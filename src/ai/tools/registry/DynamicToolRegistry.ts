@@ -15,6 +15,21 @@ export type ToolCategory =
 	| "server" // Server/guild info tools
 	| "analysis"; // Analysis/drama tools
 
+// Keep the registered protocol names intact instead of relying on snake-case
+// heuristics for these camelCase built-ins. Other tools retain legacy inference.
+const MEMORY_TOOL_CATEGORIES: Readonly<Record<string, ToolCategory>> = {
+	getUserInfo: "user",
+	getUserSummary: "user",
+	searchUsers: "user",
+	getUserActivity: "user",
+	getUserRoles: "user",
+	getUserRelationships: "relationship",
+	getRelationshipBetween: "relationship",
+	getTopRelationships: "relationship",
+	getMutualConnections: "relationship",
+	analyzeRelationship: "relationship",
+};
+
 /**
  * Strategy for loading tools based on context and keywords
  */
@@ -140,6 +155,10 @@ export class DynamicToolRegistry {
 	 * Infer the category of a tool based on its name
 	 */
 	private inferCategory(toolName: string): ToolCategory | null {
+		if (Object.hasOwn(MEMORY_TOOL_CATEGORIES, toolName)) {
+			return MEMORY_TOOL_CATEGORIES[toolName]!;
+		}
+
 		// User tools
 		if (
 			toolName.startsWith("get_user") ||

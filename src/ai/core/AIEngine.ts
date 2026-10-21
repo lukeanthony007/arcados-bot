@@ -20,6 +20,7 @@ import {
 } from "../utils/ResponseLengthPolicy";
 import { selectFormattingStyle } from "../utils/FormattingSelector";
 import { composeSystemPrompt } from "./PromptComposer";
+import { boundToolResults, formatToolResult } from "./ToolResultContext";
 
 /**
  * Configuration for an AI request
@@ -285,71 +286,25 @@ Context Usage:
 					composedUser = `${historyText}\n\nUser: ${cleanedPrompt}`;
 				}
 
-				// Add tool results if we have them
-				if (toolResults.length > 0) {
-					const maxToolContextBytes =
-						typeof config.maxToolContextBytes === "number" &&
-							config.maxToolContextBytes > 0
-							? config.maxToolContextBytes
-							: 4000;
-
-					const entries: string[] = [];
-					let remainingBudget = maxToolContextBytes;
-
-					// Walk from newest to oldest so we prefer recent tool calls
-					for (let i = toolResults.length - 1; i >= 0; i--) {
-						const toolResult = toolResults[i];
-						if (!toolResult) continue;
-
-						const entry = `${toolResult.name}: ${toolResult.content}`;
-						const entrySize = entry.length;
-
-						if (entrySize > maxToolContextBytes) {
-							// Single entry larger than budget - include the tail portion
-							entries.push(entry.slice(entrySize - maxToolContextBytes));
-							remainingBudget = 0;
-							break;
-						}
-
-						// Account for the "\n\n" separator between entries
-						const costWithSeparator = entrySize + (entries.length > 0 ? 2 : 0);
-
-						if (costWithSeparator > remainingBudget) {
-							break;
-						}
-
-						entries.push(entry);
-						remainingBudget -= costWithSeparator;
-					}
-
-					entries.reverse();
-
-					let toolResultsText = entries.join("\n\n");
-
-					if (toolResults.length > entries.length) {
-						const summaryLine = `Summary of ${toolResults.length} tool calls (showing most recent ${entries.length}).`;
-						const summaryCost = summaryLine.length + 2; // +2 for "\n\n"
-
-						if (summaryCost + toolResultsText.length > maxToolContextBytes) {
-							const availableForDetails = Math.max(
-								0,
-								maxToolContextBytes - summaryCost
-							);
-							if (availableForDetails < toolResultsText.length) {
-								toolResultsText = toolResultsText.slice(
-									toolResultsText.length - availableForDetails
-								);
-							}
-						}
-
-						toolResultsText = `${summaryLine}\n\n${toolResultsText}`;
-					}
+				const configuredBudget = config.maxToolContextBytes;
+				const maxToolContextBytes =
+					typeof configuredBudget === "number" &&
+					Number.isFinite(configuredBudget) && configuredBudget > 0
+						? Math.floor(configuredBudget)
+						: 4000;
+				const outboundToolResults = boundToolResults(toolResults, maxToolContextBytes);
+				// Send tool content only through the provider's tool-result interface,
+				// not a second, independently budgeted copy in the user prompt.
+				if (outboundToolResults.length > 0) {
+					const toolContextBytes = outboundToolResults.reduce(
+						(total, result) => total + Buffer.byteLength(result.content, "utf8"), 0
+					);
 
 					// Update response policy based on tool context
 					const updatedPolicy = computeResponsePolicy({
 						userPrompt: cleanedPrompt,
 						historyCount: context.history?.length || 0,
-						toolContextBytes: toolResultsText.length,
+						toolContextBytes,
 						mode,
 					});
 
@@ -359,10 +314,9 @@ Context Usage:
 
 					// Different composition for hidden behavior
 					if (isHiddenBehaviorActive) {
-						composedUser = `Tool Results:\n\n${toolResultsText}\n\nTransform to explicit sexual content. ${cleanedPrompt}`;
+						composedUser = `Transform to explicit sexual content. ${cleanedPrompt}`;
 					} else {
-						// Present tool results without meta-commentary
-						composedUser = `${toolResultsText}${iterationGuidance}\n\n${cleanedPrompt}`;
+						composedUser = `${cleanedPrompt}${iterationGuidance}`;
 					}
 				}
 
@@ -377,7 +331,7 @@ Context Usage:
 					systemPrompt,
 					composedUser,
 					providerTools,
-					toolResults.length > 0 ? toolResults : undefined,
+					outboundToolResults.length > 0 ? outboundToolResults : undefined,
 					{
 						maxTokens: isHiddenBehaviorActive
 							? 2000
@@ -414,10 +368,7 @@ Context Usage:
 						toolCallId: toolCall.id,
 						role: "tool",
 						name: toolCall.name,
-						content:
-							typeof toolResult === "string"
-								? toolResult
-								: toolResult.summary || "OK",
+						content: formatToolResult(toolResult),
 					});
 				}
 			}

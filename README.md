@@ -213,6 +213,43 @@ Generate contextual intelligence
 4. Set environment variables for bot token and LLM providers
 5. Intelligence builds automatically from observable interactions
 
+### Chat tool context
+
+Blocking `AIEngine.generate()` requests pass retrieved tool results through
+`AIProvider.callTextAPIWithTools()`. The consumer preserves narrative summaries,
+adds top-level or `data.formatted` details, and falls back to serialized `data`
+when no formatted representation exists. Structured failures and missing results
+are reported as tool errors rather than `"OK"`. Producers and retrieval scope
+are unchanged.
+
+The registry explicitly categorizes the registered camelCase user and relationship
+tools, keeping their protocol names intact. Normal chat and explicit category
+selection can advertise those definitions; unrelated tools retain legacy name
+inference. This changes selection metadata, not producer queries, authorization,
+or consent enforcement.
+
+`maxToolContextBytes` bounds the aggregate UTF-8 **content** bytes sent in that
+provider argument (default: 4000). Newest results take priority; oversized content
+keeps its prefix, with `[truncated]` when space permits. All tool names, roles and
+call IDs remain intact, including older results whose content budget is exhausted.
+Protocol metadata is outside this content budget. Tool content is not duplicated
+in the user prompt. Very small budgets can omit details or error text.
+
+Offline regression check, without installed dependencies or services:
+
+```sh
+bun test src/ai/core/AIEngine.test.ts src/ai/tools/registry/DynamicToolRegistry.test.ts
+```
+
+The tests exercise the public engine with a captured provider, fake tool results,
+real profile/relationship tools backed by a fake DB, and the registered category
+catalog. The real-producer fixture requires the called tools to have been
+advertised. Serialization faults must not discard other pending results.
+The streaming-provider module is stubbed before loading the engine to avoid
+SDK/config initialization. This verifies selection and engine-to-provider
+transport, not provider SDK behavior, model answer quality, live retrieval,
+automatic context enrichment, consent enforcement, or production replies.
+
 ### License
 
 MIT

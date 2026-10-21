@@ -182,7 +182,8 @@ export class AIRequestBuilder {
 	}
 
 	/**
-	 * Set maximum bytes/characters of tool context to feed back into the model
+	 * Bound aggregate UTF-8 tool-result content bytes sent to the provider.
+	 * Names and call IDs are preserved outside this budget.
 	 */
 	maxToolContextBytes(bytes: number): this {
 		this.config.maxToolContextBytes = bytes;
