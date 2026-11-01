@@ -111,6 +111,12 @@ export interface UserProfileData {
   behavior_patterns?: any; // JSONB
   temporal_profile?: any; // JSONB
 
+  // Incremental enrichment tracking (UserProfileEnrichmentPipeline)
+  last_enriched_conversation_count?: number;
+  last_enriched_conversation_id?: string;
+  profile_version?: number;
+  enrichment_history?: unknown; // JSONB, parsed by IncrementalEnrichment.parseHistory
+
   // Metadata
   created_at: Date;
   updated_at: Date;
@@ -379,6 +385,16 @@ export class PostgreSQLManager {
 					PRIMARY KEY (guild_id, user_id),
 					FOREIGN KEY (guild_id, user_id) REFERENCES members(guild_id, user_id) ON DELETE CASCADE
 				)
+			`);
+
+      // Incremental enrichment tracking used by UserProfileEnrichmentPipeline
+      await client.query(`
+				ALTER TABLE user_profiles
+				ADD COLUMN IF NOT EXISTS last_enriched_conversation_count INTEGER DEFAULT 0,
+				ADD COLUMN IF NOT EXISTS last_enriched_conversation_id VARCHAR(50),
+				ADD COLUMN IF NOT EXISTS profile_version INTEGER DEFAULT 1,
+				ADD COLUMN IF NOT EXISTS enrichment_history JSONB DEFAULT '[]'::jsonb,
+				ADD COLUMN IF NOT EXISTS last_enriched_at TIMESTAMP WITH TIME ZONE
 			`);
 
       await client.query(`
@@ -1468,6 +1484,10 @@ export class PostgreSQLManager {
           psych_profile: row.psych_profile || {},
           behavior_patterns: row.behavior_patterns || {},
           temporal_profile: row.temporal_profile || {},
+          last_enriched_conversation_count: row.last_enriched_conversation_count ?? 0,
+          last_enriched_conversation_id: row.last_enriched_conversation_id ?? undefined,
+          profile_version: row.profile_version ?? undefined,
+          enrichment_history: row.enrichment_history ?? undefined,
           created_at: row.created_at,
           updated_at: row.updated_at,
         },
