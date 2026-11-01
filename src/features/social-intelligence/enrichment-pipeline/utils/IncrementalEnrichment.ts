@@ -174,8 +174,8 @@ export class IncrementalEnrichment {
 		const data =
 			typeof jsonbData === "string" ? JSON.parse(jsonbData) : jsonbData;
 
-		// Validate structure
-		if (!data.base_summary || !Array.isArray(data.deltas)) {
+		// Validate structure (an empty base summary is valid: first enrichment had no prior profile)
+		if (typeof data.base_summary !== "string" || !Array.isArray(data.deltas)) {
 			return null;
 		}
 

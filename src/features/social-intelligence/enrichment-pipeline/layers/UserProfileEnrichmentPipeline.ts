@@ -45,7 +45,8 @@ export class UserProfileEnrichmentPipeline {
 
 	/**
 	 * Enrich user profile based on new conversations
-	 * Returns new profile_version or null if enrichment failed
+	 * Returns new profile_version, or null when skipped (not enough new data, over budget).
+	 * Throws on failure so the enrichment queue records and retries it.
 	 */
 	async enrichUser(userId: string, guildId: string): Promise<number | null> {
 		try {
@@ -53,10 +54,7 @@ export class UserProfileEnrichmentPipeline {
 			const profileResult = await this.db.getUserProfile(userId, guildId);
 
 			if (!profileResult.success) {
-				console.warn(
-					`⚠️  Failed to get user profile for ${userId.slice(0, 8)}`,
-				);
-				return null;
+				throw new Error(`failed to read profile: ${profileResult.error}`);
 			}
 
 			const existingProfile = profileResult.data;
@@ -239,22 +237,19 @@ export class UserProfileEnrichmentPipeline {
 			// Get base summary (from history or existing summary)
 			const baseSummary = existingHistory
 				? IncrementalEnrichment.getCompositeSummary(existingHistory)
-				: existingSummary || "No previous profile data.";
+				: existingSummary;
 
 			// Generate delta using LLM
 			const deltaPrompt = IncrementalEnrichment.createDeltaPrompt(
 				"user",
-				baseSummary,
+				baseSummary || "No previous profile data.",
 				conversationSummaries,
 				contextRange,
 			);
 
 			const delta = await this.generateDelta(deltaPrompt, guildId);
 			if (!delta) {
-				console.warn(
-					`⚠️  Failed to generate delta for user ${userId.slice(0, 8)}`,
-				);
-				return null;
+				throw new Error("failed to generate summary delta");
 			}
 
 			// Calculate confidence
@@ -308,7 +303,17 @@ export class UserProfileEnrichmentPipeline {
 			const latestConversationId =
 				newConversations.length > 0 ? newConversations[0].id : lastEnrichedConversationId;
 
-			// Update database
+			// Ensure a profile row exists; the UPDATE below would otherwise match nothing
+			const ensureResult = await this.db.query(
+				`INSERT INTO user_profiles (guild_id, user_id) VALUES ($1, $2)
+				ON CONFLICT (guild_id, user_id) DO NOTHING`,
+				[guildId, userId],
+			);
+			if (!ensureResult.success) {
+				throw new Error(`failed to create profile row: ${ensureResult.error}`);
+			}
+
+			// Update database (strip nulls so a failed estimate keeps the previous value)
 			const updateResult = await this.db.query(
 				`
 				UPDATE user_profiles
@@ -318,16 +323,17 @@ export class UserProfileEnrichmentPipeline {
 					last_enriched_at = NOW(),
 					last_enriched_conversation_count = $6,
 					last_enriched_conversation_id = $7,
-					psych_profile = COALESCE(psych_profile, '{}'::jsonb) || jsonb_build_object(
+					psych_profile = COALESCE(psych_profile, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
 						'big_five_proxies', $8::jsonb,
 						'mbti_type', $9::jsonb
-					),
-					behavior_patterns = COALESCE(behavior_patterns, '{}'::jsonb) || jsonb_build_object(
+					)),
+					behavior_patterns = COALESCE(behavior_patterns, '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
 						'communication_style', $10::jsonb,
 						'response_patterns', $11::jsonb,
 						'emoji_signature', $12::jsonb,
 						'temporal_profile', $13::jsonb
-					)
+					)),
+					updated_at = NOW()
 				WHERE user_id = $1 AND guild_id = $2
 				RETURNING profile_version
 				`,
@@ -349,10 +355,10 @@ export class UserProfileEnrichmentPipeline {
 			);
 
 			if (!updateResult.success) {
-				console.error(
-					`❌ Failed to update user profile for ${userId.slice(0, 8)}`,
-				);
-				return null;
+				throw new Error(`failed to save profile: ${updateResult.error}`);
+			}
+			if (!updateResult.data?.length) {
+				throw new Error("profile update matched no row");
 			}
 
 			// Track cost
@@ -364,11 +370,10 @@ export class UserProfileEnrichmentPipeline {
 
 			return newProfileVersion;
 		} catch (error) {
-			console.error(
-				`❌ Error enriching user ${userId.slice(0, 8)}:`,
-				error,
-			);
-			return null;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`User enrichment failed for ${userId}: ${message}`, {
+				cause: error,
+			});
 		}
 	}
 
@@ -494,9 +499,11 @@ export class UserProfileEnrichmentPipeline {
 				.user("system-enricher")
 				.guild(guildId)
 				.build();
+			// Structured mode: the chat preset caps output at 60 tokens, truncating summaries
 			const result = await builder
-				.chat()
 				.blocking()
+				.mode("structured")
+				.maxTokens(500)
 				.withContext(ctx)
 				.provider(provider as "grok" | "ollama")
 				.persona("casual")

@@ -501,9 +501,11 @@ export class MBTIEstimator {
 				.build();
 
 			const builder = new AIRequestBuilder(this.aiEngine);
+			// Structured mode: the chat preset caps output at 60 tokens, truncating the JSON
 			const result = await builder
-				.chat()
 				.blocking()
+				.mode("structured")
+				.maxTokens(800)
 				.withContext(ctx)
 				.provider("grok")
 				.withoutTools()

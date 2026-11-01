@@ -189,11 +189,12 @@ export class EnrichmentPipelineOrchestrator {
 	) {
 		if (!this.postgresManager) return;
 
-		// Check if user needs enrichment based on conversation count
+		// Check if user needs enrichment based on conversation count.
+		// Starts from members so users without a profile row yet still qualify; bots never do.
 		const result = await this.postgresManager.query(
 			`
 			SELECT
-				last_enriched_conversation_count,
+				COALESCE(p.last_enriched_conversation_count, 0) AS last_enriched_conversation_count,
 				(
 					SELECT COUNT(DISTINCT cs.id)
 					FROM conversation_segments cs
@@ -201,19 +202,21 @@ export class EnrichmentPipelineOrchestrator {
 					AND $2 = ANY(cs.participants)
 					AND cs.status = 'finalized'
 					AND cs.ai_processing_status = 'completed'
-				) as current_conversation_count
-			FROM user_profiles
-			WHERE guild_id = $1 AND user_id = $2
+				) AS current_conversation_count
+			FROM members m
+			LEFT JOIN user_profiles p ON p.guild_id = m.guild_id AND p.user_id = m.user_id
+			WHERE m.guild_id = $1 AND m.user_id = $2 AND m.bot = false
 		`,
 			[guildId, userId],
 		);
 
 		if (result.success && result.data && result.data.length > 0) {
-			const { last_enriched_conversation_count, current_conversation_count } =
-				result.data[0];
+			const lastCount = Number(result.data[0].last_enriched_conversation_count);
+			const currentCount = Number(result.data[0].current_conversation_count);
+			const newConversations = currentCount - lastCount;
 
 			// Trigger if 5+ new conversations since last enrichment
-			if (current_conversation_count - (last_enriched_conversation_count || 0) >= 5) {
+			if (newConversations >= 5) {
 				this.queue.enqueue({
 					layer: EnrichmentLayer.USER,
 					entityId: userId,
@@ -222,7 +225,7 @@ export class EnrichmentPipelineOrchestrator {
 				});
 
 				console.log(
-					`🔔 User ${userId} has ${current_conversation_count - last_enriched_conversation_count} new conversations, queued for enrichment`,
+					`🔔 User ${userId} has ${newConversations} new conversations, queued for enrichment`,
 				);
 			}
 		}

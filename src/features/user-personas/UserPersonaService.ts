@@ -188,10 +188,19 @@ export class UserPersonaService {
 			}
 
 			await onProgress?.("Analyzing personality and conversations…");
+			// A failed enrichment shouldn't block the persona; the profiler below fills in
 			const enrichedProfileVersion = await new UserProfileEnrichmentPipeline(
 				this.db,
 				engine,
-			).enrichUser(userId, guildId);
+			)
+				.enrichUser(userId, guildId)
+				.catch((error: unknown) => {
+					console.warn(
+						"🔸 Persona:",
+						error instanceof Error ? error.message : error,
+					);
+					return null;
+				});
 			const psychProfiled =
 				enrichedProfileVersion === null
 					? await new PsychologicalProfiler(this.db, engine).profileUser(
