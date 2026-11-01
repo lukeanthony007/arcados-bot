@@ -20,6 +20,7 @@ import { APICostTracker } from "./utils/APICostTracker";
 import { VoiceStateCoordinator } from "./features/voice-state/VoiceStateCoordinator";
 import { SyncCoordinator } from "./features/discord-sync/SyncCoordinator";
 import { DeletedMessageLogger } from "./utils/DeletedMessageLogger";
+import { UserPersonaService } from "./features/user-personas/UserPersonaService";
 
 export class Bot {
   public client: Client;
@@ -215,6 +216,14 @@ export class Bot {
 
     // Initialize message handler
     this.messageHandler = new MessageHandler(this.client, this.db);
+
+    // Member personas (/persona init|change|clear); commands reach it through the client
+    Object.assign(this.client, {
+      userPersonas: new UserPersonaService(
+        this.db,
+        this.conversationWorkflow.getRelationshipMapper()!
+      ),
+    });
 
     // Initialize voice assistant
     this.voiceAssistant = VoiceAssistantManager.getInstance();

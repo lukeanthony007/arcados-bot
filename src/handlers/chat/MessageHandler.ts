@@ -22,6 +22,7 @@ import { VoiceAssistantManager } from "../voice/VoiceAssistantManager";
 import { AIFactory } from "../../ai/core/AIFactory";
 import type { AIEngine } from "../../ai/core/AIEngine";
 import { detectModeFromMessage, stripModeKeywords } from "../../ai/personas/modes";
+import { buildPersonaPrompt } from "../../features/user-personas/personaPrompt";
 
 export class MessageHandler {
   private client: Client;
@@ -251,7 +252,8 @@ export class MessageHandler {
     const chatAI = await this.getChatAI();
     const contentResponse = await chatAI.generateMentionResponse(
       rawForAI,
-      context
+      context,
+      await this.getActivePersonaPrompt(message.guildId!)
     );
 
     if (!contentResponse?.success || !contentResponse.content) {
@@ -434,7 +436,8 @@ export class MessageHandler {
     const contentResponse = await chatAI.generateReplyResponse(
       rawForAI,
       context,
-      historyFormatted
+      historyFormatted,
+      await this.getActivePersonaPrompt(message.guildId!)
     );
 
     if (!contentResponse?.success || !contentResponse.content) {
@@ -472,6 +475,15 @@ export class MessageHandler {
 
     // Store exactly what was sent in session history
     appendAssistantTurnAndTrackMessage(found.sessionId, reply, sentText);
+  }
+
+  /**
+   * System persona for the member persona active in this guild (set via /persona change), if any
+   */
+  private async getActivePersonaPrompt(guildId: string): Promise<string | undefined> {
+    if (!this.db.isConnected()) return undefined;
+    const active = await this.db.getActivePersona(guildId);
+    return active.success && active.data ? buildPersonaPrompt(active.data) : undefined;
   }
 
   /**

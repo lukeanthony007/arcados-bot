@@ -228,7 +228,13 @@ Commands automatically receive guild context and can access AI tools, database m
 - Personas are defined in [personas/definitions.ts](src/ai/personas/definitions.ts)
 - Use AIRequestBuilder's `.persona()` method to select persona
 - Example: `new AIRequestBuilder(engine).chat().blocking().provider("grok").persona("casual").generate(prompt)`
+- Use `.customPersona(text)` for ad-hoc persona text that replaces the registry persona; the yin/yang layer is then skipped unless a mode is explicitly requested
 - AI providers are in [src/ai/providers/](src/ai/providers/)
+
+**Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
+- `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has Grok write a character profile, and stores it in `user_personas` with real messages as voice examples
+- `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes `buildPersonaPrompt(...)` to ChatAIManager (voice is unaffected)
+- The service is attached to the Discord client as `client.userPersonas`
 
 **Add a database schema**: PostgreSQLManager has schema creation methods; update via migration pattern in `recreate:schema` script.
 

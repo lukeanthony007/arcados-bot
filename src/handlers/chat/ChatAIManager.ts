@@ -37,26 +37,30 @@ export class ChatAIManager {
 	 * - Commands
 	 *
 	 * Configuration:
-	 * - Persona: sophia (philosophical, analytical)
+	 * - Persona: sophia (philosophical, analytical), or a member persona when personaPrompt is given
 	 * - Mode: chat (concise, 3 iterations max)
 	 * - Tools: user, relationship, conversation (dynamic based on prompt)
 	 * - Formatting: disabled (plain text for Discord)
 	 */
 	async generateMentionResponse(
 		prompt: string,
-		context: AIContext
+		context: AIContext,
+		personaPrompt?: string
 	): Promise<AIResponse> {
 		const builder = new AIRequestBuilder(this.engine);
 
 		const enrichedContext = await enrichAIContext(context, {}, { query: prompt });
 
-		const result = await builder
+		builder
 			.chat()
 			.blocking()
 			.withContext(enrichedContext)
 			.provider("grok")
-			.persona("sophia")
-			.generate(prompt);
+			.persona("sophia");
+		if (personaPrompt) {
+			builder.customPersona(personaPrompt);
+		}
+		const result = await builder.generate(prompt);
 
 		// Blocking mode always returns AIResponse
 		if (typeof result === "object" && "success" in result) {
@@ -86,20 +90,24 @@ export class ChatAIManager {
 	async generateReplyResponse(
 		prompt: string,
 		context: AIContext,
-		history: Array<{ role: string; content: string }>
+		history: Array<{ role: string; content: string }>,
+		personaPrompt?: string
 	): Promise<AIResponse> {
 		const builder = new AIRequestBuilder(this.engine);
 
 		const enrichedContext = await enrichAIContext(context, {}, { query: prompt });
 
-		const result = await builder
+		builder
 			.chat()
 			.blocking()
 			.withContext(enrichedContext)
 			.history(history)
 			.provider("grok")
-			.persona("sophia")
-			.generate(prompt);
+			.persona("sophia");
+		if (personaPrompt) {
+			builder.customPersona(personaPrompt);
+		}
+		const result = await builder.generate(prompt);
 
 		// Blocking mode always returns AIResponse
 		if (typeof result === "object" && "success" in result) {

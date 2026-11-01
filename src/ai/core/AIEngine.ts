@@ -27,6 +27,8 @@ import { composeSystemPrompt } from "./PromptComposer";
 export interface AIRequestConfig {
 	provider: string;
 	personaKey?: string;
+	// Ad-hoc persona text that replaces the registry persona (e.g. a member's character profile)
+	personaOverride?: string;
 	mode?: ConversationMode; // 'chat' or 'structured'
 	streaming?: boolean;
 
@@ -447,8 +449,8 @@ Context Usage:
 		context: AIContext,
 		userPrompt: string
 	): string {
-		const personaKey = config.personaKey || DEFAULT_PERSONA;
-		const persona = this.getPersona(personaKey);
+		const personaBase =
+			config.personaOverride ?? this.getPersona(config.personaKey || DEFAULT_PERSONA).base;
 
 		// Check for hidden behavior triggers
 		if (userPrompt) {
@@ -475,10 +477,12 @@ Context Usage:
 		// Normal prompt construction using PromptComposer
 		const methodPrompt = config.methodPrompt || "";
 		const formatting = config.useDiscordFormatting !== false ? this.DISCORD_FORMATTING : "";
-		const communicationMode = context.communicationMode || "yin";
+		// Custom personas carry their own voice, so yin/yang applies only when explicitly requested
+		const communicationMode =
+			context.communicationMode ?? (config.personaOverride ? undefined : "yin");
 
 		return composeSystemPrompt({
-			personaBase: persona.base,
+			personaBase,
 			communicationMode,
 			conversationalBase: this.CONVERSATIONAL_BASE,
 			formatting,

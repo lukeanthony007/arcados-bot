@@ -14,7 +14,8 @@ import { YIN_MODE, YANG_MODE } from "../personas/modes";
 
 export interface PromptComposition {
 	personaBase: string;
-	communicationMode: CommunicationMode;
+	/** Omit to skip the yin/yang layer (e.g. user personas that carry their own voice) */
+	communicationMode?: CommunicationMode;
 	conversationalBase: string;
 	formatting?: string;
 	methodPrompt?: string;
@@ -33,9 +34,9 @@ export function composeSystemPrompt(composition: PromptComposition): string {
 	}
 
 	// Layer 2: Yin or Yang mode (HOW to communicate - direct vs. metaphorical)
-	const modePrompt =
-		composition.communicationMode === "yang" ? YANG_MODE : YIN_MODE;
-	layers.push(modePrompt);
+	if (composition.communicationMode) {
+		layers.push(composition.communicationMode === "yang" ? YANG_MODE : YIN_MODE);
+	}
 
 	// Layer 3: Conversational base (brevity/structure rules + context usage discipline)
 	if (composition.conversationalBase) {

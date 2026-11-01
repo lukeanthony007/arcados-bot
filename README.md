@@ -150,6 +150,7 @@ This is context engineering in practice—managing what an LLM knows and when it
 - Real-time RAG pipelines with zero-lag retrieval
 - Dynamic tool registry for programmatic intelligence access
 - Conversation detection with multi-strategy grouping
+- Member personas: `/persona init @user` builds a character profile from a member's messages, conversations and relationships; `/persona change @user` makes the bot speak as them; `/persona clear` reverts
 - Graceful degradation—core inference works with partial data
 
 ## Data Model

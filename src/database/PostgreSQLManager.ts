@@ -122,6 +122,24 @@ export interface UserProfileData {
   updated_at: Date;
 }
 
+export interface UserPersonaData {
+  guild_id: string;
+  user_id: string;
+  display_name: string;
+  character_profile: string; // AI-written character sheet (voice, personality, interests)
+  style_examples: string[]; // Real messages used as few-shot voice samples
+  source_stats: Record<string, unknown>; // What the profile was built from
+  created_by?: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+type UserPersonaRow = Omit<UserPersonaData, "style_examples" | "source_stats" | "created_by"> & {
+  style_examples: string[] | null;
+  source_stats: Record<string, unknown> | null;
+  created_by: string | null;
+};
+
 export interface RoleData {
   id: string;
   guild_id: string;
@@ -686,6 +704,33 @@ export class PostgreSQLManager {
 					self_video BOOLEAN DEFAULT false,
 					timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
 					created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+				)
+			`);
+
+      // Member personas the bot can speak as (built by /persona init)
+      await client.query(`
+				CREATE TABLE IF NOT EXISTS user_personas (
+					guild_id VARCHAR(20) NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
+					user_id VARCHAR(20) NOT NULL,
+					display_name TEXT NOT NULL,
+					character_profile TEXT NOT NULL,
+					style_examples TEXT[] DEFAULT '{}',
+					source_stats JSONB DEFAULT '{}',
+					created_by VARCHAR(20),
+					created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+					updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+					PRIMARY KEY (guild_id, user_id)
+				)
+			`);
+
+      // Which member persona the bot currently speaks as, per guild (set by /persona change)
+      await client.query(`
+				CREATE TABLE IF NOT EXISTS guild_active_personas (
+					guild_id VARCHAR(20) PRIMARY KEY REFERENCES guilds(id) ON DELETE CASCADE,
+					user_id VARCHAR(20) NOT NULL,
+					activated_by VARCHAR(20),
+					activated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+					FOREIGN KEY (guild_id, user_id) REFERENCES user_personas(guild_id, user_id) ON DELETE CASCADE
 				)
 			`);
 
@@ -1662,6 +1707,189 @@ export class PostgreSQLManager {
     } finally {
       client.release();
     }
+  }
+
+  // User persona operations
+  async upsertUserPersona(
+    persona: Omit<UserPersonaData, "created_at" | "updated_at">
+  ): Promise<DatabaseResult<UserPersonaData>> {
+    if (!this.isConnected()) {
+      return { success: false, error: "Database not connected" };
+    }
+
+    const client = await this.pool!.connect();
+    try {
+      const result = await client.query<UserPersonaRow>(
+        `
+				INSERT INTO user_personas (guild_id, user_id, display_name, character_profile, style_examples, source_stats, created_by, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+				ON CONFLICT (guild_id, user_id) DO UPDATE SET
+					display_name = EXCLUDED.display_name,
+					character_profile = EXCLUDED.character_profile,
+					style_examples = EXCLUDED.style_examples,
+					source_stats = EXCLUDED.source_stats,
+					created_by = EXCLUDED.created_by,
+					updated_at = NOW()
+				RETURNING *
+			`,
+        [
+          persona.guild_id,
+          persona.user_id,
+          persona.display_name,
+          persona.character_profile,
+          persona.style_examples,
+          JSON.stringify(persona.source_stats),
+          persona.created_by ?? null,
+        ]
+      );
+      const row = result.rows[0];
+      if (!row) {
+        return { success: false, error: "Persona upsert returned no row" };
+      }
+      return { success: true, data: this.mapUserPersonaRow(row) };
+    } catch (error) {
+      console.error("🔸 Failed to upsert user persona:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  async getUserPersona(
+    guildId: string,
+    userId: string
+  ): Promise<DatabaseResult<UserPersonaData | undefined>> {
+    if (!this.isConnected()) {
+      return { success: false, error: "Database not connected" };
+    }
+
+    const client = await this.pool!.connect();
+    try {
+      const result = await client.query<UserPersonaRow>(
+        `SELECT * FROM user_personas WHERE guild_id = $1 AND user_id = $2`,
+        [guildId, userId]
+      );
+      const row = result.rows[0];
+      return { success: true, data: row ? this.mapUserPersonaRow(row) : undefined };
+    } catch (error) {
+      console.error("🔸 Failed to get user persona:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  async setActivePersona(
+    guildId: string,
+    userId: string,
+    activatedBy: string
+  ): Promise<DatabaseResult<void>> {
+    if (!this.isConnected()) {
+      return { success: false, error: "Database not connected" };
+    }
+
+    const client = await this.pool!.connect();
+    try {
+      await client.query(
+        `
+				INSERT INTO guild_active_personas (guild_id, user_id, activated_by, activated_at)
+				VALUES ($1, $2, $3, NOW())
+				ON CONFLICT (guild_id) DO UPDATE SET
+					user_id = EXCLUDED.user_id,
+					activated_by = EXCLUDED.activated_by,
+					activated_at = NOW()
+			`,
+        [guildId, userId, activatedBy]
+      );
+      return { success: true };
+    } catch (error) {
+      console.error("🔸 Failed to set active persona:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Get the persona the bot currently speaks as in a guild (undefined = default persona)
+   */
+  async getActivePersona(
+    guildId: string
+  ): Promise<DatabaseResult<UserPersonaData | undefined>> {
+    if (!this.isConnected()) {
+      return { success: false, error: "Database not connected" };
+    }
+
+    const client = await this.pool!.connect();
+    try {
+      const result = await client.query<UserPersonaRow>(
+        `
+				SELECT p.* FROM guild_active_personas a
+				JOIN user_personas p ON p.guild_id = a.guild_id AND p.user_id = a.user_id
+				WHERE a.guild_id = $1
+			`,
+        [guildId]
+      );
+      const row = result.rows[0];
+      return { success: true, data: row ? this.mapUserPersonaRow(row) : undefined };
+    } catch (error) {
+      console.error("🔸 Failed to get active persona:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Revert a guild to the default persona. Returns whether a persona was active.
+   */
+  async clearActivePersona(guildId: string): Promise<DatabaseResult<boolean>> {
+    if (!this.isConnected()) {
+      return { success: false, error: "Database not connected" };
+    }
+
+    const client = await this.pool!.connect();
+    try {
+      const result = await client.query(
+        `DELETE FROM guild_active_personas WHERE guild_id = $1`,
+        [guildId]
+      );
+      return { success: true, data: (result.rowCount ?? 0) > 0 };
+    } catch (error) {
+      console.error("🔸 Failed to clear active persona:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    } finally {
+      client.release();
+    }
+  }
+
+  private mapUserPersonaRow(row: UserPersonaRow): UserPersonaData {
+    return {
+      guild_id: row.guild_id,
+      user_id: row.user_id,
+      display_name: row.display_name,
+      character_profile: row.character_profile,
+      style_examples: row.style_examples ?? [],
+      source_stats: row.source_stats ?? {},
+      created_by: row.created_by ?? undefined,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
   }
 
   async getMessageInteractions(

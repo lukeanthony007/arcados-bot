@@ -118,6 +118,14 @@ export class AIRequestBuilder {
 	}
 
 	/**
+	 * Use ad-hoc persona text instead of a registry persona (e.g. a member's character profile)
+	 */
+	customPersona(personaText: string): this {
+		this.config.personaOverride = personaText;
+		return this;
+	}
+
+	/**
 	 * Set communication mode (yin/yang)
 	 */
 	communicationMode(mode: "yin" | "yang"): this {
@@ -330,6 +338,7 @@ Response style:
 		const finalConfig: AIRequestConfig = {
 			provider: this.config.provider,
 			personaKey: this.config.personaKey,
+			personaOverride: this.config.personaOverride,
 			mode: this.config.mode,
 			streaming: this.config.streaming,
 			methodPrompt: this.config.methodPrompt,
