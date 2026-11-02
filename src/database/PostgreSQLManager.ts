@@ -613,6 +613,12 @@ export class PostgreSQLManager {
 				ALTER TABLE voice_channel_preferences
 				ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT false
 			`);
+
+			// Add blocked_users column if it doesn't exist (migration; used by voice-state /block)
+			await client.query(`
+				ALTER TABLE voice_channel_preferences
+				ADD COLUMN IF NOT EXISTS blocked_users TEXT[] DEFAULT '{}'
+			`);
 			
 			// Migrate banned_users to blacklist and add whitelist column
 			await client.query(`
@@ -624,11 +630,21 @@ export class PostgreSQLManager {
 				ADD COLUMN IF NOT EXISTS blacklist TEXT[] DEFAULT '{}'
 			`);
 			// Migrate data from banned_users to blacklist if blacklist is empty
+			// (only when the legacy column exists, e.g. databases created before this migration)
 			await client.query(`
-				UPDATE voice_channel_preferences
-				SET blacklist = banned_users
-				WHERE (blacklist IS NULL OR blacklist = '{}')
-				AND banned_users IS NOT NULL AND banned_users != '{}'
+				DO $$
+				BEGIN
+					IF EXISTS (
+						SELECT 1 FROM information_schema.columns
+						WHERE table_name = 'voice_channel_preferences' AND column_name = 'banned_users'
+					) THEN
+						UPDATE voice_channel_preferences
+						SET blacklist = banned_users
+						WHERE (blacklist IS NULL OR blacklist = '{}')
+						AND banned_users IS NOT NULL AND banned_users != '{}';
+					END IF;
+				END
+				$$;
 			`);
 
       // Voice channel ownership history - track ownership changes
