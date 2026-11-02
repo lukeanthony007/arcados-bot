@@ -44,14 +44,14 @@ export class ConversationScorer {
     for (const participantId of participants) {
       if (participantId === userId) continue;
 
-      const edge = await this.getCachedEdge(guildId, userId, participantId);
-      if (edge?.data) {
+      // Edges are directed (author → other), so a pair's history spans both rows
+      const [edgeAB, edgeBA] = await Promise.all([
+        this.getCachedEdge(guildId, userId, participantId),
+        this.getCachedEdge(guildId, participantId, userId),
+      ]);
+      if (edgeAB?.data || edgeBA?.data) {
         // Normalize edge interaction count to 0-1 range
-        const interactionCount =
-          (edge.data.message_count || 0) +
-          (edge.data.reply_count || 0) +
-          (edge.data.mention_count || 0) +
-          (edge.data.reaction_count || 0);
+        const interactionCount = (edgeAB?.data?.total || 0) + (edgeBA?.data?.total || 0);
 
         // Use logarithmic scale to prevent extreme values
         const normalizedScore = Math.min(1, Math.log10(interactionCount + 1) / 3);

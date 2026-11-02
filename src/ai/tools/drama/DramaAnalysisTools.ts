@@ -43,10 +43,28 @@ export const detectDramaEvents: DatabaseTool = {
         Date.now() - lookbackHours * 60 * 60 * 1000
       );
 
-      // Query relationship edges for low-affinity, high-interaction pairs
-      // We look for bidirectional relationships where both users interact but with low affinity
+      // Query relationship edges for low-affinity, high-interaction pairs.
+      // Edges are directed (author → other), so both rows of a pair are merged first.
       const result = await context.db.query(
-        `SELECT
+        `WITH re1 AS (
+          SELECT
+            LEAST(user_a, user_b) AS user_a,
+            GREATEST(user_a, user_b) AS user_b,
+            SUM(CASE WHEN user_a < user_b THEN msg_a_to_b ELSE msg_b_to_a END) AS msg_a_to_b,
+            SUM(CASE WHEN user_a < user_b THEN msg_b_to_a ELSE msg_a_to_b END) AS msg_b_to_a,
+            SUM(mentions) AS mentions,
+            SUM(replies) AS replies,
+            SUM(reactions) AS reactions,
+            MAX(last_interaction) AS last_interaction
+          FROM relationship_edges
+          WHERE guild_id = $1 AND user_a <> user_b
+            AND NOT EXISTS (
+              SELECT 1 FROM members m
+              WHERE m.guild_id = $1 AND m.user_id IN (user_a, user_b) AND m.bot
+            )
+          GROUP BY LEAST(user_a, user_b), GREATEST(user_a, user_b)
+        )
+        SELECT
           re1.user_a,
           re1.user_b,
           re1.msg_a_to_b,
@@ -68,9 +86,8 @@ export const detectDramaEvents: DatabaseTool = {
                LEAST(10, (re1.msg_a_to_b + re1.msg_b_to_a) / 2))
             )
           END as affinity_score
-        FROM relationship_edges re1
-        WHERE re1.guild_id = $1
-          AND (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) >= $2
+        FROM re1
+        WHERE (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) >= $2
           AND re1.last_interaction >= $3
           AND CASE
             WHEN (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) = 0 THEN 0
@@ -246,7 +263,7 @@ export const detectDramaEvents: DatabaseTool = {
                 event.total_interactions > 50 && "High interaction frequency",
                 negativeCount > 2 && "Negative language detected",
                 event.replies > 10 && "Frequent back-and-forth",
-              ].filter(Boolean),
+              ].filter((i): i is string => typeof i === "string"),
             },
           };
         })

@@ -300,44 +300,42 @@ export const compareUsersTool: DatabaseTool = {
 
 			// Relationships comparison
 			if (metric === "relationships" || metric === "all") {
-				// Get relationship counts and average affinity
-				const user1RelResult = await context.db.query(
-					`SELECT COUNT(*) as friend_count,
-                AVG(CASE
-                  WHEN (msg_a_to_b + msg_b_to_a + mentions + replies + reactions) = 0 THEN 0
-                  ELSE LEAST(100,
-                    (CASE WHEN msg_a_to_b > 0 THEN 15 ELSE 0 END +
-                     CASE WHEN msg_b_to_a > 0 THEN 15 ELSE 0 END +
-                     CASE WHEN mentions > 0 THEN 20 ELSE 0 END +
-                     CASE WHEN replies > 0 THEN 30 ELSE 0 END +
-                     CASE WHEN reactions > 0 THEN 10 ELSE 0 END +
-                     LEAST(10, (msg_a_to_b + msg_b_to_a) / 2))
-                  )
-                END) as avg_affinity
-           FROM relationship_edges
-           WHERE guild_id = $1 AND user_a = $2
-             AND (msg_a_to_b + msg_b_to_a + mentions + replies + reactions) >= 5`,
-					[context.guildId, user1Id]
-				);
-
-				const user2RelResult = await context.db.query(
-					`SELECT COUNT(*) as friend_count,
-                AVG(CASE
-                  WHEN (msg_a_to_b + msg_b_to_a + mentions + replies + reactions) = 0 THEN 0
-                  ELSE LEAST(100,
-                    (CASE WHEN msg_a_to_b > 0 THEN 15 ELSE 0 END +
-                     CASE WHEN msg_b_to_a > 0 THEN 15 ELSE 0 END +
-                     CASE WHEN mentions > 0 THEN 20 ELSE 0 END +
-                     CASE WHEN replies > 0 THEN 30 ELSE 0 END +
-                     CASE WHEN reactions > 0 THEN 10 ELSE 0 END +
-                     LEAST(10, (msg_a_to_b + msg_b_to_a) / 2))
-                  )
-                END) as avg_affinity
-           FROM relationship_edges
-           WHERE guild_id = $1 AND user_a = $2
-             AND (msg_a_to_b + msg_b_to_a + mentions + replies + reactions) >= 5`,
-					[context.guildId, user2Id]
-				);
+				// Edges are directed (author → other); aggregate both rows of each pair the user is in
+				const relationshipStatsQuery = `
+					WITH pairs AS (
+						SELECT
+							SUM(CASE WHEN user_a = $2 THEN msg_a_to_b ELSE msg_b_to_a END) AS sent,
+							SUM(CASE WHEN user_a = $2 THEN msg_b_to_a ELSE msg_a_to_b END) AS received,
+							SUM(mentions) AS mentions,
+							SUM(replies) AS replies,
+							SUM(reactions) AS reactions
+						FROM relationship_edges
+						WHERE guild_id = $1 AND $2 IN (user_a, user_b) AND user_a <> user_b
+							AND NOT EXISTS (
+								SELECT 1 FROM members m
+								WHERE m.guild_id = $1 AND m.user_id IN (user_a, user_b) AND m.bot
+							)
+						GROUP BY LEAST(user_a, user_b), GREATEST(user_a, user_b)
+					)
+					SELECT COUNT(*) AS friend_count,
+						AVG(LEAST(100,
+							CASE WHEN sent > 0 THEN 15 ELSE 0 END +
+							CASE WHEN received > 0 THEN 15 ELSE 0 END +
+							CASE WHEN mentions > 0 THEN 20 ELSE 0 END +
+							CASE WHEN replies > 0 THEN 30 ELSE 0 END +
+							CASE WHEN reactions > 0 THEN 10 ELSE 0 END +
+							LEAST(10, (sent + received) / 2)
+						)) AS avg_affinity
+					FROM pairs
+					WHERE sent + received + mentions + replies + reactions >= 5`;
+				const user1RelResult = await context.db.query(relationshipStatsQuery, [
+					context.guildId,
+					user1Id,
+				]);
+				const user2RelResult = await context.db.query(relationshipStatsQuery, [
+					context.guildId,
+					user2Id,
+				]);
 
 				const user1FriendCount = Number.parseInt(
 					user1RelResult.data?.[0]?.friend_count || "0"
