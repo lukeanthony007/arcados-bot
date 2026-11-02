@@ -19,6 +19,7 @@ import { VoiceConnectionManager } from "./handlers/voice/tts/services/VoiceConne
 import { APICostTracker } from "./utils/APICostTracker";
 import { VoiceStateCoordinator } from "./features/voice-state/VoiceStateCoordinator";
 import { SyncCoordinator } from "./features/discord-sync/SyncCoordinator";
+import { StateSyncService } from "./features/discord-sync/StateSyncService";
 import { DeletedMessageLogger } from "./utils/DeletedMessageLogger";
 import { UserPersonaService } from "./features/user-personas/UserPersonaService";
 
@@ -34,6 +35,7 @@ export class Bot {
   private voiceAssistant?: VoiceAssistantManager;
   public voiceStateCoordinator?: VoiceStateCoordinator; // Public for slash commands
   private syncCoordinator?: SyncCoordinator;
+  private stateSyncService?: StateSyncService;
 
   // Track if event handlers are already set up
   private eventHandlersSetup = false;
@@ -246,6 +248,16 @@ export class Bot {
     const mediaPlayer = MediaPlayerManager.getInstance();
     mediaPlayer.initialize(this.client);
 
+    // Initialize state sync service
+    // Handles real-time Discord state synchronization
+    this.stateSyncService = new StateSyncService(
+      this.client,
+      this.db,
+      this.conversationWorkflow.getRelationshipMapper()!,
+      this.conversationWorkflow.getConversationDetector()!,
+      false // Set to true for verbose logging
+    );
+    await this.stateSyncService.start();
   }
 
   /**
@@ -422,6 +434,11 @@ export class Bot {
       await costTracker.shutdown();
     } catch (error) {
       console.error("🔸 Error flushing cost tracking:", error);
+    }
+
+    // Stop state sync service
+    if (this.stateSyncService) {
+      await this.stateSyncService.stop();
     }
 
     // Stop conversation workflow (handles conversation finalization + cleanup)
