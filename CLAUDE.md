@@ -213,7 +213,8 @@ Commands only receive the interaction. Shared services are attached to the Disco
 
 **Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
 - `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
-- `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes `buildPersonaPrompt(...)` to `generateChatResponse` (voice is unaffected)
+- `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes the persona to `generateChatResponse` (voice is unaffected)
+- Each turn, `personaContext.ts` adds the persona member's real history with the people involved (speaker, @mentions, members named in the message): interaction counts, shared conversation summaries (slurs masked), and recent messages between them (group pings, bare mentions/links and slurs filtered), so feelings about people come from what the member actually said
 - The service is attached to the Discord client as `client.userPersonas`
 
 **Add a database table or column**: add `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` to `PostgreSQLManager.initializeSchema()`; it runs on every startup.

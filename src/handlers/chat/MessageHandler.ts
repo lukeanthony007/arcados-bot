@@ -7,7 +7,7 @@
 
 import type { Client, Message } from "discord.js";
 import { ChannelType } from "discord.js";
-import type { PostgreSQLManager } from "../../database/PostgreSQLManager";
+import type { PostgreSQLManager, UserPersonaData } from "../../database/PostgreSQLManager";
 import { generateChatResponse } from "./chatResponse";
 import type { ChatMessage } from "../../ai/runtime/OmpRuntime";
 import {
@@ -20,7 +20,6 @@ import {
 import { resolveMentionsInText } from "../../ai/utils/MentionResolver";
 import { VoiceAssistantManager } from "../voice/VoiceAssistantManager";
 import { detectModeFromMessage, stripModeKeywords } from "../../ai/personas/modes";
-import { buildPersonaPrompt } from "../../features/user-personas/personaPrompt";
 
 export class MessageHandler {
   private client: Client;
@@ -222,7 +221,7 @@ export class MessageHandler {
       messageId: message.id,
       content: rawForAI,
       communicationMode: detectedMode,
-      personaPrompt: await this.getActivePersonaPrompt(message.guildId!),
+      persona: await this.getActivePersona(message.guildId!),
     });
 
     if (!contentResponse?.success || !contentResponse.content) {
@@ -389,7 +388,7 @@ export class MessageHandler {
       messageId: message.id,
       content: rawForAI,
       communicationMode: detectedMode,
-      personaPrompt: await this.getActivePersonaPrompt(message.guildId!),
+      persona: await this.getActivePersona(message.guildId!),
       history: historyFormatted,
     });
 
@@ -431,12 +430,12 @@ export class MessageHandler {
   }
 
   /**
-   * System persona for the member persona active in this guild (set via /persona change), if any
+   * Member persona active in this guild (set via /persona change), if any
    */
-  private async getActivePersonaPrompt(guildId: string): Promise<string | undefined> {
+  private async getActivePersona(guildId: string): Promise<UserPersonaData | undefined> {
     if (!this.db.isConnected()) return undefined;
     const active = await this.db.getActivePersona(guildId);
-    return active.success && active.data ? buildPersonaPrompt(active.data) : undefined;
+    return active.success ? active.data : undefined;
   }
 
   /**
