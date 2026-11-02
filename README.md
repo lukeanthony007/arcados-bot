@@ -88,9 +88,9 @@ Every query triggers a retrieval pipeline:
 - Score and rank by relevance to the query
 - Compress to fit context window
 
-**Multi-Provider Orchestration**
+**LLM Orchestration**
 
-Switch between Grok, Gemini, OpenAI, or Ollama without changing application code. Each provider has different strengths—cost, speed, reasoning depth, tool use. The orchestration layer abstracts this, letting you optimize per-query.
+Model calls run through the omp SDK: Cursor's default model first, with automatic fallback to Grok when Cursor is unavailable. The bot's database tools are exposed to the model as agent tools, alongside web search.
 
 **Dynamic Tool Registry**
 
@@ -146,7 +146,7 @@ This is context engineering in practice—managing what an LLM knows and when it
 - Bridging node identification between communities
 - Influence flow mapping across network topology
 - Anomaly detection for behavioral shifts
-- LLM orchestration on the omp SDK (Grok via xAI), with the bot's database tools as agent tools and web search
+- LLM orchestration on the omp SDK (Cursor, with Grok fallback), with the bot's database tools as agent tools and web search
 - Real-time RAG pipelines with zero-lag retrieval
 - Dynamic tool registry for programmatic intelligence access
 - Conversation detection with multi-strategy grouping

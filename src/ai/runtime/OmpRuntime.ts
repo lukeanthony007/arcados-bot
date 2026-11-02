@@ -29,11 +29,16 @@ import { getToolCatalog } from "../tools";
 import type { ToolContext } from "../tools/registry/DatabaseTools";
 import { adaptTool } from "./toolAdapter";
 
-/** Model used for every request (chat, voice and background jobs) */
-const MODEL_PROVIDER = "xai";
-const MODEL_ID = "grok-4-1-fast-non-reasoning";
+/** Model used for every request (chat, voice and background jobs): Cursor's default "Auto" route */
+const MODEL_PROVIDER = "cursor";
+const MODEL_ID = "default";
+/** omp retries a failed request (usage limit, outage, missing login) on these models, in order */
+const FALLBACK_MODELS = ["xai/grok-4-1-fast-non-reasoning"];
 
-/** Bot-local omp state, isolated from the user's ~/.omp configuration */
+/**
+ * Bot-local omp state (settings, workspace), isolated from the user's ~/.omp configuration.
+ * Credentials still come from the user's omp login (`/login cursor`).
+ */
 const OMP_HOME = fileURLToPath(new URL("../../../.omp-bot", import.meta.url));
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -198,25 +203,32 @@ export class OmpRuntime {
 	}
 
 	private async createBackend(): Promise<Backend> {
-		if (!config.grokApiKey) {
-			throw new Error("GROK_API_KEY is not configured");
-		}
 		const agentDir = `${OMP_HOME}/agent`;
 		const cwd = `${OMP_HOME}/workspace`;
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(cwd, { recursive: true });
 
-		const authStorage = await discoverAuthStorage(agentDir);
-		authStorage.keys.setRuntime(MODEL_PROVIDER, config.grokApiKey);
+		// Default agent dir: the user's omp credential store, where the Cursor login lives
+		const authStorage = await discoverAuthStorage();
+		// xAI key powers the Grok fallback and lets web_search reach X/Twitter posts
+		if (config.grokApiKey)
+			authStorage.keys.setRuntime("xai", config.grokApiKey);
 		const modelRegistry = new ModelRegistry(authStorage);
 		await modelRegistry.refresh();
 		const model = modelRegistry.find(MODEL_PROVIDER, MODEL_ID);
 		if (!model) {
 			throw new Error(`Model ${MODEL_PROVIDER}/${MODEL_ID} is not available`);
 		}
+		if (!(await modelRegistry.getApiKey(model))) {
+			console.warn(
+				`⚠️ No ${MODEL_PROVIDER} credentials (run \`omp\` and \`/login ${MODEL_PROVIDER}\`); requests will use the fallback model`,
+			);
+		}
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.enabled": true,
+			modelRoles: { default: `${MODEL_PROVIDER}/${MODEL_ID}` },
+			"retry.fallbackChains": { default: FALLBACK_MODELS },
 		});
 		return { authStorage, modelRegistry, model, settings, agentDir, cwd };
 	}
@@ -285,6 +297,7 @@ export class OmpRuntime {
 		let inputTokens = 0;
 		let outputTokens = 0;
 		let costUsd = 0;
+		let answeredBy = `${MODEL_PROVIDER}/${MODEL_ID}`;
 		let session: AgentSession | null = null;
 
 		const timeout = AbortSignal.timeout(
@@ -297,20 +310,23 @@ export class OmpRuntime {
 		signal.addEventListener("abort", onAbort, { once: true });
 
 		const finish = (response: AIResponse): AIResponse => {
-			APICostTracker.getInstance().trackRequest("grok", {
-				endpoint: request.label,
-				success: response.success,
-				error: response.error,
-				inputTokens,
-				outputTokens,
-				latency: Date.now() - started,
-				additionalMetadata: {
-					model: MODEL_ID,
-					via: "omp",
-					costUsd,
-					tools: executedTools,
+			APICostTracker.getInstance().trackRequest(
+				answeredBy.startsWith("xai/") ? "grok" : "cursor",
+				{
+					endpoint: request.label,
+					success: response.success,
+					error: response.error,
+					inputTokens,
+					outputTokens,
+					latency: Date.now() - started,
+					additionalMetadata: {
+						model: answeredBy,
+						via: "omp",
+						costUsd,
+						tools: executedTools,
+					},
 				},
-			});
+			);
 			return response;
 		};
 
@@ -342,6 +358,11 @@ export class OmpRuntime {
 						event.message.usage.input + event.message.usage.cacheRead;
 					outputTokens += event.message.usage.output;
 					costUsd += event.message.usage.cost.total;
+					answeredBy = `${event.message.provider}/${event.message.model}`;
+				} else if (event.type === "retry_fallback_applied") {
+					console.warn(
+						`⚠️ [${request.label}] ${event.from} failed, falling back to ${event.to}`,
+					);
 				}
 			});
 

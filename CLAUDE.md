@@ -74,7 +74,7 @@ AI infrastructure built on the omp SDK:
   - `stream(...)` → `{ tokens: AsyncIterable<string>, result }` (voice)
   - `generateStructured<T>({ systemPrompt, prompt, schema, label })` → schema-validated object via a `submit` tool, or null
   - `tools: { context: ToolContext, names?, webSearch? }` exposes the bot tool catalog (default: all) plus omp's `web_search`
-  - Model is fixed in `OmpRuntime.ts` (`xai/grok-4-1-fast-non-reasoning`, key from `GROK_API_KEY`); cost tracking (APICostTracker) and timeouts happen inside the runtime
+  - Model: Cursor's default "Auto" route (`cursor/default`), using the Cursor login in the user's omp credential store (`omp` → `/login cursor`). When Cursor fails (usage limit, outage, no login), omp's retry fallback chain re-runs the request on `xai/grok-4-1-fast-non-reasoning` (key from `GROK_API_KEY`). Cost tracking records the model that actually answered (`cursor` or `grok`); timeouts happen inside the runtime
   - The omp SDK requires Bun; run scripts with `bun run`, not Node/tsx
 - **Tools** (`tools/`): `getToolCatalog()` in `tools/index.ts` loads every `DatabaseTool` (user, relationship, conversation, message, server, context, analysis, live, drama, search, storyline, voice, music, media, stream); `runtime/toolAdapter.ts` binds them to a request's `ToolContext` for omp
 - **Personas** (`personas/`): "sophia" and "casual" definitions, yin/yang modes, and `buildSystemPrompt()` (persona → yin/yang → conversational base → method prompt) for chat and voice
@@ -209,10 +209,10 @@ Commands only receive the interaction. Shared services are attached to the Disco
 - Personas are defined in [personas/definitions.ts](src/ai/personas/definitions.ts)
 - Compose chat/voice prompts with `buildSystemPrompt({ persona, personaText?, communicationMode?, methodPrompt? })`; `personaText` replaces the registry persona (yin/yang is then skipped unless explicitly requested)
 - Example: `OmpRuntime.get().generate({ systemPrompt: buildSystemPrompt({ persona: "casual" }), prompt, tools: { context }, label: "feature.name" })`
-- To change the model, edit `MODEL_PROVIDER`/`MODEL_ID` in [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts) and supply that provider's key via `authStorage.keys.setRuntime`
+- To change the model or fallback, edit `MODEL_PROVIDER`/`MODEL_ID`/`FALLBACK_MODELS` in [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts); the provider needs an omp login or a key set via `authStorage.keys.setRuntime`
 
 **Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
-- `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has Grok write a character profile, and stores it in `user_personas` with real messages as voice examples
+- `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
 - `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes `buildPersonaPrompt(...)` to `generateChatResponse` (voice is unaffected)
 - The service is attached to the Discord client as `client.userPersonas`
 

@@ -280,6 +280,7 @@ export class APICostTracker {
 				"ollama",
 				"cartesia",
 				"google-tts",
+				"cursor",
 			];
 
 			for (const provider of providers) {

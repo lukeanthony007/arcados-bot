@@ -41,7 +41,7 @@ async function main() {
 
     if (provider === "all") {
       // Show all providers
-      const providers = ["grok", "gemini", "openai", "ollama", "cartesia", "google-tts"];
+      const providers = ["grok", "gemini", "openai", "ollama", "cartesia", "google-tts", "cursor"];
       for (const prov of providers) {
         await showProvider(prov, baseDir);
       }

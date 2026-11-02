@@ -8,7 +8,8 @@ export type ProviderName =
 	| "openai"
 	| "ollama"
 	| "cartesia"
-	| "google-tts";
+	| "google-tts"
+	| "cursor";
 
 export type Timeframe = "hour" | "day" | "week" | "month";
 
