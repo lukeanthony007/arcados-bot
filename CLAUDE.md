@@ -115,20 +115,20 @@ AI infrastructure built on the omp SDK:
 - Analysis tools provide metadata and trends
 
 **LiveEventSync events**:
-- messageCreate → increments relationship edges, buffers message for conversation detection, creates streaming conversations, queues user enrichment every 50 messages
+- messageCreate → increments relationship edges, buffers message for conversation detection, queues user enrichment every 50 messages
 - reactionAdd/reactionRemove → increments edge counters
 - guildMemberAdd/Update → updates member profiles
 - channelCreate/Update/Delete → updates channel records
 - roleCreate/Update/Delete → updates role records
-- Streaming conversations created on 2+ messages, finalized after 10-min inactivity
+- Conversations are finalized after 10-20 min of channel inactivity (in-memory buffers; lost on a crash)
 
 **Conversation Lifecycle**:
-1. ConversationDetector buffers messages per channel
-2. On 2+ messages: create `streaming_conversation` (immediately queryable with preliminary keywords)
-3. After 10-min inactivity OR 50-message buffer: multi-strategy grouping + validation
-4. Full enrichment: hybrid keywords, embeddings, AI topic labels
-5. Finalized segments stored in `conversation_segments` table
-6. Used for context retrieval (what topics have users discussed)
+1. ConversationDetector buffers human messages per channel in memory (bot commands are dropped at ingest)
+2. After 10-20 min inactivity, a 50-message buffer or a 30-min span: multi-strategy grouping (reply chains, mentions, proximity) + validation (≥3 messages, ≥2 participants, ≤24h, no gap >8h)
+3. Finalized segments stored in `conversation_segments` as `pending`; nearby/overlapping segments are merged
+4. The enrichment queue summarizes significant `pending` segments; small ones are marked `skipped`
+5. Monologues and exchanges under 3 messages are intentionally never grouped
+6. Messages the live detector missed (downtime, old history) are added with `npm run regenerate:conversations [--since YYYY-MM-DD] [--until YYYY-MM-DD]`, which replays stored messages per channel; re-runs skip already-grouped messages
 
 ## Configuration
 
@@ -225,6 +225,6 @@ Commands only receive the interaction. Shared services are attached to the Disco
 
 **Track new interaction types**: ConversationDetector uses multi-strategy grouping; add new strategies in `conversation-detection/strategies/` directory.
 
-**Debug conversation detection**: ConversationDetector buffers messages per channel with 10-min inactivity timeouts; check `streaming_conversations` table or add logging.
+**Debug conversation detection**: ConversationDetector buffers messages per channel with 10-20 min inactivity timeouts; inspect `conversation_segments` (coverage = messages appearing in some segment's `message_ids`) or add logging.
 
 **Extend bot mention handling**: Message handling logic lives in `src/handlers/chat/MessageHandler.ts`; modify sanitization, context resolution, or chunking there.

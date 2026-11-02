@@ -1889,32 +1889,9 @@ export class ReconciliationSync {
    * Run periodic maintenance tasks
    */
   async runMaintenance(): Promise<void> {
-    await this.compactSegments();
     await this.updateRollingWindows();
     await this.consolidateOverlappingSegments();
     await this.reconcileConversationEnrichmentBacklog();
-  }
-
-  /**
-   * Compact old conversation segments (delete old, large segments)
-   */
-  private async compactSegments(): Promise<void> {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - 30);
-
-    const result = await this.db.query(
-      `DELETE FROM conversation_segments
-			 WHERE start_time < $1
-			 AND (SELECT COUNT(*) FROM unnest(participants) p) > 5`,
-      [cutoffDate]
-    );
-
-    if (result.success && this.verbose) {
-      const deleted = (result.data as any)?.rowCount || 0;
-      if (deleted > 0) {
-        console.log(`🔹 ReconciliationSync: Compacted ${deleted} old segments`);
-      }
-    }
   }
 
   /**

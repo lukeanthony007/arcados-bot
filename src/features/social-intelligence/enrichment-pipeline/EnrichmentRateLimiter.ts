@@ -46,15 +46,16 @@ export class EnrichmentRateLimiter {
 	private readonly MONTHLY_CAP = 40.0;
 	private readonly WARNING_THRESHOLD = 0.8; // Warn at 80%
 
-	// Token cost estimates (approximate, provider-specific)
+	// Token prices for budgeting. "grok" is the omp runtime's paid model
+	// (xai/grok-4-1-fast-non-reasoning, the fallback when Cursor is unavailable)
 	private readonly COST_PER_1K_INPUT_TOKENS = {
-		grok: 0.005, // $5 per 1M tokens
+		grok: 0.0002, // $0.20 per 1M tokens
 		gemini: 0.00015, // $0.15 per 1M tokens (flash)
 		ollama: 0, // Free (local inference)
 	};
 
 	private readonly COST_PER_1K_OUTPUT_TOKENS = {
-		grok: 0.015, // $15 per 1M tokens
+		grok: 0.0005, // $0.50 per 1M tokens
 		gemini: 0.0006, // $0.60 per 1M tokens (flash)
 		ollama: 0, // Free (local inference)
 	};
