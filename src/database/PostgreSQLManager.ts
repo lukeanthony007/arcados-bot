@@ -78,22 +78,6 @@ export interface MemberData {
   updated_at: Date;
 }
 
-export interface RelationshipEntry {
-  user_id: string;
-  affinity_percentage: number; // 0-100, percentage of user's total interactions
-  interaction_count: number;
-  last_interaction: Date;
-  summary?: string;
-  emojis?: string[];
-  notes?: string[];
-  conversations?: ConversationEntry[];
-  // Additional fields for display and analysis
-  display_name?: string;
-  username?: string;
-  raw_points?: number;
-  total_messages?: number;
-}
-
 export interface UserProfileData {
   guild_id: string;
   user_id: string;
@@ -104,7 +88,6 @@ export interface UserProfileData {
   emojis?: string[];
   notes?: string[];
   aliases?: string[];
-  relationship_network?: RelationshipEntry[];
 
   // Psychological profiling
   psych_profile?: any; // JSONB - Big 5, MBTI, etc.
@@ -243,6 +226,9 @@ export class PostgreSQLManager {
 
     const client = await this.pool!.connect();
     try {
+      // Fuzzy member-name matching for AI tools (word_similarity); ships with PostgreSQL contrib
+      await client.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+
       // Enable pgvector extension for embeddings
       // Gracefully handle if extension is not installed on the server
       try {
@@ -389,7 +375,6 @@ export class PostgreSQLManager {
 					emojis TEXT[] DEFAULT '{}',
 					notes TEXT[] DEFAULT '{}',
 					aliases TEXT[] DEFAULT '{}',
-					relationship_network JSONB DEFAULT '[]',
 					
 					-- Psychological profiling
 					psych_profile JSONB DEFAULT '{}',
@@ -538,20 +523,11 @@ export class PostgreSQLManager {
 				`);
       }
 
-      // Relationship pairs - optional cache for quick undirected reads
+      // Closeness is computed on demand from messages (facts/closeness.ts); drop the old caches
       await client.query(`
-				CREATE TABLE IF NOT EXISTS relationship_pairs (
-					guild_id VARCHAR(20) NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
-					u_min VARCHAR(20) NOT NULL,
-					u_max VARCHAR(20) NOT NULL,
-					last_interaction TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					total_interactions INTEGER DEFAULT 0,
-					segment_ids TEXT[] DEFAULT '{}',
-					created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					PRIMARY KEY (guild_id, u_min, u_max),
-					CHECK (u_min < u_max)
-				)
+				DROP VIEW IF EXISTS relationship_network_live;
+				DROP TABLE IF EXISTS relationship_pairs;
+				ALTER TABLE user_profiles DROP COLUMN IF EXISTS relationship_network;
 			`);
 
       // Guild vocabulary - TF-IDF vocabulary for keyword extraction
@@ -771,8 +747,6 @@ export class PostgreSQLManager {
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_status ON conversation_segments(status);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_last_activity ON conversation_segments(last_activity_at DESC);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_active_users ON conversation_segments(guild_id, status) WHERE status = 'active';
-				CREATE INDEX IF NOT EXISTS idx_relationship_pairs_guild ON relationship_pairs(guild_id);
-				CREATE INDEX IF NOT EXISTS idx_relationship_pairs_users ON relationship_pairs(u_min, u_max);
 				CREATE INDEX IF NOT EXISTS idx_guild_vocabulary_guild ON guild_vocabulary(guild_id);
 				CREATE INDEX IF NOT EXISTS idx_guild_vocabulary_term ON guild_vocabulary(term);
 				CREATE INDEX IF NOT EXISTS idx_guild_vocabulary_idf ON guild_vocabulary(guild_id, idf_score DESC);
@@ -803,7 +777,6 @@ export class PostgreSQLManager {
 				-- User profiles indexes for AI retrieval
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_guild_id ON user_profiles(guild_id);
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_relationship_network ON user_profiles USING GIN (relationship_network);
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_psych_profile ON user_profiles USING GIN (psych_profile);
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_behavior_patterns ON user_profiles USING GIN (behavior_patterns);
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_temporal_profile ON user_profiles USING GIN (temporal_profile);
@@ -1388,50 +1361,6 @@ export class PostgreSQLManager {
     }
   }
 
-  async getMemberRelationshipNetwork(
-    userId: string,
-    guildId: string
-  ): Promise<DatabaseResult<RelationshipEntry[]>> {
-    // Delegate to user_profiles table
-    const profileResult = await this.getUserProfile(userId, guildId);
-
-    if (!profileResult.success) {
-      return {
-        success: false,
-        error: profileResult.error,
-      };
-    }
-
-    if (!profileResult.data) {
-      return { success: true, data: [] };
-    }
-
-    return {
-      success: true,
-      data: (profileResult.data.relationship_network || []) as RelationshipEntry[],
-    };
-  }
-
-  async updateMemberRelationshipNetwork(
-    memberId: string,
-    relationships: RelationshipEntry[]
-  ): Promise<DatabaseResult<void>> {
-    // Extract guild_id and user_id from memberId (format: guild_id_user_id)
-    const parts = memberId.split('_');
-    if (parts.length < 2) {
-      return {
-        success: false,
-        error: `Invalid memberId format: ${memberId}. Expected format: guild_id_user_id`,
-      };
-    }
-
-    const guildId = parts[0]!;
-    const userId = parts.slice(1).join('_'); // Handle cases where user_id might contain underscores
-
-    // Delegate to user_profiles table
-    return this.updateUserProfileRelationships(userId, guildId, relationships);
-  }
-
   // User profile operations
   async upsertUserProfile(
     profileData: UserProfileData
@@ -1445,17 +1374,16 @@ export class PostgreSQLManager {
       const query = `
 				INSERT INTO user_profiles (
 					guild_id, user_id, summary, keywords, emojis, notes, aliases,
-					relationship_network, psych_profile, behavior_patterns, temporal_profile,
+					psych_profile, behavior_patterns, temporal_profile,
 					updated_at
 				)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
 				ON CONFLICT (guild_id, user_id) DO UPDATE SET
 					summary = EXCLUDED.summary,
 					keywords = EXCLUDED.keywords,
 					emojis = EXCLUDED.emojis,
 					notes = EXCLUDED.notes,
 					aliases = EXCLUDED.aliases,
-					relationship_network = EXCLUDED.relationship_network,
 					psych_profile = EXCLUDED.psych_profile,
 					behavior_patterns = EXCLUDED.behavior_patterns,
 					temporal_profile = EXCLUDED.temporal_profile,
@@ -1471,7 +1399,6 @@ export class PostgreSQLManager {
         profileData.emojis || [],
         profileData.notes || [],
         profileData.aliases || [],
-        profileData.relationship_network ? JSON.stringify(profileData.relationship_network) : '[]',
         profileData.psych_profile ? JSON.stringify(profileData.psych_profile) : '{}',
         profileData.behavior_patterns ? JSON.stringify(profileData.behavior_patterns) : '{}',
         profileData.temporal_profile ? JSON.stringify(profileData.temporal_profile) : '{}',
@@ -1490,7 +1417,6 @@ export class PostgreSQLManager {
           emojis: row.emojis || [],
           notes: row.notes || [],
           aliases: row.aliases || [],
-          relationship_network: row.relationship_network || [],
           psych_profile: row.psych_profile || {},
           behavior_patterns: row.behavior_patterns || {},
           temporal_profile: row.temporal_profile || {},
@@ -1541,7 +1467,6 @@ export class PostgreSQLManager {
           emojis: row.emojis || [],
           notes: row.notes || [],
           aliases: row.aliases || [],
-          relationship_network: row.relationship_network || [],
           psych_profile: row.psych_profile || {},
           behavior_patterns: row.behavior_patterns || {},
           temporal_profile: row.temporal_profile || {},
@@ -1674,52 +1599,6 @@ export class PostgreSQLManager {
       return { success: true };
     } catch (error) {
       console.error("🔸 Failed to update user profile psych:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  async updateUserProfileRelationships(
-    userId: string,
-    guildId: string,
-    relationships: RelationshipEntry[]
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-				UPDATE user_profiles
-				SET relationship_network = $1, updated_at = NOW()
-				WHERE user_id = $2 AND guild_id = $3
-			`;
-
-      const result = await client.query(query, [
-        JSON.stringify(relationships),
-        userId,
-        guildId,
-      ]);
-
-      if (result.rowCount === 0) {
-        // Create profile if it doesn't exist
-        await this.upsertUserProfile({
-          guild_id: guildId,
-          user_id: userId,
-          relationship_network: relationships,
-        } as UserProfileData);
-      } else {
-        return { success: true };
-      }
-
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to update user profile relationships:", error);
       return {
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",
@@ -1910,95 +1789,6 @@ export class PostgreSQLManager {
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
-  }
-
-  async getMessageInteractions(
-    user1Id: string,
-    user2Id: string,
-    guildId: string,
-    timeWindowMinutes: number = 5
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      // Get messages from both users in the guild
-      const query = `
-				SELECT 
-					id,
-					channel_id,
-					author_id,
-					content,
-					created_at,
-					edited_at
-				FROM messages 
-				WHERE guild_id = $1 
-					AND author_id IN ($2, $3)
-					AND active = true
-				ORDER BY created_at ASC
-			`;
-
-      const result = await client.query(query, [guildId, user1Id, user2Id]);
-      const messages = result.rows;
-
-      // Process messages to find interactions
-      const interactions: any[] = [];
-      const timeWindowMs = timeWindowMinutes * 60 * 1000;
-
-      for (let i = 0; i < messages.length; i++) {
-        const message = messages[i];
-        const messageTime = new Date(message.created_at).getTime();
-
-        // Check for mentions
-        const mentionPattern = new RegExp(
-          `<@!?${user1Id === message.author_id ? user2Id : user1Id}>`,
-          "g"
-        );
-        if (mentionPattern.test(message.content)) {
-          interactions.push({
-            interaction_type: "mention",
-            timestamp: new Date(message.created_at),
-            channel_id: message.channel_id,
-            message_id: message.id,
-            other_user_id: user1Id === message.author_id ? user2Id : user1Id,
-            points: 2,
-          });
-        }
-
-        // Check for same-channel interactions within time window
-        if (i > 0) {
-          const prevMessage = messages[i - 1];
-          const prevTime = new Date(prevMessage.created_at).getTime();
-
-          if (
-            message.channel_id === prevMessage.channel_id &&
-            message.author_id !== prevMessage.author_id &&
-            Math.abs(messageTime - prevTime) <= timeWindowMs
-          ) {
-            interactions.push({
-              interaction_type: "same_channel",
-              timestamp: new Date(message.created_at),
-              channel_id: message.channel_id,
-              message_id: message.id,
-              other_user_id: prevMessage.author_id,
-              points: 1,
-            });
-          }
-        }
-      }
-
-      return { success: true, data: interactions };
-    } catch (error) {
-      console.error("🔸 Failed to get message interactions:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
   }
 
   /**
@@ -2196,39 +1986,6 @@ export class PostgreSQLManager {
       };
     } catch (error) {
       console.error("🔸 Failed to get edge:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get all edges for a user (both directions)
-   */
-  async getEdgesForUser(
-    guildId: string,
-    userId: string,
-    limit: number = 50
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM relationship_edges
-        WHERE guild_id = $1 AND (user_a = $2 OR user_b = $2)
-        ORDER BY last_interaction DESC, total DESC
-        LIMIT $3
-      `;
-      const result = await client.query(query, [guildId, userId, limit]);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get edges for user:", error);
       return {
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",
@@ -2666,108 +2423,6 @@ export class PostgreSQLManager {
         }
       }
       console.error("🔸 Failed to load active conversations:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  // ============================================================================
-  // Relationship Pairs - Undirected Cache
-  // ============================================================================
-
-  /**
-   * Upsert relationship pair (undirected, cached for quick reads)
-   */
-  async upsertPair(
-    guildId: string,
-    user1: string,
-    user2: string,
-    segmentId?: string
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const [uMin, uMax] = user1 < user2 ? [user1, user2] : [user2, user1];
-
-      const query = segmentId
-        ? `
-          INSERT INTO relationship_pairs (
-            guild_id, u_min, u_max, last_interaction, total_interactions, segment_ids
-          )
-          VALUES ($1, $2, $3, NOW(), 1, ARRAY[$4]::TEXT[])
-          ON CONFLICT (guild_id, u_min, u_max) DO UPDATE SET
-            last_interaction = NOW(),
-            total_interactions = relationship_pairs.total_interactions + 1,
-            segment_ids = (
-              SELECT array_agg(elem)
-              FROM (
-                SELECT DISTINCT elem
-                FROM unnest(relationship_pairs.segment_ids || ARRAY[$4]::TEXT[]) AS elem
-                ORDER BY elem DESC
-                LIMIT 20
-              ) subq
-            ),
-            updated_at = NOW()
-        `
-        : `
-          INSERT INTO relationship_pairs (
-            guild_id, u_min, u_max, last_interaction, total_interactions
-          )
-          VALUES ($1, $2, $3, NOW(), 1)
-          ON CONFLICT (guild_id, u_min, u_max) DO UPDATE SET
-            last_interaction = NOW(),
-            total_interactions = relationship_pairs.total_interactions + 1,
-            updated_at = NOW()
-        `;
-
-      const params = segmentId
-        ? [guildId, uMin, uMax, segmentId]
-        : [guildId, uMin, uMax];
-
-      await client.query(query, params);
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to upsert pair:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get pairs for a user
-   */
-  async getPairsForUser(
-    guildId: string,
-    userId: string,
-    limit: number = 50
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM relationship_pairs
-        WHERE guild_id = $1 AND (u_min = $2 OR u_max = $2)
-        ORDER BY last_interaction DESC, total_interactions DESC
-        LIMIT $3
-      `;
-      const result = await client.query(query, [guildId, userId, limit]);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get pairs for user:", error);
       return {
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",

@@ -49,6 +49,14 @@ export interface ConversationFeatures {
 	semantic_score?: number;
 }
 
+export type InteractionType =
+	| "message"
+	| "mention"
+	| "reply"
+	| "reaction"
+	| "same_channel"
+	| "conversation";
+
 export interface ConversationEntry {
 	segment_id: string;
 	participants: string[];
@@ -91,79 +99,6 @@ export interface GuildVocabulary {
 	is_stopword: boolean;
 	updated_at: Date;
 }
-
-// ============================================================================
-// RELATIONSHIP TYPES
-// ============================================================================
-
-export interface RelationshipEdge {
-	guild_id: string;
-	user_a: string;
-	user_b: string;
-	msg_a_to_b: number;
-	msg_b_to_a: number;
-	mentions: number;
-	replies: number;
-	reactions: number;
-	rolling_7d: number;
-	rolling_30d: number;
-	total: number;
-	last_interaction: Date;
-}
-
-export interface RelationshipEntry {
-	user_id: string;
-	affinity_percentage: number; // 0-100
-	interaction_count: number;
-	last_interaction: Date;
-	summary?: string;
-	keywords?: string[];
-	emojis?: string[];
-	notes?: string[];
-	conversations?: ConversationEntry[];
-	display_name?: string;
-	username?: string;
-	raw_points?: number;
-	total_messages?: number;
-}
-
-export interface AffinityScoreResult {
-	target_user_id: string;
-	raw_points: number;
-	relevance_percentage: number;
-	interaction_summary: UserInteractionSummary;
-	conversations: ConversationEntry[];
-	breakdown: {
-		conversation_points: number;
-		message_points: number;
-		bonus_points: number;
-	};
-}
-
-export interface UserInteractionSummary {
-	total_interactions: number;
-	messages: number;
-	mentions: number;
-	replies: number;
-	reactions: number;
-	conversations_together: number;
-}
-
-export interface MessageInteraction {
-	user1_id: string;
-	user2_id: string;
-	timestamp: Date;
-	interaction_type: InteractionType;
-	direction: "a_to_b" | "b_to_a" | "mutual";
-}
-
-export type InteractionType =
-	| "message"
-	| "mention"
-	| "reply"
-	| "reaction"
-	| "same_channel"
-	| "conversation";
 
 // ============================================================================
 // GROUPING STRATEGY TYPES
@@ -227,12 +162,6 @@ export interface ConversationQueryOptions {
 	startDate?: Date; // Filter by start time
 	endDate?: Date; // Filter by end time
 	participants?: string[]; // Filter by participant user IDs
-}
-
-export interface RelationshipQueryOptions {
-	useLiveView?: boolean; // Use live view for real-time data (default: true)
-	minAffinity?: number; // Minimum affinity percentage
-	limit?: number; // Max results
 }
 
 export interface SemanticSearchOptions {

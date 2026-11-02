@@ -1,625 +1,282 @@
 import {
-  type DatabaseTool,
-  type ToolContext,
-  type DatabaseToolResult,
-  formatRelationship,
+	type Connection,
+	describeStrength,
+	getConnections,
+	getPairFacts,
+} from "../../../features/social-intelligence/facts/closeness";
+import {
+	type DatabaseTool,
+	type DatabaseToolResult,
+	type ToolContext,
+	formatConnection,
+	resolveUserId,
 } from "../registry/DatabaseTools";
-import type { RelationshipEntry } from "../../../features/social-intelligence/types";
+
+const MEANING =
+	"share = fraction of the person's own interactions that go to this connection; reciprocity = how balanced it is (1 = both sides engage equally, 0 = one-sided).";
+
+function pct(value: number): string {
+	return `${(value * 100).toFixed(0)}%`;
+}
+
+function failure(label: string, error: unknown): DatabaseToolResult {
+	console.error(`🔸 Error in ${label}:`, error);
+	return {
+		success: false,
+		error: error instanceof Error ? error.message : `Failed in ${label}`,
+	};
+}
+
+async function memberName(
+	context: ToolContext,
+	userId: string,
+): Promise<string> {
+	const result = await context.db.query(
+		`SELECT COALESCE(nick, display_name, global_name, username) AS name
+		 FROM members WHERE guild_id = $1 AND user_id = $2`,
+		[context.guildId, userId],
+	);
+	return (result.data?.[0]?.name as string | undefined) ?? userId;
+}
+
+async function resolvePair(
+	first: string,
+	second: string,
+	context: ToolContext,
+): Promise<{ a: string; b: string } | { error: string }> {
+	const [a, b] = await Promise.all([
+		resolveUserId(first, context.guildId, context.db),
+		resolveUserId(second, context.guildId, context.db),
+	]);
+	if (!a.success || !a.userId)
+		return { error: a.error ?? `Unknown user "${first}"` };
+	if (!b.success || !b.userId)
+		return { error: b.error ?? `Unknown user "${second}"` };
+	return { a: a.userId, b: b.userId };
+}
 
 /**
- * Get user's relationship network
+ * A member's strongest connections
  */
-export const getUserRelationshipsTool: DatabaseTool = {
-  name: "getUserRelationships",
-  description:
-    "Get a user's complete relationship network with affinity scores, interaction counts, and summaries. Use this to understand who a user interacts with most.",
-  parameters: {
-    type: "object",
-    properties: {
-      userId: {
-        type: "string",
-        description: "Discord user ID to get relationships for",
-      },
-      limit: {
-        type: "number",
-        description: "Maximum number of relationships to return (default: 20)",
-      },
-      minAffinity: {
-        type: "number",
-        description: "Minimum affinity percentage to filter (default: 0)",
-      },
-    },
-    required: ["userId"],
-  },
-  execute: async (
-    params: Record<string, any>,
-    context: ToolContext
-  ): Promise<string | DatabaseToolResult> => {
-    const { userId, limit, minAffinity } = params as { userId: string; limit?: number; minAffinity?: number };
-    try {
-      const result = await context.db.getMemberRelationshipNetwork(
-        userId,
-        context.guildId
-      );
-
-      if (!result.success || !result.data) {
-        return {
-          success: false,
-          error: `Failed to get relationships for user ${userId}`,
-        };
-      }
-
-      let relationships = result.data;
-
-      // Filter by minimum affinity
-      if (minAffinity !== undefined) {
-        relationships = relationships.filter(
-          (r) => r.affinity_percentage >= minAffinity
-        );
-      }
-
-      // Sort by affinity and limit
-      relationships = relationships
-        .sort((a, b) => b.affinity_percentage - a.affinity_percentage)
-        .slice(0, limit || 20);
-
-      // Get display names for relationships
-      const userIds = relationships.map((r) => r.user_id);
-      if (userIds.length > 0) {
-        const namesResult = await context.db.query(
-          `SELECT user_id, display_name, username 
-           FROM members 
-           WHERE user_id = ANY($1::text[]) AND guild_id = $2 AND active = true`,
-          [userIds, context.guildId]
-        );
-
-        if (namesResult.success && namesResult.data) {
-          const nameMap = new Map(
-            namesResult.data.map((m: any) => [m.user_id, m])
-          );
-          relationships.forEach((rel) => {
-            const member = nameMap.get(rel.user_id);
-            if (member) {
-              rel.display_name = member.display_name;
-              rel.username = member.username;
-            }
-          });
-        }
-      }
-
-      const formatted = relationships.map(formatRelationship).join("\n\n");
-
-      return {
-        success: true,
-        summary: `Found ${relationships.length} relationship(s) for user`,
-        data: {
-          formatted,
-          relationships,
-          count: relationships.length,
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Error in getUserRelationships:", error);
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to get relationships",
-      };
-    }
-  },
+export const getUserConnectionsTool: DatabaseTool = {
+	name: "getUserConnections",
+	description: `Get who a user interacts with most, strongest first. Closeness is computed from real replies, direct mentions and shared conversations (recent activity counts more). Each connection reports a plain label (very close / close / regular / occasional), the share of the user's interactions it represents, reciprocity, raw counts and last interaction. ${MEANING}`,
+	parameters: {
+		type: "object",
+		properties: {
+			userId: {
+				type: "string",
+				description:
+					"Discord user ID or name of the person to get connections for",
+			},
+			limit: {
+				type: "number",
+				description: "Maximum number of connections to return (default: 10)",
+			},
+		},
+		required: ["userId"],
+	},
+	execute: async (
+		params: Record<string, unknown>,
+		context: ToolContext,
+	): Promise<string | DatabaseToolResult> => {
+		const { userId, limit } = params as { userId: string; limit?: number };
+		try {
+			const resolved = await resolveUserId(userId, context.guildId, context.db);
+			if (!resolved.success || !resolved.userId) {
+				return {
+					success: false,
+					error: resolved.error ?? `Unknown user "${userId}"`,
+				};
+			}
+			const subject = await memberName(context, resolved.userId);
+			const connections = await getConnections(
+				context.db,
+				context.guildId,
+				resolved.userId,
+				limit || 10,
+			);
+			if (connections.length === 0) {
+				return {
+					success: true,
+					summary: `No recorded interactions for ${subject}`,
+					data: { user: subject, connections: [], count: 0 },
+					formatted: `${subject} has no recorded interactions.`,
+				};
+			}
+			return {
+				success: true,
+				summary: `Found ${connections.length} connection(s) for ${subject}`,
+				data: { user: subject, connections, count: connections.length },
+				formatted: `${subject}'s connections:\n${connections.map(formatConnection).join("\n")}`,
+			};
+		} catch (error) {
+			return failure("getUserConnections", error);
+		}
+	},
 };
 
 /**
- * Get specific relationship between two users
+ * The relationship between two specific users
  */
-export const getRelationshipBetweenTool: DatabaseTool = {
-  name: "getRelationshipBetween",
-  description:
-    "Get the specific relationship data between two users including affinity, conversations, and summaries. Use this when asked about relationships between specific people.",
-  parameters: {
-    type: "object",
-    properties: {
-      user1Id: {
-        type: "string",
-        description: "First user's Discord ID",
-      },
-      user2Id: {
-        type: "string",
-        description: "Second user's Discord ID",
-      },
-    },
-    required: ["user1Id", "user2Id"],
-  },
-  execute: async (
-    params: Record<string, any>,
-    context: ToolContext
-  ): Promise<string | DatabaseToolResult> => {
-    const { user1Id, user2Id } = params as { user1Id: string; user2Id: string };
-    try {
-      // Get user1's relationship network
-      const result = await context.db.getMemberRelationshipNetwork(
-        user1Id,
-        context.guildId
-      );
+export const getRelationshipTool: DatabaseTool = {
+	name: "getRelationship",
+	description: `Get the facts about how two specific users interact: closeness label, replies and mentions in each direction, shared conversations, reciprocity and last interaction. Says so plainly if they have never interacted. ${MEANING}`,
+	parameters: {
+		type: "object",
+		properties: {
+			user1Id: {
+				type: "string",
+				description: "First user: Discord user ID or name",
+			},
+			user2Id: {
+				type: "string",
+				description: "Second user: Discord user ID or name",
+			},
+		},
+		required: ["user1Id", "user2Id"],
+	},
+	execute: async (
+		params: Record<string, unknown>,
+		context: ToolContext,
+	): Promise<string | DatabaseToolResult> => {
+		const { user1Id, user2Id } = params as { user1Id: string; user2Id: string };
+		try {
+			const pair = await resolvePair(user1Id, user2Id, context);
+			if ("error" in pair) return { success: false, error: pair.error };
+			const facts = await getPairFacts(
+				context.db,
+				context.guildId,
+				pair.a,
+				pair.b,
+			);
+			if (!facts) {
+				return {
+					success: true,
+					summary: "These two users have never interacted",
+					data: { interacted: false },
+					formatted:
+						"These two users have never interacted (no replies, direct mentions or shared conversations).",
+				};
+			}
 
-      if (!result.success || !result.data) {
-        return {
-          success: false,
-          error: `Failed to get relationships for user ${user1Id}`,
-        };
-      }
+			const a = facts.name;
+			const subject = await memberName(context, pair.a);
+			const { a_to_b: out, b_to_a: back } = facts;
 
-      const relationship = result.data.find(
-        (r) => r.user_id === user2Id
-      );
+			const lines = [
+				`${subject} and ${a}: ${describeStrength(facts)} (${pct(facts.share)} of ${subject}'s interactions, ${pct(facts.reciprocity)} reciprocal)`,
+				`${subject} → ${a}: ${out.replies} replies, ${out.mentions} mentions`,
+				`${a} → ${subject}: ${back.replies} replies, ${back.mentions} mentions`,
+				`Shared conversations: ${facts.shared_conversations}`,
+				`Last interaction: ${new Date(facts.last_interaction).toLocaleDateString()}`,
+			];
+			const outTotal = out.replies + out.mentions;
+			const backTotal = back.replies + back.mentions;
+			if (outTotal > backTotal * 2 && outTotal > 0) {
+				lines.push(
+					`${subject} reaches out to ${a} much more than the reverse.`,
+				);
+			} else if (backTotal > outTotal * 2 && backTotal > 0) {
+				lines.push(
+					`${a} reaches out to ${subject} much more than the reverse.`,
+				);
+			}
 
-      if (!relationship) {
-        // Try reverse relationship
-        const reverseResult = await context.db.getMemberRelationshipNetwork(
-          user2Id,
-          context.guildId
-        );
-
-        if (
-          reverseResult.success &&
-          reverseResult.data &&
-          reverseResult.data.find((r) => r.user_id === user1Id)
-        ) {
-          return {
-            success: true,
-            summary:
-              "Relationship exists but is tracked from the other user's perspective",
-            data: {
-              formatted:
-                "Relationship detected but not detailed in this direction",
-              relationship: null,
-            },
-          };
-        }
-
-        return {
-          success: false,
-          error: `No relationship found between ${user1Id} and ${user2Id}`,
-        };
-      }
-
-      // Get display names
-      const namesResult = await context.db.query(
-        `SELECT user_id, display_name, username
-         FROM members
-         WHERE user_id IN ($1, $2) AND guild_id = $3 AND active = true`,
-        [user1Id, user2Id, context.guildId]
-      );
-
-      if (namesResult.success && namesResult.data) {
-        const nameMap = new Map(
-          namesResult.data.map((m: any) => [m.user_id, m])
-        );
-        const user2Member = nameMap.get(user2Id);
-        if (user2Member) {
-          relationship.display_name = user2Member.display_name;
-          relationship.username = user2Member.username;
-        }
-      }
-
-      const formatted = formatRelationship(relationship);
-
-      // Add conversation details
-      if (relationship.conversations && relationship.conversations.length > 0) {
-        const convDetails = relationship.conversations
-          .slice(-3)
-          .map(
-            (conv) =>
-              `  - ${conv.conversation_id}: ${conv.message_count} messages, ${conv.duration_minutes} min`
-          )
-          .join("\n");
-        formatted + `\nRecent conversations:\n${convDetails}`;
-      }
-
-      return {
-        success: true,
-        summary: `Relationship affinity: ${relationship.affinity_percentage.toFixed(
-          1
-        )}%`,
-        data: {
-          formatted,
-          relationship,
-          conversationCount: relationship.conversations?.length || 0,
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Error in getRelationshipBetween:", error);
-      return {
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Failed to get relationship",
-      };
-    }
-  },
+			return {
+				success: true,
+				summary: `${describeStrength(facts)} relationship`,
+				data: { interacted: true, facts },
+				formatted: lines.join("\n"),
+			};
+		} catch (error) {
+			return failure("getRelationship", error);
+		}
+	},
 };
 
 /**
- * Get top N relationships for a user
- */
-export const getTopRelationshipsTool: DatabaseTool = {
-  name: "getTopRelationships",
-  description:
-    "Get the top N relationships for a user sorted by affinity percentage. Use this to find a user's closest connections.",
-  parameters: {
-    type: "object",
-    properties: {
-      userId: {
-        type: "string",
-        description: "Discord user ID to get top relationships for",
-      },
-      limit: {
-        type: "number",
-        description: "Number of top relationships to return (default: 10)",
-      },
-    },
-    required: ["userId"],
-  },
-  execute: async (
-    params: Record<string, any>,
-    context: ToolContext
-  ): Promise<string | DatabaseToolResult> => {
-    const { userId, limit } = params as { userId: string; limit?: number };
-    try {
-      const result = await context.db.getMemberRelationshipNetwork(
-        userId,
-        context.guildId
-      );
-
-      if (!result.success || !result.data) {
-        return {
-          success: false,
-          error: `Failed to get relationships for user ${userId}`,
-        };
-      }
-
-      const topRelationships = result.data
-        .sort((a, b) => b.affinity_percentage - a.affinity_percentage)
-        .slice(0, limit || 10);
-
-      // Get display names
-      const userIds = topRelationships.map((r) => r.user_id);
-      if (userIds.length > 0) {
-        const namesResult = await context.db.query(
-          `SELECT user_id, display_name, username 
-           FROM members 
-           WHERE user_id = ANY($1::text[]) AND guild_id = $2 AND active = true`,
-          [userIds, context.guildId]
-        );
-
-        if (namesResult.success && namesResult.data) {
-          const nameMap = new Map(
-            namesResult.data.map((m: any) => [m.user_id, m])
-          );
-          topRelationships.forEach((rel) => {
-            const member = nameMap.get(rel.user_id);
-            if (member) {
-              rel.display_name = member.display_name;
-              rel.username = member.username;
-            }
-          });
-        }
-      }
-
-      const formatted = topRelationships
-        .map(
-          (rel, idx) =>
-            `${idx + 1}. ${
-              rel.display_name || rel.user_id
-            }: ${rel.affinity_percentage.toFixed(1)}% affinity (${
-              rel.interaction_count
-            } interactions)`
-        )
-        .join("\n");
-
-      return {
-        success: true,
-        summary: `Top ${topRelationships.length} relationship(s) for user`,
-        data: {
-          formatted,
-          relationships: topRelationships,
-          count: topRelationships.length,
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Error in getTopRelationships:", error);
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to get top relationships",
-      };
-    }
-  },
-};
-
-/**
- * Get mutual connections between two users
+ * People both users interact with
  */
 export const getMutualConnectionsTool: DatabaseTool = {
-  name: "getMutualConnections",
-  description:
-    "Find users who have relationships with both specified users (mutual connections). Use this to find common friends or connections.",
-  parameters: {
-    type: "object",
-    properties: {
-      user1Id: {
-        type: "string",
-        description: "First user's Discord ID",
-      },
-      user2Id: {
-        type: "string",
-        description: "Second user's Discord ID",
-      },
-    },
-    required: ["user1Id", "user2Id"],
-  },
-  execute: async (
-    params: Record<string, any>,
-    context: ToolContext
-  ): Promise<string | DatabaseToolResult> => {
-    const { user1Id, user2Id } = params as { user1Id: string; user2Id: string };
-    try {
-      // Get both users' relationship networks
-      const [result1, result2] = await Promise.all([
-        context.db.getMemberRelationshipNetwork(
-          user1Id,
-          context.guildId
-        ),
-        context.db.getMemberRelationshipNetwork(
-          user2Id,
-          context.guildId
-        ),
-      ]);
+	name: "getMutualConnections",
+	description: `Find the people two users both interact with (within each one's 25 strongest connections), ordered by combined closeness. ${MEANING}`,
+	parameters: {
+		type: "object",
+		properties: {
+			user1Id: {
+				type: "string",
+				description: "First user: Discord user ID or name",
+			},
+			user2Id: {
+				type: "string",
+				description: "Second user: Discord user ID or name",
+			},
+		},
+		required: ["user1Id", "user2Id"],
+	},
+	execute: async (
+		params: Record<string, unknown>,
+		context: ToolContext,
+	): Promise<string | DatabaseToolResult> => {
+		const { user1Id, user2Id } = params as { user1Id: string; user2Id: string };
+		try {
+			const pair = await resolvePair(user1Id, user2Id, context);
+			if ("error" in pair) return { success: false, error: pair.error };
+			const [first, second] = await Promise.all([
+				getConnections(context.db, context.guildId, pair.a, 25),
+				getConnections(context.db, context.guildId, pair.b, 25),
+			]);
+			const secondById = new Map<string, Connection>(
+				second.map((c) => [c.user_id, c]),
+			);
+			const mutual = first
+				.filter((c) => c.user_id !== pair.b && secondById.has(c.user_id))
+				.map((c) => {
+					const other = secondById.get(c.user_id) as Connection;
+					return {
+						name: c.name,
+						user_id: c.user_id,
+						with_user1: c,
+						with_user2: other,
+					};
+				})
+				.sort(
+					(x, y) =>
+						y.with_user1.share +
+						y.with_user2.share -
+						(x.with_user1.share + x.with_user2.share),
+				);
 
-      if (!result1.success || !result2.success) {
-        return {
-          success: false,
-          error: "Failed to get relationship networks",
-        };
-      }
-
-      const network1 = new Set(
-        (result1.data || []).map((r: RelationshipEntry) => r.user_id)
-      );
-      const network2 = new Set(
-        (result2.data || []).map((r: RelationshipEntry) => r.user_id)
-      );
-
-      // Find mutual connections
-      const mutualIds = Array.from(network1).filter((id) => network2.has(id));
-
-      if (mutualIds.length === 0) {
-        return {
-          success: true,
-          summary: "No mutual connections found",
-          data: {
-            formatted: "No mutual connections between these users",
-            connections: [],
-            count: 0,
-          },
-        };
-      }
-
-      // Get details for mutual connections
-      const namesResult = await context.db.query(
-        `SELECT user_id, display_name, username 
-         FROM members 
-         WHERE user_id = ANY($1::text[]) AND guild_id = $2 AND active = true`,
-        [mutualIds, context.guildId]
-      );
-
-      const connections: any[] = [];
-      if (namesResult.success && namesResult.data) {
-        for (const member of namesResult.data) {
-          const rel1 = (result1.data || []).find(
-            (r: RelationshipEntry) => r.user_id === member.user_id
-          );
-          const rel2 = (result2.data || []).find(
-            (r: RelationshipEntry) => r.user_id === member.user_id
-          );
-
-          connections.push({
-            user_id: member.user_id,
-            display_name: member.display_name,
-            username: member.username,
-            affinity_with_user1: rel1?.affinity_percentage || 0,
-            affinity_with_user2: rel2?.affinity_percentage || 0,
-          });
-        }
-      }
-
-      const formatted = connections
-        .map(
-          (conn) =>
-            `${conn.display_name}: ${conn.affinity_with_user1.toFixed(
-              1
-            )}% with user1, ${conn.affinity_with_user2.toFixed(1)}% with user2`
-        )
-        .join("\n");
-
-      return {
-        success: true,
-        summary: `Found ${connections.length} mutual connection(s)`,
-        data: {
-          formatted,
-          connections,
-          count: connections.length,
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Error in getMutualConnections:", error);
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to get mutual connections",
-      };
-    }
-  },
+			if (mutual.length === 0) {
+				return {
+					success: true,
+					summary: "No mutual connections",
+					data: { mutual: [], count: 0 },
+					formatted:
+						"These two users have no mutual connections among their top 25.",
+				};
+			}
+			const formatted = mutual
+				.map(
+					(m) =>
+						`${m.name}: ${describeStrength(m.with_user1)} with user 1 (${pct(m.with_user1.share)} of their interactions), ${describeStrength(m.with_user2)} with user 2 (${pct(m.with_user2.share)})`,
+				)
+				.join("\n");
+			return {
+				success: true,
+				summary: `Found ${mutual.length} mutual connection(s)`,
+				data: { mutual, count: mutual.length },
+				formatted,
+			};
+		} catch (error) {
+			return failure("getMutualConnections", error);
+		}
+	},
 };
 
-/**
- * Analyze relationship strength and patterns
- */
-export const analyzeRelationshipTool: DatabaseTool = {
-  name: "analyzeRelationship",
-  description:
-    "Analyze the relationship between two users including strength, interaction patterns, and conversation frequency. Use this for detailed relationship insights.",
-  parameters: {
-    type: "object",
-    properties: {
-      user1Id: {
-        type: "string",
-        description: "First user's Discord ID",
-      },
-      user2Id: {
-        type: "string",
-        description: "Second user's Discord ID",
-      },
-    },
-    required: ["user1Id", "user2Id"],
-  },
-  execute: async (
-    params: Record<string, any>,
-    context: ToolContext
-  ): Promise<string | DatabaseToolResult> => {
-    const { user1Id, user2Id } = params as { user1Id: string; user2Id: string };
-    try {
-      // Get relationship
-      const networkResult = await context.db.getMemberRelationshipNetwork(
-        user1Id,
-        context.guildId
-      );
-
-      if (!networkResult.success || !networkResult.data) {
-        return {
-          success: false,
-          error: `Failed to get relationship data`,
-        };
-      }
-
-      // relationship_network JSONB entries carry optional keywords (not in PostgreSQLManager's narrower type)
-      const network: RelationshipEntry[] = networkResult.data;
-      const relationship = network.find((r) => r.user_id === user2Id);
-
-      if (!relationship) {
-        return {
-          success: false,
-          error: `No relationship found between these users`,
-        };
-      }
-
-      // Analyze conversations
-      const conversations = relationship.conversations || [];
-      const totalConversations = conversations.length;
-      const totalMessages = conversations.reduce(
-        (sum, conv) => sum + conv.message_count,
-        0
-      );
-      const avgDuration =
-        conversations.length > 0
-          ? conversations.reduce(
-              (sum, conv) => sum + (conv.duration_minutes || 0),
-              0
-            ) / conversations.length
-          : 0;
-
-      // Get recent interaction
-      const recentConv =
-        conversations.length > 0
-          ? conversations.sort(
-              (a, b) =>
-                new Date(b.end_time).getTime() - new Date(a.end_time).getTime()
-            )[0]
-          : null;
-
-      const parts: string[] = [];
-      parts.push(`Relationship Analysis:`);
-      parts.push(
-        `  - Affinity Score: ${relationship.affinity_percentage.toFixed(1)}%`
-      );
-      parts.push(`  - Interaction Count: ${relationship.interaction_count}`);
-      parts.push(`  - Total Conversations: ${totalConversations}`);
-      parts.push(`  - Total Messages: ${totalMessages}`);
-
-      if (totalConversations > 0) {
-        parts.push(`  - Average Duration: ${avgDuration.toFixed(1)} minutes`);
-      }
-
-      if (relationship.summary) {
-        parts.push(`  - Summary: ${relationship.summary}`);
-      }
-
-      if (relationship.keywords && relationship.keywords.length > 0) {
-        parts.push(`  - Keywords: ${relationship.keywords.join(", ")}`);
-      }
-
-      if (recentConv) {
-        parts.push(
-          `  - Most Recent: ${new Date(
-            recentConv.end_time
-          ).toLocaleDateString()} (${recentConv.message_count} messages)`
-        );
-      }
-
-      // Strength classification
-      let strength = "Weak";
-      if (relationship.affinity_percentage >= 70) {
-        strength = "Very Strong";
-      } else if (relationship.affinity_percentage >= 50) {
-        strength = "Strong";
-      } else if (relationship.affinity_percentage >= 30) {
-        strength = "Moderate";
-      }
-
-      parts.push(`  - Relationship Strength: ${strength}`);
-
-      return {
-        success: true,
-        summary: `${strength} relationship (${relationship.affinity_percentage.toFixed(
-          1
-        )}% affinity)`,
-        data: {
-          formatted: parts.join("\n"),
-          relationship,
-          analysis: {
-            strength,
-            totalConversations,
-            totalMessages,
-            avgDuration,
-            recentConversation: recentConv,
-          },
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Error in analyzeRelationship:", error);
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to analyze relationship",
-      };
-    }
-  },
-};
-
-/**
- * Export all relationship tools for registration
- */
 export const relationshipTools: DatabaseTool[] = [
-  getUserRelationshipsTool,
-  getRelationshipBetweenTool,
-  getTopRelationshipsTool,
-  getMutualConnectionsTool,
-  analyzeRelationshipTool,
+	getUserConnectionsTool,
+	getRelationshipTool,
+	getMutualConnectionsTool,
 ];

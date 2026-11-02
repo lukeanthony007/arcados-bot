@@ -1,6 +1,9 @@
 import type { DatabaseTool, ToolContext } from "../registry/DatabaseTools";
 import { ConversationDetector } from "../../../features/social-intelligence/conversation-detection/ConversationDetector";
-import { RelationshipMapper } from "../../../features/social-intelligence/relationship-mapping/RelationshipMapper";
+import {
+	describeStrength,
+	getPairFacts,
+} from "../../../features/social-intelligence/facts/closeness";
 
 /**
  * Get live conversation context from the current channel
@@ -171,13 +174,13 @@ ${formattedMessages
 };
 
 /**
- * Get relationship matrix between conversation participants
+ * Get closeness between conversation participants
  * Provides social context about how participants know each other
  */
 export const getConversationParticipantRelationships: DatabaseTool = {
 	name: "getConversationParticipantRelationships",
 	description:
-		"Get the relationship matrix between all participants in the current active conversation. Shows affinity scores and connection strength. Use this to understand group dynamics and who knows whom.",
+		"Get how the participants of the current active conversation know each other: for every pair, a closeness label (very close / close / regular / occasional, or no recorded interactions), replies, mentions and shared conversations. Closeness is computed from real interactions. Use this to understand group dynamics and who knows whom.",
 	parameters: {
 		type: "object",
 		properties: {
@@ -193,7 +196,6 @@ export const getConversationParticipantRelationships: DatabaseTool = {
 			const channelId = String(params.channelId);
 
 			const conversationManager = new ConversationDetector(context.db);
-			const networkManager = new RelationshipMapper(context.db);
 
 			// Get active participants
 			const participantIds =
@@ -220,21 +222,6 @@ export const getConversationParticipantRelationships: DatabaseTool = {
 				};
 			}
 
-			// Get peer matrix
-			const matrixResult = await networkManager.getPeerMatrix(
-				participantIds,
-				context.guildId,
-			);
-
-			if (!matrixResult.success || !matrixResult.data) {
-				return {
-					success: false,
-					error: "Failed to retrieve relationship matrix",
-				};
-			}
-
-			const matrix = matrixResult.data as unknown as Record<string, Record<string, number>>;
-
 			// Get participant names
 			const participantNames = new Map<string, string>();
 			for (const userId of participantIds) {
@@ -260,73 +247,78 @@ export const getConversationParticipantRelationships: DatabaseTool = {
 				}
 			}
 
-			// Format relationships
+			// Closeness for every participant pair (from the first member's point of view)
 			const relationships: Array<{
 				user1: string;
 				user2: string;
-				affinity: number;
-				connectionStrength: string;
+				interacted: boolean;
+				description: string;
+				share: number;
+				reciprocity: number;
+				replies: number;
+				mentions: number;
+				sharedConversations: number;
 			}> = [];
 
+			const pairs: Array<[string, string]> = [];
 			for (let i = 0; i < participantIds.length; i++) {
 				for (let j = i + 1; j < participantIds.length; j++) {
-					const user1Id = participantIds[i]!;
-					const user2Id = participantIds[j]!;
-
-					const affinity = matrix[user1Id]?.[user2Id] || 0;
-
-					let connectionStrength = "No connection";
-					if (affinity >= 0.7) connectionStrength = "Strong connection";
-					else if (affinity >= 0.4) connectionStrength = "Moderate connection";
-					else if (affinity >= 0.15) connectionStrength = "Weak connection";
-
-					relationships.push({
-						user1: participantNames.get(user1Id) || "Unknown",
-						user2: participantNames.get(user2Id) || "Unknown",
-						affinity,
-						connectionStrength,
-					});
+					pairs.push([participantIds[i]!, participantIds[j]!]);
 				}
 			}
+			const pairFacts = await Promise.all(
+				pairs.map(([a, b]) => getPairFacts(context.db, context.guildId, a, b)),
+			);
 
-			// Sort by affinity (strongest first)
-			relationships.sort((a, b) => b.affinity - a.affinity);
+			pairs.forEach(([user1Id, user2Id], index) => {
+				const facts = pairFacts[index];
+				relationships.push({
+					user1: participantNames.get(user1Id) || "Unknown",
+					user2: participantNames.get(user2Id) || "Unknown",
+					interacted: facts !== null,
+					description: facts ? describeStrength(facts) : "no recorded interactions",
+					share: facts?.share ?? 0,
+					reciprocity: facts?.reciprocity ?? 0,
+					replies: (facts?.a_to_b.replies ?? 0) + (facts?.b_to_a.replies ?? 0),
+					mentions: (facts?.a_to_b.mentions ?? 0) + (facts?.b_to_a.mentions ?? 0),
+					sharedConversations: facts?.shared_conversations ?? 0,
+				});
+			});
 
-			// Format as natural text
+			// Strongest first (share of the first member's interactions); strangers last
+			relationships.sort((a, b) => b.share - a.share);
+
+			const strangers = relationships.filter((r) => !r.interacted);
+			const closePairs = relationships.filter((r) => r.share >= 0.1);
+
 			const formatted = `Participant Relationships:
 
 ${relationships
 	.map(
 		(rel) =>
-			`${rel.user1} ↔ ${rel.user2}: ${rel.connectionStrength} (affinity: ${rel.affinity.toFixed(2)})`,
+			`${rel.user1} ↔ ${rel.user2}: ${rel.description}${
+				rel.interacted
+					? ` (${rel.replies} replies, ${rel.mentions} mentions, ${rel.sharedConversations} shared conversations)`
+					: ""
+			}`,
 	)
 	.join("\n")}
 
 Social Context:
-${
-	relationships.some((r) => r.affinity >= 0.7)
-		? `- Strong connections detected (people who interact frequently)`
-		: ""
-}
-${
-	relationships.some((r) => r.affinity < 0.15)
-		? `- Some participants may be new or unfamiliar with each other`
-		: ""
-}`;
+${closePairs.length > 0 ? `- ${closePairs.length} close pair(s): people who interact frequently` : ""}
+${strangers.length > 0 ? `- ${strangers.length} pair(s) have never interacted` : ""}`;
 
 			return {
 				success: true,
-				summary: `Relationship matrix for ${participantIds.length} participants, ${relationships.length} connections analyzed`,
+				summary: `Relationships for ${participantIds.length} participants, ${relationships.length} pairs analyzed`,
 				data: {
 					participants: participantIds.map((id) => ({
 						userId: id,
 						displayName: participantNames.get(id) || "Unknown",
 					})),
 					relationships,
-					strongConnectionCount: relationships.filter((r) => r.affinity >= 0.7)
-						.length,
-					weakConnectionCount: relationships.filter((r) => r.affinity < 0.15)
-						.length,
+					closePairCount: closePairs.length,
+					strangerPairCount: strangers.length,
 				},
 				formatted,
 			};

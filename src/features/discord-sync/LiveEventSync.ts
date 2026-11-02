@@ -34,13 +34,6 @@ export class LiveEventSync {
 	private verbose: boolean;
 	private embeddingService: EmbeddingService;
 
-	// Rollup queue for relationship network updates (batched for performance)
-	private rollupQueue: Map<string, number> = new Map(); // userId:guildId -> interaction count
-	private rollupTimer?: NodeJS.Timeout;
-	private readonly ROLLUP_SIZE_THRESHOLD = 50;
-	private readonly ROLLUP_TIME_THRESHOLD = 30 * 1000; // 30 seconds
-	private lastRollupTime = Date.now();
-
 	// Deduplication for Discord event retries
 	private recentMessageIds: Map<string, number> = new Map(); // messageId -> timestamp
 	private readonly MESSAGE_DEDUP_WINDOW = 5000; // 5 seconds
@@ -126,8 +119,6 @@ export class LiveEventSync {
 
 		// Voice state updates are now handled directly in Bot.ts via VoiceStateCoordinator
 		// No need for LiveEventSync to handle voice events
-
-		this.startRollupTimer();
 	}
 
 	/**
@@ -304,8 +295,6 @@ export class LiveEventSync {
 				"a_to_b",
 				timestamp
 			);
-			this.queueRollup(authorId, guildId);
-			this.queueRollup(mentionedId, guildId);
 		}
 
 		// Handle reply interactions (2-level deep tracking)
@@ -325,8 +314,6 @@ export class LiveEventSync {
 						"a_to_b",
 						timestamp
 					);
-					this.queueRollup(authorId, guildId);
-					this.queueRollup(repliedToId, guildId);
 
 					// Second-level reply tracking (extended conversation threads)
 					if (
@@ -351,8 +338,6 @@ export class LiveEventSync {
 									"a_to_b",
 									timestamp
 								);
-								this.queueRollup(authorId, guildId);
-								this.queueRollup(originalAuthorId, guildId);
 							}
 						} catch {
 							// Original message may not be accessible
@@ -384,8 +369,6 @@ export class LiveEventSync {
 					"a_to_b",
 					timestamp
 				);
-				this.queueRollup(authorId, guildId);
-				this.queueRollup(otherMsg.author_id, guildId);
 			}
 		}
 	}
@@ -465,8 +448,6 @@ export class LiveEventSync {
 			"a_to_b",
 			new Date()
 		);
-		this.queueRollup(reactorId, guildId);
-		this.queueRollup(authorId, guildId);
 
 		this.stats.reactionsSynced++;
 	}
@@ -678,67 +659,6 @@ export class LiveEventSync {
 	}
 
 	/**
-	 * Queue a user for relationship network rollup
-	 */
-	private queueRollup(userId: string, guildId: string): void {
-		const key = `${guildId}:${userId}`;
-		this.rollupQueue.set(key, (this.rollupQueue.get(key) ?? 0) + 1);
-
-		const now = Date.now();
-		const timeSinceLastRollup = now - this.lastRollupTime;
-
-		if (
-			this.rollupQueue.size >= this.ROLLUP_SIZE_THRESHOLD ||
-			timeSinceLastRollup > this.ROLLUP_TIME_THRESHOLD
-		) {
-			this.processRollupQueue().catch((err) =>
-				console.error("🔸 LiveEventSync: Error processing rollup queue:", err)
-			);
-		}
-	}
-
-	/**
-	 * Start periodic rollup timer
-	 */
-	private startRollupTimer(): void {
-		this.rollupTimer = setInterval(async () => {
-			await this.processRollupQueue();
-		}, this.ROLLUP_TIME_THRESHOLD);
-	}
-
-	/**
-	 * Process queued rollups
-	 */
-	private async processRollupQueue(): Promise<void> {
-		if (this.rollupQueue.size === 0) return;
-
-		const entries = Array.from(this.rollupQueue.entries());
-		this.rollupQueue.clear();
-		this.lastRollupTime = Date.now();
-
-		const batchSize = 10;
-		for (let i = 0; i < entries.length; i += batchSize) {
-			const batch = entries.slice(i, i + batchSize);
-			await Promise.all(
-				batch.map(async ([key]) => {
-					const [guildId, userId] = key.split(":");
-					if (!guildId || !userId) return;
-
-					try {
-						await this.relationshipMapper.rollupEdgesToMemberNetwork(
-							userId,
-							guildId
-						);
-					} catch (err) {
-						console.error(`🔸 LiveEventSync: Failed to rollup for ${key}:`, err);
-						this.queueRollup(userId, guildId);
-					}
-				})
-			);
-		}
-	}
-
-	/**
 	 * Check if message was already processed (deduplication)
 	 */
 	private isMessageDuplicate(messageId: string): boolean {
@@ -781,11 +701,7 @@ export class LiveEventSync {
 	 * Stop watching (cleanup)
 	 */
 	async stop(): Promise<void> {
-		if (this.rollupTimer) {
-			clearInterval(this.rollupTimer);
-		}
 		await this.conversationDetector.finalizeAllSegments();
-		await this.processRollupQueue();
 		console.log("🔹 LiveEventSync stopped");
 	}
 

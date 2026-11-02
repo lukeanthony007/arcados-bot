@@ -4,9 +4,8 @@ import {
   type DatabaseToolResult,
   formatConversation,
 } from "../registry/DatabaseTools";
-import type { ConversationEntry } from "../../../features/social-intelligence/types";
 import { ConversationDetector } from "../../../features/social-intelligence/conversation-detection/ConversationDetector";
-import { pgvector, type RelationshipEntry } from "../../../database/PostgreSQLManager.js";
+import { pgvector } from "../../../database/PostgreSQLManager.js";
 import { EmbeddingService } from "../../../features/social-intelligence/semantic-analysis/EmbeddingService.js";
 
 /**
@@ -186,12 +185,12 @@ export const getConversationDetailsTool: DatabaseTool = {
 };
 
 /**
- * Get user's recent conversations across all relationships
+ * Get user's recent conversations, newest first
  */
 export const getRecentConversationsTool: DatabaseTool = {
   name: "getRecentConversations",
   description:
-    "Get a user's recent conversations across all their relationships. Use this to understand who someone has been talking to recently.",
+    "Get a user's most recent finalized conversations (newest first) with who took part, channel and summary. Use this to understand who someone has been talking to recently.",
   parameters: {
     type: "object",
     properties: {
@@ -212,76 +211,71 @@ export const getRecentConversationsTool: DatabaseTool = {
   ): Promise<string | DatabaseToolResult> => {
     const { userId, limit } = params as { userId: string; limit?: number };
     try {
-      // Get user's relationship network
-      const networkResult = await context.db.getMemberRelationshipNetwork(
-        userId,
-        context.guildId
+      const segmentsResult = await context.db.query(
+        `SELECT cs.id, cs.start_time, cs.end_time, cs.summary, cs.message_count,
+                cs.participants, c.name AS channel_name
+         FROM conversation_segments cs
+         LEFT JOIN channels c ON c.id = cs.channel_id AND c.guild_id = cs.guild_id
+         WHERE cs.guild_id = $1 AND $2 = ANY(cs.participants) AND cs.status = 'finalized'
+         ORDER BY cs.end_time DESC
+         LIMIT $3`,
+        [context.guildId, userId, limit || 10]
       );
 
-      if (!networkResult.success || !networkResult.data) {
+      if (!segmentsResult.success || !segmentsResult.data) {
         return {
           success: false,
-          error: `Failed to get relationship network: ${networkResult.error}`,
+          error: `Failed to get conversations: ${segmentsResult.error}`,
         };
       }
 
-      // Collect all conversations from relationships
-      const allConversations: Array<{
-        conversation: ConversationEntry;
-        otherUserId: string;
-        relationship: RelationshipEntry;
-      }> = [];
+      const segments: Array<{
+        id: string;
+        start_time: Date;
+        end_time: Date;
+        summary: string | null;
+        message_count: number;
+        participants: string[];
+        channel_name: string | null;
+      }> = segmentsResult.data;
 
-      for (const rel of networkResult.data) {
-        if (rel.conversations && rel.conversations.length > 0) {
-          for (const conv of rel.conversations) {
-            allConversations.push({
-              conversation: conv,
-              otherUserId: rel.user_id,
-              relationship: rel,
-            });
+      const participantIds = [...new Set(segments.flatMap((s) => s.participants))];
+      const nameMap = new Map<string, string>();
+      if (participantIds.length > 0) {
+        const namesResult = await context.db.query(
+          `SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
+           FROM members
+           WHERE user_id = ANY($1::text[]) AND guild_id = $2`,
+          [participantIds, context.guildId]
+        );
+        if (namesResult.success && namesResult.data) {
+          for (const member of namesResult.data) {
+            nameMap.set(member.user_id, member.name);
           }
         }
       }
 
-      // Sort by most recent
-      allConversations.sort(
-        (a, b) =>
-          new Date(b.conversation.end_time).getTime() -
-          new Date(a.conversation.end_time).getTime()
-      );
+      const limited = segments.map((seg) => ({
+        conversation_id: seg.id,
+        channel: seg.channel_name,
+        start_time: seg.start_time,
+        end_time: seg.end_time,
+        message_count: seg.message_count,
+        summary: seg.summary,
+        participants: seg.participants
+          .filter((id) => id !== userId)
+          .map((id) => nameMap.get(id) ?? id),
+      }));
 
-      // Get display names
-      const userIds = [
-        ...new Set(allConversations.map((c) => c.otherUserId)),
-      ].slice(0, limit || 10);
-
-      const namesResult = await context.db.query(
-        `SELECT user_id, display_name, username 
-         FROM members 
-         WHERE user_id = ANY($1::text[]) AND guild_id = $2 AND active = true`,
-        [userIds, context.guildId]
-      );
-
-      const nameMap = new Map();
-      if (namesResult.success && namesResult.data) {
-        for (const member of namesResult.data) {
-          nameMap.set(member.user_id, member);
-        }
-      }
-
-      // Format conversations
-      const limited = allConversations.slice(0, limit || 10);
       const formatted = limited
-        .map((item, idx) => {
-          const member = nameMap.get(item.otherUserId);
-          const name = member?.display_name || item.otherUserId;
-          const conv = item.conversation;
-          return `${idx + 1}. With ${name} (${conv.conversation_id}):\n   ${
+        .map((conv, idx) => {
+          const others = conv.participants.join(", ") || "no one else";
+          const where = conv.channel ? ` in #${conv.channel}` : "";
+          return `${idx + 1}. With ${others}${where} (${conv.conversation_id}):\n   ${
             conv.message_count
-          } messages, ${conv.duration_minutes} min, ${new Date(
-            conv.end_time
-          ).toLocaleDateString()}`;
+          } messages, ${new Date(conv.end_time).toLocaleDateString()}${
+            conv.summary ? `\n   ${conv.summary}` : ""
+          }`;
         })
         .join("\n\n");
 
@@ -852,8 +846,8 @@ export const getRecentConversationMessagesTool: DatabaseTool = {
       rankBy: {
         type: "string",
         description:
-          "How to rank conversations: 'message_count' (default), 'drama_score', or 'recent'",
-        enum: ["message_count", "drama_score", "recent"],
+          "How to rank conversations: 'message_count' (default) or 'recent'",
+        enum: ["message_count", "recent"],
       },
     },
     required: [],
@@ -875,10 +869,6 @@ export const getRecentConversationMessagesTool: DatabaseTool = {
       // Build ranking ORDER BY clause
       let orderByClause: string;
       switch (rankBy) {
-        case "drama_score":
-          orderByClause =
-            "(COALESCE((features->>'drama_score')::numeric, 0)) DESC, message_count DESC";
-          break;
         case "recent":
           orderByClause = "end_time DESC";
           break;

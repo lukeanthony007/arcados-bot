@@ -10,6 +10,7 @@
  */
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
+import { getConnections } from "../facts/closeness";
 import { pgvector } from "../../../database/PostgreSQLManager.js";
 import { CommunicationStyleAnalyzer } from "./analyzers/CommunicationStyleAnalyzer";
 import { TemporalPatternAnalyzer } from "./analyzers/TemporalPatternAnalyzer";
@@ -368,13 +369,9 @@ export class PsychologicalProfiler {
 					}))
 				: [];
 
-		// Get user relationships and profile data (from user_profiles)
+		// Strongest connections (computed on demand from messages) and profile data
+		const relationships = await getConnections(this.db, guildId, userId, 5);
 		const profileResult = await this.db.getUserProfile(userId, guildId);
-
-		const relationships =
-			profileResult.success && profileResult.data
-				? (profileResult.data.relationship_network || [])
-				: [];
 
 		const keywords =
 			profileResult.success && profileResult.data
@@ -633,7 +630,7 @@ export class PsychologicalProfiler {
 
 	/**
 	 * Build interaction style metrics. Reaction counts are not stored per user in the
-	 * database (relationship_edges.reactions is pair-level and undirected), so no
+	 * database (reactions are only tracked pair-level and undirected), so no
 	 * reactions metric is produced.
 	 */
 	private buildInteractionStyle(data: UserAnalysisData): InteractionStyle {

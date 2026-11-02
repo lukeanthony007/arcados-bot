@@ -17,9 +17,7 @@ import type {
 	StreamingConversation,
 	FinalizedConversation,
 	ConversationQueryOptions,
-	RelationshipQueryOptions,
 	SemanticSearchOptions,
-	RelationshipEntry,
 	ConversationFeatures,
 	KeywordScore,
 } from "./types";
@@ -48,13 +46,6 @@ export class SocialIntelligence {
 	private keywordExtractor: KeywordExtractor;
 	private embeddingService: EmbeddingService;
 
-	// Relationship rollup queue (shared with LiveEventSync logic)
-	private rollupQueue: Map<string, number> = new Map(); // userId:guildId -> interaction count
-	private rollupTimer?: NodeJS.Timeout;
-	private readonly ROLLUP_SIZE_THRESHOLD = 50;
-	private readonly ROLLUP_TIME_THRESHOLD = 30 * 1000; // 30 seconds
-	private lastRollupTime = Date.now();
-
 	constructor(db: PostgreSQLManager) {
 		this.db = db;
 
@@ -63,8 +54,6 @@ export class SocialIntelligence {
 		this.relationshipMapper = new RelationshipMapper(db);
 		this.keywordExtractor = new KeywordExtractor(db);
 		this.embeddingService = EmbeddingService.getInstance();
-
-		this.startRollupTimer();
 	}
 
 	// ============================================================================
@@ -488,123 +477,6 @@ export class SocialIntelligence {
 	}
 
 	// ============================================================================
-	// RELATIONSHIP QUERIES (Called by AI tools)
-	// ============================================================================
-
-	/**
-	 * Get user's relationships (live data)
-	 *
-	 * Queries relationship_network_live view, which prioritizes fresh raw edges
-	 * over cached JSONB (eliminates 30-second lag).
-	 *
-	 * @param userId User ID
-	 * @param guildId Guild ID
-	 * @param options Query options
-	 * @returns Array of relationship entries
-	 */
-	async getRelationships(
-		userId: string,
-		guildId: string,
-		options?: RelationshipQueryOptions
-	): Promise<RelationshipEntry[]> {
-		const opts: RelationshipQueryOptions = {
-			useLiveView: true,
-			limit: 25,
-			...options,
-		};
-
-		if (opts.useLiveView !== false) {
-			const liveResult = await this.db.query(
-				`
-				SELECT relationship_network
-				FROM relationship_network_live
-				WHERE guild_id = $1 AND user_id = $2
-				LIMIT 1
-			`,
-				[guildId, userId]
-			);
-
-			if (
-				liveResult.success &&
-				liveResult.data &&
-				liveResult.data.length > 0 &&
-				liveResult.data[0].relationship_network
-			) {
-				const parsed = this.ensureArray<RelationshipEntry>(
-					liveResult.data[0].relationship_network
-				);
-
-				if (parsed.length > 0) {
-					const totalPoints = parsed.reduce(
-						(sum, entry) => sum + (entry.raw_points || 0),
-						0
-					);
-
-					const normalized = parsed
-						.map((entry) => ({
-							user_id: entry.user_id,
-							affinity_percentage:
-								totalPoints > 0
-									? ((entry.raw_points || 0) / totalPoints) * 100
-									: entry.affinity_percentage || 0,
-							interaction_count: entry.interaction_count || 0,
-							last_interaction: entry.last_interaction
-								? new Date(entry.last_interaction)
-								: new Date(),
-							conversations: entry.conversations,
-							display_name: entry.display_name,
-							username: entry.username,
-							raw_points: entry.raw_points,
-							total_messages: entry.total_messages,
-						}))
-						.sort((a, b) => b.affinity_percentage - a.affinity_percentage);
-
-					return this.applyRelationshipFilters(normalized, opts);
-				}
-			}
-		}
-
-		const fallback = await this.relationshipMapper.getTopRelationships(
-			userId,
-			guildId,
-			opts.limit ?? 25
-		);
-
-		if (fallback.success && fallback.data) {
-			return this.applyRelationshipFilters(fallback.data, opts);
-		}
-
-		return [];
-	}
-
-	/**
-	 * Get affinity score between two users
-	 *
-	 * Calculates affinity based on:
-	 * - Shared conversation segments
-	 * - Direct interactions (mentions, replies, reactions)
-	 * - Proximity interactions (same channel, time window)
-	 *
-	 * @param user1Id First user ID
-	 * @param user2Id Second user ID
-	 * @param guildId Guild ID
-	 * @returns Affinity score (0-100)
-	 */
-	async getAffinityScore(
-		user1Id: string,
-		user2Id: string,
-		guildId: string
-	): Promise<number> {
-		const result = await this.relationshipMapper.calculateAffinityScore(
-			user1Id,
-			user2Id,
-			guildId
-		);
-
-		return this.normalizeAffinity(result.raw_points ?? 0);
-	}
-
-	// ============================================================================
 	// SEMANTIC ANALYSIS (Called by AI tools or enrichment pipeline)
 	// ============================================================================
 
@@ -857,70 +729,11 @@ export class SocialIntelligence {
 				direction,
 				timestamp
 			);
-			this.queueRollup(authorId, guildId);
-			this.queueRollup(otherId, guildId);
 		} catch (error) {
 			console.error(
 				`[SocialIntelligence] Failed to record ${kind} interaction for ${authorId} -> ${otherId}:`,
 				error
 			);
-		}
-	}
-
-	private queueRollup(userId: string, guildId: string): void {
-		if (!userId) {
-			return;
-		}
-		const key = `${guildId}:${userId}`;
-		this.rollupQueue.set(key, (this.rollupQueue.get(key) ?? 0) + 1);
-
-		const now = Date.now();
-		const timeSinceLastRollup = now - this.lastRollupTime;
-
-		if (
-			this.rollupQueue.size >= this.ROLLUP_SIZE_THRESHOLD ||
-			timeSinceLastRollup > this.ROLLUP_TIME_THRESHOLD
-		) {
-			void this.processRollupQueue();
-		}
-	}
-
-	private startRollupTimer(): void {
-		if (this.rollupTimer) {
-			clearInterval(this.rollupTimer);
-		}
-
-		this.rollupTimer = setInterval(() => {
-			void this.processRollupQueue();
-		}, this.ROLLUP_TIME_THRESHOLD);
-	}
-
-	private async processRollupQueue(): Promise<void> {
-		if (this.rollupQueue.size === 0) {
-			return;
-		}
-
-		const entries = Array.from(this.rollupQueue.keys());
-		this.rollupQueue.clear();
-		this.lastRollupTime = Date.now();
-
-		for (const entry of entries) {
-			const [guildId, userId] = entry.split(":");
-			if (!guildId || !userId) {
-				continue;
-			}
-
-			try {
-				await this.relationshipMapper.rollupEdgesToMemberNetwork(
-					userId,
-					guildId
-				);
-			} catch (error) {
-				console.error(
-					`[SocialIntelligence] Failed to roll up relationship network for ${entry}:`,
-					error
-				);
-			}
 		}
 	}
 
@@ -1168,35 +981,6 @@ export class SocialIntelligence {
 
 		return Math.min(matches * 0.02, 0.1);
 	}
-
-	private applyRelationshipFilters(
-		entries: RelationshipEntry[],
-		options: RelationshipQueryOptions
-	): RelationshipEntry[] {
-		let filtered = entries;
-
-		if (options.minAffinity) {
-			filtered = filtered.filter(
-				(entry) => entry.affinity_percentage >= options.minAffinity!
-			);
-		}
-
-		if (options.limit) {
-			filtered = filtered.slice(0, options.limit);
-		}
-
-		return filtered;
-	}
-
-	private normalizeAffinity(points: number): number {
-		if (points <= 0) {
-			return 0;
-		}
-
-		const score = Math.min(100, Math.log10(points + 1) * 25);
-		return Math.round(score * 100) / 100;
-	}
-
 }
 
 // Export types for convenience

@@ -8,6 +8,12 @@ import type {
 	PostgreSQLManager,
 	UserPersonaData,
 } from "../../database/PostgreSQLManager";
+import {
+	type Connection,
+	describeStrength,
+	getConnections,
+	getPairFacts,
+} from "../social-intelligence/facts/closeness";
 import { SLUR_PATTERN } from "./personaPrompt";
 
 /** People to add history for per turn */
@@ -18,20 +24,12 @@ const MAX_THEIR_MESSAGES = 5;
 /** Messages pinging more people than this are group VC summons, not about the person */
 const MAX_MENTIONS_PER_MESSAGE = 3;
 /** People listed in the "who you actually interact with" ranking */
-const TOP_INTERACTIONS = 8;
+const TOP_CONNECTIONS = 8;
 
 interface MemberName {
 	user_id: string;
 	name: string;
 	aliases: string[];
-}
-
-interface EdgeRow {
-	from_persona: boolean;
-	messages: number;
-	mentions: number;
-	replies: number;
-	last_interaction: Date | null;
 }
 
 interface ConversationRow {
@@ -43,12 +41,6 @@ interface ConversationRow {
 interface MessageRow {
 	content: string;
 	created_at: Date;
-}
-
-export interface InteractionRow {
-	user_id: string;
-	outgoing: number;
-	incoming: number;
 }
 
 export async function buildPersonaContext(
@@ -67,7 +59,7 @@ export async function buildPersonaContext(
 	);
 
 	const sections = await Promise.all([
-		describeTopInteractions(db, guildId, persona, byId),
+		describeTopInteractions(db, guildId, persona),
 		...people.map((personId) =>
 			describeHistory(db, guildId, persona, personId, byId),
 		),
@@ -75,48 +67,9 @@ export async function buildPersonaContext(
 	return sections.filter(Boolean).join("\n\n");
 }
 
-/**
- * Who a member really talks with: replies and direct mentions in both directions over their
- * whole history (group pings and bots excluded), most interactions first.
- */
-export async function getTopInteractions(
-	db: PostgreSQLManager,
-	guildId: string,
-	userId: string,
-	limit = TOP_INTERACTIONS,
-): Promise<InteractionRow[]> {
-	const result = await db.query(
-		`WITH replies AS (
-			SELECT p.author_id AS other, 'out' AS dir
-			FROM messages m JOIN messages p ON p.id = m.referenced_message_id
-			WHERE m.guild_id = $1 AND m.author_id = $2 AND p.author_id <> $2
-			UNION ALL
-			SELECT m.author_id, 'in'
-			FROM messages m JOIN messages p ON p.id = m.referenced_message_id
-			WHERE m.guild_id = $1 AND p.author_id = $2 AND m.author_id <> $2
-		), mentions AS (
-			SELECT (regexp_matches(m.content, '<@!?(\\d+)>', 'g'))[1] AS other, 'out' AS dir
-			FROM messages m
-			WHERE m.guild_id = $1 AND m.author_id = $2 AND m.content LIKE '%<@%'
-			AND array_length(regexp_split_to_array(m.content, '<@'), 1) <= $3 + 1
-			UNION ALL
-			SELECT m.author_id, 'in'
-			FROM messages m
-			WHERE m.guild_id = $1 AND m.author_id <> $2 AND strpos(m.content, '<@' || $2) > 0
-			AND array_length(regexp_split_to_array(m.content, '<@'), 1) <= $3 + 1
-		)
-		SELECT x.other AS user_id,
-			COUNT(*) FILTER (WHERE x.dir = 'out')::int AS outgoing,
-			COUNT(*) FILTER (WHERE x.dir = 'in')::int AS incoming
-		FROM (SELECT * FROM replies UNION ALL SELECT * FROM mentions) x
-		JOIN members mem ON mem.guild_id = $1 AND mem.user_id = x.other AND mem.bot = false
-		WHERE x.other <> $2
-		GROUP BY x.other
-		ORDER BY COUNT(*) DESC
-		LIMIT $4`,
-		[guildId, userId, MAX_MENTIONS_PER_MESSAGE, limit],
-	);
-	return result.success && result.data ? result.data : [];
+/** One line per connection: strength label, who reaches out, shared conversations, last contact */
+export function describeConnection(connection: Connection): string {
+	return `${describeStrength(connection)} (they reach out ${Math.round(connection.inbound)}, you ${Math.round(connection.outbound)}; ${connection.shared_conversations} shared conversations; last ${formatDate(connection.last_interaction)})`;
 }
 
 /** Grounds "who are your friends" answers in data instead of the profile's summary */
@@ -124,17 +77,21 @@ async function describeTopInteractions(
 	db: PostgreSQLManager,
 	guildId: string,
 	persona: UserPersonaData,
-	byId: Map<string, MemberName>,
 ): Promise<string> {
-	const rows = await getTopInteractions(db, guildId, persona.user_id);
-	if (rows.length === 0) return "";
+	const connections = await getConnections(
+		db,
+		guildId,
+		persona.user_id,
+		TOP_CONNECTIONS,
+	);
+	if (connections.length === 0) return "";
 
 	const self = persona.display_name;
 	return [
-		`Who you (${self}) actually interact with most (replies and direct mentions over your whole history; this overrides the profile about who you're close to):`,
-		...rows.map(
-			(row) =>
-				`- ${byId.get(row.user_id)?.name ?? row.user_id} (<@${row.user_id}>): you → them ${row.outgoing}, them → you ${row.incoming}`,
+		`Who you (${self}) actually interact with most (from your replies, direct mentions and shared conversations; this overrides the profile about who you're close to):`,
+		...connections.map(
+			(connection) =>
+				`- ${connection.name} (<@${connection.user_id}>): ${describeConnection(connection)}`,
 		),
 	].join("\n");
 }
@@ -195,13 +152,8 @@ async function describeHistory(
 	const other = byId.get(personId);
 	if (!other) return "";
 
-	const [edges, profile, conversations, own, theirs] = await Promise.all([
-		db.query(
-			`SELECT user_a = $2 AS from_persona, msg_a_to_b AS messages, mentions, replies, last_interaction
-			FROM relationship_edges
-			WHERE guild_id = $1 AND ((user_a = $2 AND user_b = $3) OR (user_a = $3 AND user_b = $2))`,
-			[guildId, persona.user_id, personId],
-		),
+	const [pair, profile, conversations, own, theirs] = await Promise.all([
+		getPairFacts(db, guildId, persona.user_id, personId),
 		db.query(
 			`SELECT summary FROM relationship_profiles
 			WHERE guild_id = $1 AND user_a = LEAST($2, $3) AND user_b = GREATEST($2, $3) AND summary IS NOT NULL`,
@@ -231,16 +183,15 @@ async function describeHistory(
 		`What you (${self}) actually have with ${other.name} (<@${personId}>):`,
 	];
 
-	const edgeRows: EdgeRow[] = edges.success && edges.data ? edges.data : [];
-	const outbound = edgeRows.find((row) => row.from_persona);
-	const inbound = edgeRows.find((row) => !row.from_persona);
-	if (outbound || inbound) {
-		const last = edgeRows
-			.map((row) => row.last_interaction)
-			.filter((date): date is Date => date !== null)
-			.sort((a, b) => b.getTime() - a.getTime())[0];
+	if (pair) {
+		const direction = (
+			who: string,
+			to: string,
+			d: { replies: number; mentions: number },
+		) =>
+			`${who} → ${to} ${d.replies} ${d.replies === 1 ? "reply" : "replies"}, ${d.mentions} ${d.mentions === 1 ? "mention" : "mentions"}`;
 		lines.push(
-			`- Interactions: you → them ${count(outbound)}; them → you ${count(inbound)}${last ? `; last ${formatDate(last)}` : ""}`,
+			`- Closeness: ${describeStrength(pair)}; ${direction("you", "them", pair.a_to_b)}; ${direction("them", "you", pair.b_to_a)}; ${pair.shared_conversations} shared conversations; last ${formatDate(pair.last_interaction)}`,
 		);
 	}
 
@@ -316,11 +267,6 @@ async function messagesAbout(
 			(row) =>
 				`${formatDate(row.created_at)}: ${row.content.replace(/\s+/g, " ").slice(0, 200)}`,
 		);
-}
-
-function count(row: EdgeRow | undefined): string {
-	if (!row) return "none";
-	return `${row.messages} messages, ${row.mentions} mentions, ${row.replies} replies`;
 }
 
 /** At least a few real words once mentions and links are removed (skips bare pings and link drops) */

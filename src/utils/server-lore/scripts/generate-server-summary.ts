@@ -9,6 +9,7 @@
 import { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { OmpRuntime } from "../../../ai/runtime/OmpRuntime";
 import { config } from "../../../config/index.js";
+import { getGuildGraph } from "../../../features/social-intelligence/facts/closeness";
 
 const db = new PostgreSQLManager();
 
@@ -63,30 +64,16 @@ async function main() {
 
     const guildName = guildRow?.name || guildId;
 
-    // Identify hub users based on relationship_pairs (most socially central members)
-    const hubResult = await db.query(
-      `
-      SELECT user_id, SUM(total_interactions) AS hub_score
-      FROM (
-        SELECT guild_id, u_min AS user_id, total_interactions
-        FROM relationship_pairs
-        WHERE guild_id = $1
-        UNION ALL
-        SELECT guild_id, u_max AS user_id, total_interactions
-        FROM relationship_pairs
-        WHERE guild_id = $1
-      ) t
-      GROUP BY user_id
-      ORDER BY hub_score DESC
-      LIMIT 15
-      `,
-      [guildId]
-    );
-
-    const hubUsers: string[] =
-      hubResult.success && hubResult.data
-        ? hubResult.data.map((row: any) => String(row.user_id))
-        : [];
+    // Hub users: most socially central members by total closeness
+    const hubScores = new Map<string, number>();
+    for (const edge of await getGuildGraph(db, guildId)) {
+      hubScores.set(edge.a, (hubScores.get(edge.a) ?? 0) + edge.strength);
+      hubScores.set(edge.b, (hubScores.get(edge.b) ?? 0) + edge.strength);
+    }
+    const hubUsers = [...hubScores.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([userId]) => userId);
 
     // Fetch finalized conversation segments with summaries (lifetime, capped),
     // biased toward conversations involving hub users, plus a smaller sample

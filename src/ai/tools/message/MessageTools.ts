@@ -221,7 +221,7 @@ export const searchMessagesTool: DatabaseTool = {
 export const getMessageInteractionsTool: DatabaseTool = {
   name: "getMessageInteractions",
   description:
-    "Get interactions (mentions, replies) involving a user within a time window. Use this to see who has been interacting with someone.",
+    "Get recent mentions of and replies to a user within a time window (newest first). Use this to see who has just been talking to someone; for long-term closeness use getUserConnections.",
   parameters: {
     type: "object",
     properties: {
@@ -259,12 +259,18 @@ export const getMessageInteractionsTool: DatabaseTool = {
         [context.guildId, since, `%<@${userId}>%`]
       );
 
-      // Get messages from nearby interactions (same channel within time window)
-      const interactionsResult = await context.db.getMessageInteractions(
-        userId,
-        userId, // This will find interactions in same channels
-        context.guildId,
-        timeWindowMinutes
+      // Get replies to the user's messages in the window
+      const repliesResult = await context.db.query(
+        `SELECT DISTINCT m.author_id, m.created_at, mem.display_name, mem.username
+         FROM messages m
+         JOIN messages p ON p.id = m.referenced_message_id
+         JOIN members mem ON m.author_id = mem.user_id AND m.guild_id = mem.guild_id
+         WHERE m.guild_id = $1
+           AND m.active = true
+           AND m.created_at >= $2
+           AND p.author_id = $3
+           AND m.author_id <> $3`,
+        [context.guildId, since, userId]
       );
 
       const interactions: any[] = [];
@@ -280,15 +286,20 @@ export const getMessageInteractionsTool: DatabaseTool = {
         }
       }
 
-      if (interactionsResult.success && interactionsResult.data) {
-        for (const interaction of interactionsResult.data) {
+      if (repliesResult.success && repliesResult.data) {
+        for (const msg of repliesResult.data) {
           interactions.push({
-            type: interaction.interaction_type,
-            authorId: interaction.other_user_id,
-            timestamp: interaction.timestamp,
+            type: "reply",
+            authorId: msg.author_id,
+            authorName: msg.display_name || msg.username,
+            timestamp: msg.created_at,
           });
         }
       }
+
+      interactions.sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
 
       // Get author names for interactions
       const authorIds = [...new Set(interactions.map((i) => i.authorId))];

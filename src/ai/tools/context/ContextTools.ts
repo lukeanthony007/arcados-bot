@@ -3,6 +3,7 @@ import {
   type ToolContext,
   type DatabaseToolResult,
 } from "../registry/DatabaseTools";
+import { getConnections } from "../../../features/social-intelligence/facts/closeness";
 
 /**
  * Fetch recent guild messages for context-rich AI responses
@@ -384,59 +385,8 @@ export const getHolisticUserContextTool: DatabaseTool = {
         }
       }
 
-      // Top relationships (prefer embedded network for speed)
-      let relationshipsFormatted = "No relationships tracked";
-      let relationships = Array.isArray(profile?.relationship_network) ? profile.relationship_network : [];
-      if (relationships.length > 0) {
-        const top = relationships
-          .slice()
-          .sort((a: any, b: any) => (b.affinity_percentage || 0) - (a.affinity_percentage || 0))
-          .slice(0, relationshipsLimit);
-        relationshipsFormatted = top
-          .map(
-            (r: any) =>
-              `  - ${r.display_name || r.username || r.user_id}: ${(r.affinity_percentage || 0).toFixed(1)}% affinity, ${r.interaction_count || 0} interactions${r.summary ? `, ${r.summary}` : ""}`
-          )
-          .join("\n");
-        relationships = top;
-      } else {
-        // Fallback: query edges table for recent relationships
-        const edges = await context.db.query(
-          `SELECT CASE WHEN user_a = $1 THEN user_b ELSE user_a END AS other_user,
-                  rolling_7d, total, last_interaction
-           FROM relationship_edges
-           WHERE guild_id = $2 AND (user_a = $1 OR user_b = $1)
-           ORDER BY rolling_7d DESC, total DESC
-           LIMIT $3`,
-          [userId, context.guildId, relationshipsLimit]
-        );
-        if (edges.success && edges.data && edges.data.length > 0) {
-          const otherIds = edges.data.map((e: any) => e.other_user);
-          const names = await context.db.query(
-            `SELECT user_id, display_name, username FROM members WHERE guild_id = $1 AND user_id = ANY($2::text[])`,
-            [context.guildId, otherIds]
-          );
-          const nameMap = new Map<string, string>();
-          if (names.success && names.data) {
-            for (const n of names.data) {
-              nameMap.set(n.user_id, n.display_name || n.username || n.user_id);
-            }
-          }
-          relationships = edges.data.map((e: any) => ({
-            user_id: e.other_user,
-            display_name: nameMap.get(e.other_user) || e.other_user,
-            affinity_percentage: e.rolling_7d || 0,
-            interaction_count: e.total || 0,
-            last_interaction: e.last_interaction,
-          }));
-          relationshipsFormatted = relationships
-            .map(
-              (r: any) =>
-                `  - ${r.display_name}: ${(r.affinity_percentage || 0).toFixed(1)}% affinity, ${r.interaction_count || 0} interactions`
-            )
-            .join("\n");
-        }
-      }
+      // Closest people, computed on demand from replies, mentions and shared conversations
+      const connections = await getConnections(context.db, context.guildId, userId, relationshipsLimit);
 
       // Recent messages by the user
       const messagesResult = await context.db.query(
@@ -530,18 +480,9 @@ export const getHolisticUserContextTool: DatabaseTool = {
       const parts: string[] = [];
       parts.push(header.join(" \u2014 "));
 
-      // Include user keywords/interests if available
-      if (profile?.keywords && Array.isArray(profile.keywords) && profile.keywords.length > 0) {
-        const topKeywords = profile.keywords.slice(0, 8).join(", ");
-        parts.push(`Interests: ${topKeywords}`);
-      }
-
-      // Include top relationships as natural connections (no percentages/counts)
-      if (relationshipsFormatted !== "No relationships tracked" && relationships.length > 0) {
-        const topConnections = relationships.slice(0, 3).map((r: any) => r.display_name || r.username || r.user_id);
-        if (topConnections.length > 0) {
-          parts.push(`Close connections: ${topConnections.join(", ")}`);
-        }
+      // Closest people by interaction (computed from replies, mentions, shared conversations)
+      if (connections.length > 0) {
+        parts.push(`Close connections: ${connections.slice(0, 3).map((c) => c.name).join(", ")}`);
       }
 
       // Add conversation topics if available (prioritize over raw messages)
@@ -563,7 +504,7 @@ export const getHolisticUserContextTool: DatabaseTool = {
           formatted,
           member,
           roleNames,
-          relationships,
+          connections,
           recentMessages,
           lookbackDays,
         },

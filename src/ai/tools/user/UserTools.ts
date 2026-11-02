@@ -3,81 +3,13 @@ import {
   type ToolContext,
   type DatabaseToolResult,
   formatUserInfo,
+  resolveUserId,
 } from "../registry/DatabaseTools";
 import type { MemberData } from "../../../database/PostgreSQLManager";
-
-/**
- * Resolve a user identifier (ID or name) to a Discord user ID.
- * If the input is already a Discord ID (numeric, 17-19 digits), returns it as-is.
- * Otherwise, searches for the user by name and returns their ID.
- */
-async function resolveUserId(
-  identifier: string,
-  guildId: string,
-  db: ToolContext["db"]
-): Promise<{ success: boolean; userId?: string; error?: string }> {
-  // Check if it's already a Discord ID (numeric, 17-19 digits)
-  const isDiscordId = /^\d{17,19}$/.test(identifier);
-  if (isDiscordId) {
-    return { success: true, userId: identifier };
-  }
-
-  // Search for user by name
-  const searchTerm = `%${identifier.toLowerCase()}%`;
-  const searchResult = await db.query(
-    `SELECT user_id, display_name, username, global_name, nick
-     FROM members 
-     WHERE guild_id = $1 
-       AND active = true
-       AND (
-         LOWER(display_name) LIKE $2
-         OR LOWER(username) LIKE $2
-         OR LOWER(COALESCE(global_name, '')) LIKE $2
-         OR LOWER(COALESCE(nick, '')) LIKE $2
-       )
-     ORDER BY 
-       CASE 
-         WHEN LOWER(username) = LOWER($3) THEN 1
-         WHEN LOWER(display_name) = LOWER($3) THEN 2
-         WHEN LOWER(COALESCE(global_name, '')) = LOWER($3) THEN 3
-         WHEN LOWER(COALESCE(nick, '')) = LOWER($3) THEN 4
-         ELSE 5
-       END,
-       display_name
-     LIMIT 1`,
-    [guildId, searchTerm, identifier]
-  );
-
-  if (searchResult.success && searchResult.data && searchResult.data.length > 0) {
-    return { success: true, userId: searchResult.data[0].user_id };
-  }
-
-  // Try inactive members as fallback
-  const fallbackSearch = await db.query(
-    `SELECT user_id, display_name, username, global_name, nick
-     FROM members 
-     WHERE guild_id = $1 
-       AND active = false
-       AND (
-         LOWER(display_name) LIKE $2
-         OR LOWER(username) LIKE $2
-         OR LOWER(COALESCE(global_name, '')) LIKE $2
-         OR LOWER(COALESCE(nick, '')) LIKE $2
-       )
-     ORDER BY display_name
-     LIMIT 1`,
-    [guildId, searchTerm]
-  );
-
-  if (fallbackSearch.success && fallbackSearch.data && fallbackSearch.data.length > 0) {
-    return { success: true, userId: fallbackSearch.data[0].user_id };
-  }
-
-  return {
-    success: false,
-    error: `User "${identifier}" not found in this server. Try using searchUsers to find users by name.`,
-  };
-}
+import {
+  describeStrength,
+  getConnections,
+} from "../../../features/social-intelligence/facts/closeness";
 
 /**
  * Get complete user profile information
@@ -85,7 +17,7 @@ async function resolveUserId(
 export const getUserInfoTool: DatabaseTool = {
   name: "getUserInfo",
   description:
-    "Get comprehensive user information for natural conversation context. Returns rich narrative-focused details including: who they are, how long they've been around, what topics they're into (from keywords and recent conversations), recent conversation summaries with specific details, and who they interact with. The response includes detailed conversation context like 'Recently he's been chatting about [specific events/discussions]' and topics of interest. Focus on building a flowing, conversational understanding with specific examples rather than listing generic stats. If no userId is provided, use the requesting user (for prompts like 'who am I'). Can accept either a Discord user ID (numeric string) or a username/display name (will search automatically).",
+    "Get comprehensive user information for natural conversation context. Returns rich narrative-focused details including: who they are, how long they've been around, topics from their recent conversations, recent conversation summaries with specific details, and who they interact with most (closest people, with how close, how often, and how reciprocal). The response includes detailed conversation context like 'Recently he's been chatting about [specific events/discussions]'. Focus on building a flowing, conversational understanding with specific examples rather than listing generic stats. If no userId is provided, use the requesting user (for prompts like 'who am I'). Can accept either a Discord user ID (numeric string) or a username/display name (will search automatically).",
   parameters: {
     type: "object",
     properties: {
@@ -138,10 +70,7 @@ export const getUserInfoTool: DatabaseTool = {
           // Get profile data for inactive member
           const profileResult = await context.db.getUserProfile(targetUserId, context.guildId);
           const summary = profileResult.success && profileResult.data ? profileResult.data.summary : undefined;
-          const formatted = formatUserInfo(
-            member,
-            profileResult.success ? profileResult.data : null
-          );
+          const formatted = formatUserInfo(member, profileResult.success ? profileResult.data : null);
           return {
             success: true,
             summary: `${member.display_name} - ${
@@ -197,80 +126,8 @@ export const getUserInfoTool: DatabaseTool = {
           ? new Date(messageStatsResult.data[0].first_message)
           : null;
 
-      // Get top relationships with more context
-      const network = profile?.relationship_network || [];
-      const topRelationshipsRaw = network
-        .sort((a: { affinity_percentage: number }, b: { affinity_percentage: number }) => b.affinity_percentage - a.affinity_percentage)
-        .slice(0, 5);
-
-      // Enrich relationships with display names if missing
-      const enrichedRelationships = await Promise.all(
-        topRelationshipsRaw.map(async (r: { display_name?: string; username?: string; user_id: string; affinity_percentage: number; interaction_count: number; summary?: string }) => {
-          if (r.display_name || r.username) {
-            return r; // Already has a name
-          }
-
-          // Fetch display name from database
-          const userResult = await context.db.query(
-            `SELECT display_name, username, global_name
-             FROM members
-             WHERE user_id = $1 AND guild_id = $2
-             LIMIT 1`,
-            [r.user_id, context.guildId]
-          );
-
-          if (userResult.success && userResult.data && userResult.data.length > 0) {
-            const userData = userResult.data[0];
-            return {
-              ...r,
-              display_name: userData.display_name || userData.global_name || userData.username || r.user_id,
-              username: userData.username,
-            };
-          }
-
-          return r; // Fallback to original
-        })
-      );
-
-      const topRelationships = enrichedRelationships
-        .map(
-          (r) =>
-            `  - ${
-              r.display_name || r.username || r.user_id
-            }: ${r.affinity_percentage.toFixed(1)}% affinity, ${
-              r.interaction_count
-            } interactions${r.summary ? `, context: ${r.summary}` : ""}`
-        )
-        .join("\n");
-
-      // Also enrich the full network for context (top 10)
-      const topNetworkRaw = network.slice(0, 10);
-      const enrichedNetwork = await Promise.all(
-        topNetworkRaw.map(async (r: { display_name?: string; username?: string; user_id: string; affinity_percentage: number; interaction_count: number }) => {
-          if (r.display_name || r.username) {
-            return r;
-          }
-
-          const userResult = await context.db.query(
-            `SELECT display_name, username, global_name
-             FROM members
-             WHERE user_id = $1 AND guild_id = $2
-             LIMIT 1`,
-            [r.user_id, context.guildId]
-          );
-
-          if (userResult.success && userResult.data && userResult.data.length > 0) {
-            const userData = userResult.data[0];
-            return {
-              ...r,
-              display_name: userData.display_name || userData.global_name || userData.username || r.user_id,
-              username: userData.username,
-            };
-          }
-
-          return r;
-        })
-      );
+      // Closest people, computed from replies, mentions and shared conversations
+      const topConnections = await getConnections(context.db, context.guildId, targetUserId, 10);
 
       // Build rich context object
       const richContext = {
@@ -278,17 +135,23 @@ export const getUserInfoTool: DatabaseTool = {
         username: member.username,
         globalName: member.global_name,
         summary: profile?.summary,
-        keywords: profile?.keywords || [],
-        emojis: profile?.emojis || [],
         roles: roleNames,
         roleCount: member.roles?.length || 0,
         joinedAt: new Date(member.joined_at),
         messageCount,
         firstMessageDate: firstMessage,
         active: member.active,
-        relationships: topRelationships || "No relationships tracked",
-        relationshipNetwork: enrichedNetwork, // Top 10 with names enriched
-        notes: profile?.notes || [],
+        // Closest people by recent interaction; share = fraction of this user's interactions
+        connections: topConnections.map((c) => ({
+          name: c.name,
+          closeness: describeStrength(c),
+          share: c.share,
+          reciprocity: c.reciprocity,
+          replies: c.replies,
+          mentions: c.mentions,
+          sharedConversations: c.shared_conversations,
+          lastInteraction: c.last_interaction,
+        })),
       };
 
       // Compute server-age-relative descriptor
@@ -388,7 +251,6 @@ export const getUserInfoTool: DatabaseTool = {
       
       const contextualSummaries: ContextualSummary[] = [];
       const recentTopics: Set<string> = new Set();
-      const allKeywords: string[] = [];
       
       if (conversationSegmentsResult.success && conversationSegmentsResult.data && conversationSegmentsResult.data.length > 0) {
         // Process each segment to get conversation context + user's messages
@@ -478,7 +340,6 @@ export const getUserInfoTool: DatabaseTool = {
                 const normalized = kw.toLowerCase().trim();
                 if (normalized.length > 2) {
                   recentTopics.add(normalized);
-                  allKeywords.push(normalized);
                 }
               }
             });
@@ -516,25 +377,10 @@ export const getUserInfoTool: DatabaseTool = {
         }
       }
 
-      // Combine member keywords with conversation topics
-      // Member keywords are already aggregated from conversations, so prioritize them
-      const memberKeywords = profile?.keywords || [];
-      const combinedTopics = new Set<string>();
-      
-      // Add member keywords first (they're already aggregated/curated)
-      memberKeywords.forEach(kw => {
-        if (kw && typeof kw === 'string' && kw.trim().length > 2) {
-          combinedTopics.add(kw.toLowerCase().trim());
-        }
-      });
-      
-      // Add conversation topics as additional context
-      recentTopics.forEach(topic => combinedTopics.add(topic));
-      
       // Debug: log what we found (can remove later)
       if (conversationSegmentsResult.success && conversationSegmentsResult.data) {
         console.log(`[getUserInfo] Found ${conversationSegmentsResult.data.length} conversation segments for ${targetUserId}`);
-        console.log(`[getUserInfo] Found ${contextualSummaries.length} contextual summaries, ${richSummaries.length} rich summaries, ${recentTopics.size} topics, ${memberKeywords.length} member keywords`);
+        console.log(`[getUserInfo] Found ${contextualSummaries.length} contextual summaries, ${richSummaries.length} rich summaries, ${recentTopics.size} topics`);
       }
 
       // Build a flowing narrative about interests and recent activity
@@ -543,27 +389,6 @@ export const getUserInfoTool: DatabaseTool = {
       // Add member summary if available (this is the AI-generated summary)
       if (profile?.summary && profile.summary.trim().length > 10) {
         interestParts.push(profile.summary.trim());
-      }
-
-      // Add topics/interests - prioritize member keywords (already aggregated)
-      // Skip topic extraction from keywords since they're often fragments
-      // The summaries contain the real context, topics from keywords are too noisy
-      // Only include topics if we have member keywords (which are curated)
-      if (memberKeywords.length > 0) {
-        const topicArray = memberKeywords
-          .slice(0, 10)
-          .map(kw => kw.toLowerCase().trim())
-          .filter(t => {
-            // Filter out very common words
-            const commonWords = ['the', 'and', 'or', 'but', 'for', 'with', 'about', 'this', 'that', 'has', 'have', 'was', 'were', 'are', 'is', 'been', 'from', 'can', 'will', 'would', 'could', 'should', 'not', 'you', 'your', 'they', 'them', 'their', 'there', 'these', 'those', 'only', 'one', 'see'];
-            return !commonWords.includes(t) && t.length > 3; // Require longer words
-          })
-          .slice(0, 8);
-        
-        if (topicArray.length > 0) {
-          // Format as "into all kinds of stuff - topic1, topic2, topic3"
-          interestParts.push(`into all kinds of stuff - ${topicArray.join(", ")}`);
-        }
       }
 
       // Add rich contextual summaries that combine conversation topics with user's contributions
@@ -603,21 +428,6 @@ export const getUserInfoTool: DatabaseTool = {
         }
       }
       
-      // ALWAYS include member keywords if available (even if we have other data)
-      // Member keywords are the most reliable source as they're aggregated from all conversations
-      if (memberKeywords.length > 0 && interestParts.length === 0) {
-        const filteredKeywords = memberKeywords
-          .filter(kw => kw && typeof kw === 'string' && kw.trim().length > 2)
-          .filter(kw => {
-            const commonWords = ['the', 'and', 'or', 'but', 'for', 'with', 'about', 'this', 'that', 'has', 'have', 'was', 'were', 'are', 'is', 'been'];
-            return !commonWords.includes(kw.toLowerCase().trim());
-          })
-          .slice(0, 10);
-        if (filteredKeywords.length > 0) {
-          narrativeParts.push(`\nKnown for: ${filteredKeywords.join(", ")}`);
-        }
-      }
-      
       // Also add conversation topics if we found any (as additional context)
       if (recentTopics.size > 0 && interestParts.length === 0) {
         const topicArray = Array.from(recentTopics)
@@ -631,16 +441,10 @@ export const getUserInfoTool: DatabaseTool = {
         }
       }
 
-      // Who they interact with (relationships) - format more naturally
-      if (topRelationships && topRelationships.trim()) {
-        const relationshipNames = enrichedRelationships
-          .slice(0, 5)
-          .map(r => r.display_name || r.username || r.user_id)
-          .filter(Boolean);
-        
-        if (relationshipNames.length > 0) {
-          narrativeParts.push(`\n${member.display_name} vibes with folks like ${relationshipNames.join(", ")} - they're ${member.display_name}'s usual crew.`);
-        }
+      // Who they interact with (closeness is computed from replies, mentions and shared conversations)
+      if (topConnections.length > 0) {
+        const closest = topConnections.slice(0, 5).map((c) => c.name);
+        narrativeParts.push(`\n${member.display_name} interacts most with ${closest.join(", ")}.`);
       }
 
       // Note: Message count and stats are intentionally excluded from narrative
@@ -679,7 +483,7 @@ export const getUserInfoTool: DatabaseTool = {
 export const getUserSummaryTool: DatabaseTool = {
   name: "getUserSummary",
   description:
-    "Get AI-generated summary, keywords, emojis, and notes for a user. If no userId is provided, use the requesting user (e.g., 'summarize me'). Can accept either a Discord user ID (numeric string) or a username/display name (will search automatically).",
+    "Get the AI-generated summary for a user. If no userId is provided, use the requesting user (e.g., 'summarize me'). Can accept either a Discord user ID (numeric string) or a username/display name (will search automatically).",
   parameters: {
     type: "object",
     properties: {
@@ -740,27 +544,12 @@ export const getUserSummaryTool: DatabaseTool = {
         parts.push("Summary: No summary available");
       }
 
-      if (profile?.keywords && profile.keywords.length > 0) {
-        parts.push(`Keywords: ${profile.keywords.join(", ")}`);
-      }
-
-      if (profile?.emojis && profile.emojis.length > 0) {
-        parts.push(`Emojis: ${profile.emojis.join(" ")}`);
-      }
-
-      if (profile?.notes && profile.notes.length > 0) {
-        parts.push(`Notes: ${profile.notes.join(", ")}`);
-      }
-
       return {
         success: true,
         summary: profile?.summary || "No summary available",
         data: {
           formatted: parts.join("\n"),
           summary: profile?.summary,
-          keywords: profile?.keywords || [],
-          emojis: profile?.emojis || [],
-          notes: profile?.notes || [],
         },
       };
     } catch (error) {
@@ -780,13 +569,13 @@ export const getUserSummaryTool: DatabaseTool = {
 export const searchUsersTool: DatabaseTool = {
   name: "searchUsers",
   description:
-    "Search for users by display name, username, or keywords. Use this when looking for specific users or users with certain characteristics.",
+    "Search for users by display name, username, nickname, or words in their profile summary. Use this when looking for specific users or users with certain characteristics.",
   parameters: {
     type: "object",
     properties: {
       query: {
         type: "string",
-        description: "Search query (name, username, or keyword)",
+        description: "Search query (name, username, or a word from their profile summary)",
       },
       limit: {
         type: "number",
@@ -805,21 +594,20 @@ export const searchUsersTool: DatabaseTool = {
       const searchTerm = `%${query.toLowerCase()}%`;
 
       const result = await context.db.query(
-        `SELECT user_id, display_name, username, global_name, nick, summary, keywords
-         FROM members 
-         WHERE guild_id = $1 
-           AND active = true
+        `SELECT m.user_id, m.display_name, m.username, m.global_name, m.nick, up.summary
+         FROM members m
+         LEFT JOIN user_profiles up
+           ON up.user_id = m.user_id AND up.guild_id = m.guild_id
+         WHERE m.guild_id = $1
+           AND m.active = true
            AND (
-             LOWER(display_name) LIKE $2
-             OR LOWER(username) LIKE $2
-             OR LOWER(COALESCE(global_name, '')) LIKE $2
-             OR LOWER(COALESCE(nick, '')) LIKE $2
-             OR EXISTS (
-               SELECT 1 FROM UNNEST(keywords) AS kw 
-               WHERE LOWER(kw) LIKE $2
-             )
+             LOWER(m.display_name) LIKE $2
+             OR LOWER(m.username) LIKE $2
+             OR LOWER(COALESCE(m.global_name, '')) LIKE $2
+             OR LOWER(COALESCE(m.nick, '')) LIKE $2
+             OR LOWER(COALESCE(up.summary, '')) LIKE $2
            )
-         ORDER BY display_name
+         ORDER BY m.display_name
          LIMIT $3`,
         [context.guildId, searchTerm, limit]
       );

@@ -3,6 +3,11 @@ import {
   type ToolContext,
   type DatabaseToolResult,
 } from "../registry/DatabaseTools";
+import {
+	getConnections,
+	getPairFacts,
+} from "../../../features/social-intelligence/facts/closeness";
+import { formatConnection } from "../registry/DatabaseTools";
 
 function scoreNiceness(text: string): number {
   const content = (text || "").toLowerCase();
@@ -182,7 +187,7 @@ export const rankUsersByNicenessTool: DatabaseTool = {
 export const compareUsersTool: DatabaseTool = {
 	name: "compareUsers",
 	description:
-		"Compare two users across multiple metrics including activity (message count), relationships (affinity score, friend count), and niceness (sentiment). Useful for queries like 'who is more active, X or Y?', 'who has more friends?', 'who is nicer?'",
+		"Compare two users across multiple metrics including activity (message count), relationships (number of distinct people each interacts with, their closest connections, and how close the two are to each other), and niceness (sentiment). Relationship data comes from real replies, mentions and shared conversations. Useful for queries like 'who is more active, X or Y?', 'who has more friends?', 'who is nicer?'",
 	parameters: {
 		type: "object",
 		properties: {
@@ -300,79 +305,33 @@ export const compareUsersTool: DatabaseTool = {
 
 			// Relationships comparison
 			if (metric === "relationships" || metric === "all") {
-				// Edges are directed (author → other); aggregate both rows of each pair the user is in
-				const relationshipStatsQuery = `
-					WITH pairs AS (
-						SELECT
-							SUM(CASE WHEN user_a = $2 THEN msg_a_to_b ELSE msg_b_to_a END) AS sent,
-							SUM(CASE WHEN user_a = $2 THEN msg_b_to_a ELSE msg_a_to_b END) AS received,
-							SUM(mentions) AS mentions,
-							SUM(replies) AS replies,
-							SUM(reactions) AS reactions
-						FROM relationship_edges
-						WHERE guild_id = $1 AND $2 IN (user_a, user_b) AND user_a <> user_b
-							AND NOT EXISTS (
-								SELECT 1 FROM members m
-								WHERE m.guild_id = $1 AND m.user_id IN (user_a, user_b) AND m.bot
-							)
-						GROUP BY LEAST(user_a, user_b), GREATEST(user_a, user_b)
-					)
-					SELECT COUNT(*) AS friend_count,
-						AVG(LEAST(100,
-							CASE WHEN sent > 0 THEN 15 ELSE 0 END +
-							CASE WHEN received > 0 THEN 15 ELSE 0 END +
-							CASE WHEN mentions > 0 THEN 20 ELSE 0 END +
-							CASE WHEN replies > 0 THEN 30 ELSE 0 END +
-							CASE WHEN reactions > 0 THEN 10 ELSE 0 END +
-							LEAST(10, (sent + received) / 2)
-						)) AS avg_affinity
-					FROM pairs
-					WHERE sent + received + mentions + replies + reactions >= 5`;
-				const user1RelResult = await context.db.query(relationshipStatsQuery, [
-					context.guildId,
-					user1Id,
+				const [user1Connections, user2Connections, pair] = await Promise.all([
+					getConnections(context.db, context.guildId, user1Id, 1000),
+					getConnections(context.db, context.guildId, user2Id, 1000),
+					getPairFacts(context.db, context.guildId, user1Id, user2Id),
 				]);
-				const user2RelResult = await context.db.query(relationshipStatsQuery, [
-					context.guildId,
-					user2Id,
-				]);
-
-				const user1FriendCount = Number.parseInt(
-					user1RelResult.data?.[0]?.friend_count || "0"
-				);
-				const user2FriendCount = Number.parseInt(
-					user2RelResult.data?.[0]?.friend_count || "0"
-				);
-				const user1Affinity = Number.parseFloat(
-					user1RelResult.data?.[0]?.avg_affinity || "0"
-				);
-				const user2Affinity = Number.parseFloat(
-					user2RelResult.data?.[0]?.avg_affinity || "0"
-				);
+				const user1Count = user1Connections.length;
+				const user2Count = user2Connections.length;
 
 				comparison.metrics.relationships = {
 					user1: {
-						friendCount: user1FriendCount,
-						avgAffinity: user1Affinity.toFixed(1),
+						connectionCount: user1Count,
+						topConnections: user1Connections.slice(0, 3).map((c) => c.name),
 					},
 					user2: {
-						friendCount: user2FriendCount,
-						avgAffinity: user2Affinity.toFixed(1),
+						connectionCount: user2Count,
+						topConnections: user2Connections.slice(0, 3).map((c) => c.name),
 					},
-					friendCountDifference: Math.abs(user1FriendCount - user2FriendCount),
-					affinityDifference: Math.abs(user1Affinity - user2Affinity).toFixed(1),
+					connectionCountDifference: Math.abs(user1Count - user2Count),
+					pair: pair ? formatConnection(pair) : null,
 				};
 
 				comparison.winner.relationships =
-					user1FriendCount > user2FriendCount
+					user1Count > user2Count
 						? user1Name
-						: user2FriendCount > user1FriendCount
+						: user2Count > user1Count
 							? user2Name
-							: user1Affinity > user2Affinity
-								? user1Name
-								: user2Affinity > user1Affinity
-									? user2Name
-									: "Tie";
+							: "Tie";
 			}
 
 			// Niceness comparison
@@ -438,10 +397,14 @@ export const compareUsersTool: DatabaseTool = {
 			}
 
 			if (comparison.metrics.relationships) {
+				const rel = comparison.metrics.relationships;
 				formatted += `🤝 RELATIONSHIPS:\n`;
-				formatted += `   ${user1Name}: ${comparison.metrics.relationships.user1.friendCount} connections (avg ${comparison.metrics.relationships.user1.avgAffinity}% affinity)\n`;
-				formatted += `   ${user2Name}: ${comparison.metrics.relationships.user2.friendCount} connections (avg ${comparison.metrics.relationships.user2.avgAffinity}% affinity)\n`;
-				formatted += `   Winner: ${comparison.winner.relationships}\n\n`;
+				formatted += `   ${user1Name}: ${rel.user1.connectionCount} people interacted with (${rel.user1.topConnections.join(", ") || "none"} closest)\n`;
+				formatted += `   ${user2Name}: ${rel.user2.connectionCount} people interacted with (${rel.user2.topConnections.join(", ") || "none"} closest)\n`;
+				formatted += rel.pair
+					? `   Between them: ${rel.pair}\n`
+					: `   Between them: they have never interacted\n`;
+				formatted += `   Winner (most connections): ${comparison.winner.relationships}\n\n`;
 			}
 
 			if (comparison.metrics.niceness) {

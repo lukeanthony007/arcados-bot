@@ -217,12 +217,7 @@ export class Bot {
     this.messageHandler = new MessageHandler(this.client, this.db);
 
     // Member personas (/persona init|change|clear); commands reach it through the client
-    Object.assign(this.client, {
-      userPersonas: new UserPersonaService(
-        this.db,
-        this.conversationWorkflow.getRelationshipMapper()!
-      ),
-    });
+    Object.assign(this.client, { userPersonas: new UserPersonaService(this.db) });
 
     // Initialize voice assistant
     this.voiceAssistant = VoiceAssistantManager.getInstance();

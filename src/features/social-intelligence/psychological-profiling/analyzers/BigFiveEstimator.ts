@@ -15,6 +15,7 @@ import type {
 	UserAnalysisData,
 } from "../types";
 import { buildBigFivePrompt } from "../prompts";
+import { describeStrength } from "../../facts/closeness";
 
 const BIG_FIVE_TRAITS = [
 	"extraversion",
@@ -174,10 +175,7 @@ Top emojis: ${Object.entries(emojiSignature.top_emojis)
 		// Get top relationships
 		const topRelationships = data.relationships
 			.slice(0, 5)
-			.map(
-				(r) =>
-					`${r.user_id} (${r.affinity_percentage.toFixed(0)}% affinity, ${r.interaction_count} interactions)`
-			);
+			.map((r) => `${r.name} (${describeStrength(r)})`);
 
 		return buildBigFivePrompt({
 			messageCount: data.messages.length,

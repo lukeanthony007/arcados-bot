@@ -2571,8 +2571,6 @@ export class ConversationDetector {
           )
       );
 
-      await this.upsertParticipantPairs(buffer.guildId, participants, segmentId);
-
       // Try to merge with nearby segments in the same channel
       await this.mergeNearbySegments(
         buffer.guildId,
@@ -2860,16 +2858,6 @@ export class ConversationDetector {
       ]
     );
 
-    for (const participant of newParticipants) {
-      if (participant !== message.author_id) {
-        await this.db.upsertPair(
-          guildId,
-          participant,
-          message.author_id,
-          segment.id
-        );
-      }
-    }
   }
 
   private async splitSegmentsByTopic(
@@ -3054,7 +3042,6 @@ export class ConversationDetector {
       summary: firstChunk.summary,
       status: "finalized",
     });
-    await this.upsertParticipantPairs(guildId, firstChunk.participants, segmentId);
 
     for (const chunk of extraChunks) {
       const firstMessageId = chunk.messageIds[0];
@@ -3077,7 +3064,6 @@ export class ConversationDetector {
         summary: chunk.summary,
         status: "finalized",
       });
-      await this.upsertParticipantPairs(guildId, chunk.participants, newSegmentId);
 
     }
   }
@@ -3609,26 +3595,6 @@ export class ConversationDetector {
       console.log(
         `🔄 Restored ${restoredCount} active conversations for guild ${guildId}`
       );
-    }
-  }
-
-  private async upsertParticipantPairs(
-    guildId: string,
-    participants: string[],
-    segmentId: string
-  ): Promise<void> {
-    for (let i = 0; i < participants.length; i++) {
-      const participantI = participants[i];
-      if (!participantI) {
-        continue;
-      }
-      for (let j = i + 1; j < participants.length; j++) {
-        const participantJ = participants[j];
-        if (!participantJ || participantI === participantJ) {
-          continue;
-        }
-        await this.db.upsertPair(guildId, participantI, participantJ, segmentId);
-      }
     }
   }
 

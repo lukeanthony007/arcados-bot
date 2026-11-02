@@ -5,7 +5,7 @@
  *
  * Build pipeline (/persona init):
  * 1. Refresh the member's social-intelligence profile:
- *    - RelationshipMapper.updateMemberRelationships → user_profiles.relationship_network
+ *    - closeness is computed on demand from messages (no stored relationship data)
  *    - UserProfileEnrichmentPipeline.enrichUser → summary + Big Five/MBTI + behavior patterns
  *      (only runs once enough newly enriched conversations exist)
  *    - PsychologicalProfiler.profileUser → psych/behavior/temporal profile when enrichment skipped
@@ -22,19 +22,22 @@ import type {
 	UserProfileData,
 } from "../../database/PostgreSQLManager";
 import { UserProfileEnrichmentPipeline } from "../social-intelligence/enrichment-pipeline/layers/UserProfileEnrichmentPipeline";
+import {
+	type Connection,
+	getConnections,
+} from "../social-intelligence/facts/closeness";
 import { PsychologicalProfiler } from "../social-intelligence/psychological-profiling/PsychologicalProfiler";
 import type {
 	BehaviorPatterns,
 	PsychProfile,
 	TemporalProfile,
 } from "../social-intelligence/psychological-profiling/types";
-import type { RelationshipMapper } from "../social-intelligence/relationship-mapping/RelationshipMapper";
+import { describeConnection } from "./personaContext";
 import {
 	PROFILE_WRITER_PERSONA,
 	SLUR_PATTERN,
 	buildProfileRequest,
 } from "./personaPrompt";
-import { getTopInteractions, type InteractionRow } from "./personaContext";
 
 const MIN_MESSAGES = 30;
 const MESSAGE_FETCH_LIMIT = 600;
@@ -86,12 +89,10 @@ interface NameRow {
 
 export class UserPersonaService {
 	private db: PostgreSQLManager;
-	private relationshipMapper: RelationshipMapper;
 	private building = new Set<string>();
 
-	constructor(db: PostgreSQLManager, relationshipMapper: RelationshipMapper) {
+	constructor(db: PostgreSQLManager) {
 		this.db = db;
-		this.relationshipMapper = relationshipMapper;
 	}
 
 	isAvailable(): boolean {
@@ -169,18 +170,6 @@ export class UserPersonaService {
 			}
 
 			// 1. Refresh the social-intelligence profile
-			await onProgress?.("Mapping relationships…");
-			const relationshipResult =
-				await this.relationshipMapper.updateMemberRelationships(
-					userId,
-					guildId,
-				);
-			if (!relationshipResult.success) {
-				console.warn(
-					`🔸 Persona: relationship refresh failed for ${userId}: ${relationshipResult.error}`,
-				);
-			}
-
 			await onProgress?.("Analyzing personality and conversations…");
 			// A failed enrichment shouldn't block the persona; the profiler below fills in
 			const enrichedProfileVersion = await new UserProfileEnrichmentPipeline(
@@ -207,7 +196,12 @@ export class UserPersonaService {
 			const profileResult = await this.db.getUserProfile(userId, guildId);
 			const profile = profileResult.success ? profileResult.data : undefined;
 			const conversations = await this.getConversations(guildId, userId);
-			const interactions = await getTopInteractions(this.db, guildId, userId, RELATIONSHIP_LIMIT);
+			const interactions = await getConnections(
+				this.db,
+				guildId,
+				userId,
+				RELATIONSHIP_LIMIT,
+			);
 
 			// 3. Synthesize the character profile
 			const dossier = this.buildDossier(
@@ -361,7 +355,7 @@ export class UserPersonaService {
 		profile: UserProfileData | undefined,
 		messages: string[],
 		conversations: ConversationRow[],
-		interactions: InteractionRow[],
+		interactions: Connection[],
 		userNames: Map<string, string>,
 	): string {
 		const sections: string[] = [];
@@ -401,10 +395,10 @@ export class UserPersonaService {
 
 		if (interactions.length) {
 			sections.push(
-				`TALKS TO MOST (replies and direct mentions over their whole history; who they're actually close to):\n${interactions
+				`TALKS TO MOST (from their replies, direct mentions and shared conversations; who they're actually close to):\n${interactions
 					.map(
-						(row) =>
-							`- ${userNames.get(row.user_id) ?? row.user_id}: ${name} → them ${row.outgoing}, them → ${name} ${row.incoming}`,
+						(connection) =>
+							`- ${connection.name}: ${describeConnection(connection)}`,
 					)
 					.join("\n")}`,
 			);
@@ -463,13 +457,19 @@ export class UserPersonaService {
 				.join(", ");
 			lines.push(`- Big Five (0-1): ${traits}`);
 		}
-		if (psych.mbti_type && psych.mbti_type.confidence >= 0.35 && !psych.mbti_type.type.includes("X")) {
+		if (
+			psych.mbti_type &&
+			psych.mbti_type.confidence >= 0.35 &&
+			!psych.mbti_type.type.includes("X")
+		) {
 			lines.push(`- MBTI estimate: ${psych.mbti_type.type}`);
 		}
 		const style = psych.communication_style;
 		if (style) {
 			const verbosity =
-				style.verbosity !== undefined ? `, verbosity ${style.verbosity.toFixed(2)}` : "";
+				style.verbosity !== undefined
+					? `, verbosity ${style.verbosity.toFixed(2)}`
+					: "";
 			lines.push(
 				`- Formality ${style.formality.toFixed(2)} (0 casual, 1 formal)${verbosity}, emoji richness ${style.emoji_richness.toFixed(2)}`,
 			);

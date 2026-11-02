@@ -5,6 +5,8 @@
  * behavioral patterns, and temporal activity analysis.
  */
 
+import type { Connection } from "../facts/closeness";
+
 // ============================================================================
 // Big Five Personality Traits
 // ============================================================================
@@ -202,19 +204,13 @@ export interface ConversationData {
 	first_author_id?: string; // Author of the earliest message in the conversation
 }
 
-export interface RelationshipData {
-	user_id: string;
-	affinity_percentage: number;
-	interaction_count: number;
-	last_interaction: Date;
-}
-
 export interface UserAnalysisData {
 	userId: string;
 	guildId: string;
 	messages: MessageData[];
 	conversations: ConversationData[];
-	relationships: RelationshipData[];
+	/** Strongest connections, from the shared closeness facts */
+	relationships: Connection[];
 	keywords?: string[];
 	emojis?: string[];
 	/**

@@ -1,351 +1,253 @@
+import {
+	describeStrength,
+	getPairFacts,
+} from "../../../features/social-intelligence/facts/closeness";
 import type { DatabaseTool, ToolContext } from "../registry/DatabaseTools.js";
 
+const NEGATIVE_KEYWORDS = [
+	"hate",
+	"stupid",
+	"idiot",
+	"dumb",
+	"shut up",
+	"wrong",
+	"disagree",
+	"annoying",
+	"cringe",
+	"toxic",
+	"trash",
+];
+
+interface ExchangeRow {
+	user_a: string;
+	user_b: string;
+	a_to_b: string;
+	b_to_a: string;
+	last_interaction: Date;
+}
+
 /**
- * Detect drama/conflict events in the server
- * Identifies high-conflict interactions between users with low affinity
+ * Detect heated recent exchanges in the server.
+ * Finds pairs with many replies to each other inside the lookback window, then checks the
+ * recent replies for negative language. Long-term closeness is context, not a filter.
  */
 export const detectDramaEvents: DatabaseTool = {
-  name: "detectDramaEvents",
-  description:
-    "Detect potential drama, conflicts, or 'beefs' between users in the server. Identifies pairs of users with low affinity but high interaction frequency, suggesting contentious relationships. Useful for queries like 'biggest beefs', 'who is fighting', 'drama summary'.",
-  parameters: {
-    type: "object",
-    properties: {
-      lookbackHours: {
-        type: "number",
-        description:
-          "How many hours to look back for drama detection (default: 168 for 7 days, max: 720 for 30 days)",
-      },
-      minInteractions: {
-        type: "number",
-        description: "Minimum number of interactions to consider (default: 10)",
-      },
-      maxAffinityPercent: {
-        type: "number",
-        description:
-          "Maximum affinity percentage to consider as 'low affinity' (default: 30, meaning <30% affinity suggests conflict)",
-      },
-      limit: {
-        type: "number",
-        description: "Maximum number of drama pairs to return (default: 5)",
-      },
-    },
-    required: [],
-  },
-  execute: async (params: any, context: ToolContext) => {
-    try {
-      const lookbackHours = Math.min(params.lookbackHours || 168, 720);
-      const minInteractions = params.minInteractions || 10;
-      const maxAffinityPercent = params.maxAffinityPercent || 30;
-      const limit = Math.min(params.limit || 5, 10);
+	name: "detectDramaEvents",
+	description:
+		"Detect potential drama or 'beefs': pairs of users with a lot of recent back-and-forth replies, scored by volume and negative language in their latest replies. Each pair includes how close they are over the long term (so long-time friends bantering are distinguishable from new antagonists) and sample exchanges. Intensity is a heuristic from reply volume plus negative-word hits, not a measured sentiment. Useful for queries like 'biggest beefs', 'who is fighting', 'drama summary'.",
+	parameters: {
+		type: "object",
+		properties: {
+			lookbackHours: {
+				type: "number",
+				description:
+					"How many hours to look back for drama detection (default: 168 for 7 days, max: 720 for 30 days)",
+			},
+			minInteractions: {
+				type: "number",
+				description:
+					"Minimum number of replies between the pair in the window to consider (default: 10)",
+			},
+			limit: {
+				type: "number",
+				description: "Maximum number of drama pairs to return (default: 5)",
+			},
+		},
+		required: [],
+	},
+	execute: async (params: Record<string, unknown>, context: ToolContext) => {
+		try {
+			const lookbackHours = Math.min(Number(params.lookbackHours) || 168, 720);
+			const minInteractions = Number(params.minInteractions) || 10;
+			const limit = Math.min(Number(params.limit) || 5, 10);
 
-      const lookbackTime = new Date(
-        Date.now() - lookbackHours * 60 * 60 * 1000
-      );
+			const lookbackTime = new Date(
+				Date.now() - lookbackHours * 60 * 60 * 1000,
+			);
 
-      // Query relationship edges for low-affinity, high-interaction pairs.
-      // Edges are directed (author → other), so both rows of a pair are merged first.
-      const result = await context.db.query(
-        `WITH re1 AS (
-          SELECT
-            LEAST(user_a, user_b) AS user_a,
-            GREATEST(user_a, user_b) AS user_b,
-            SUM(CASE WHEN user_a < user_b THEN msg_a_to_b ELSE msg_b_to_a END) AS msg_a_to_b,
-            SUM(CASE WHEN user_a < user_b THEN msg_b_to_a ELSE msg_a_to_b END) AS msg_b_to_a,
-            SUM(mentions) AS mentions,
-            SUM(replies) AS replies,
-            SUM(reactions) AS reactions,
-            MAX(last_interaction) AS last_interaction
-          FROM relationship_edges
-          WHERE guild_id = $1 AND user_a <> user_b
-            AND NOT EXISTS (
-              SELECT 1 FROM members m
-              WHERE m.guild_id = $1 AND m.user_id IN (user_a, user_b) AND m.bot
-            )
-          GROUP BY LEAST(user_a, user_b), GREATEST(user_a, user_b)
-        )
-        SELECT
-          re1.user_a,
-          re1.user_b,
-          re1.msg_a_to_b,
-          re1.msg_b_to_a,
-          re1.mentions,
-          re1.replies,
-          re1.reactions,
-          (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) as total_interactions,
-          re1.last_interaction,
-          -- Calculate affinity score (0-100 based on interaction diversity and frequency)
-          CASE
-            WHEN (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) = 0 THEN 0
-            ELSE LEAST(100,
-              (CASE WHEN re1.msg_a_to_b > 0 THEN 15 ELSE 0 END +
-               CASE WHEN re1.msg_b_to_a > 0 THEN 15 ELSE 0 END +
-               CASE WHEN re1.mentions > 0 THEN 20 ELSE 0 END +
-               CASE WHEN re1.replies > 0 THEN 30 ELSE 0 END +
-               CASE WHEN re1.reactions > 0 THEN 10 ELSE 0 END +
-               LEAST(10, (re1.msg_a_to_b + re1.msg_b_to_a) / 2))
-            )
-          END as affinity_score
-        FROM re1
-        WHERE (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) >= $2
-          AND re1.last_interaction >= $3
-          AND CASE
-            WHEN (re1.msg_a_to_b + re1.msg_b_to_a + re1.mentions + re1.replies + re1.reactions) = 0 THEN 0
-            ELSE LEAST(100,
-              (CASE WHEN re1.msg_a_to_b > 0 THEN 15 ELSE 0 END +
-               CASE WHEN re1.msg_b_to_a > 0 THEN 15 ELSE 0 END +
-               CASE WHEN re1.mentions > 0 THEN 20 ELSE 0 END +
-               CASE WHEN re1.replies > 0 THEN 30 ELSE 0 END +
-               CASE WHEN re1.reactions > 0 THEN 10 ELSE 0 END +
-               LEAST(10, (re1.msg_a_to_b + re1.msg_b_to_a) / 2))
-            )
-          END <= $4
-        ORDER BY total_interactions DESC, affinity_score ASC
-        LIMIT $5`,
-        [
-          context.guildId,
-          minInteractions,
-          lookbackTime,
-          maxAffinityPercent,
-          limit,
-        ]
-      );
+			// Replies between each human pair inside the window, both directions merged
+			const result = await context.db.query(
+				`SELECT
+           LEAST(m.author_id, p.author_id) AS user_a,
+           GREATEST(m.author_id, p.author_id) AS user_b,
+           COUNT(*) FILTER (WHERE m.author_id < p.author_id) AS a_to_b,
+           COUNT(*) FILTER (WHERE m.author_id > p.author_id) AS b_to_a,
+           MAX(m.created_at) AS last_interaction
+         FROM messages m
+         JOIN messages p ON p.id = m.referenced_message_id
+         JOIN members ma ON ma.guild_id = m.guild_id AND ma.user_id = m.author_id AND ma.bot = false
+         JOIN members mb ON mb.guild_id = m.guild_id AND mb.user_id = p.author_id AND mb.bot = false
+         WHERE m.guild_id = $1 AND m.active = true AND m.created_at >= $2
+           AND m.author_id <> p.author_id
+         GROUP BY 1, 2
+         HAVING COUNT(*) >= $3
+         ORDER BY COUNT(*) DESC
+         LIMIT $4`,
+				[context.guildId, lookbackTime, minInteractions, limit],
+			);
 
-      if (!result.success || !result.data || result.data.length === 0) {
-        return {
-          success: true,
-          summary: "No significant drama or conflicts detected",
-          data: { dramaEvents: [] },
-          formatted: `No drama detected with criteria: ${minInteractions}+ interactions, <${maxAffinityPercent}% affinity, past ${lookbackHours}h`,
-        };
-      }
+			if (!result.success || !result.data || result.data.length === 0) {
+				return {
+					success: true,
+					summary: "No significant drama or conflicts detected",
+					data: { dramaEvents: [] },
+					formatted: `No drama detected with criteria: ${minInteractions}+ replies between a pair, past ${lookbackHours}h`,
+				};
+			}
 
-      const dramaEvents = result.data;
+			const exchanges: ExchangeRow[] = result.data;
 
-      // Enrich with user names and message samples
-      const enriched = await Promise.all(
-        dramaEvents.map(async (event: any) => {
-          // Get user A name
-          const userAResult = await context.db.query(
-            `SELECT display_name, username, global_name
-             FROM members
-             WHERE guild_id = $1 AND user_id = $2`,
-            [context.guildId, event.user_a]
-          );
+			const ids = [...new Set(exchanges.flatMap((e) => [e.user_a, e.user_b]))];
+			const namesResult = await context.db.query(
+				`SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
+         FROM members WHERE guild_id = $1 AND user_id = ANY($2::text[])`,
+				[context.guildId, ids],
+			);
+			const names = new Map<string, string>(
+				(namesResult.data ?? []).map((m: { user_id: string; name: string }) => [
+					m.user_id,
+					m.name,
+				]),
+			);
 
-          const userAName =
-            userAResult.success &&
-            userAResult.data &&
-            userAResult.data.length > 0
-              ? userAResult.data[0].display_name ||
-                userAResult.data[0].global_name ||
-                userAResult.data[0].username
-              : "Unknown";
+			const enriched = await Promise.all(
+				exchanges.map(async (event) => {
+					const userAName = names.get(event.user_a) ?? "Unknown";
+					const userBName = names.get(event.user_b) ?? "Unknown";
+					const repliesAToB = Number(event.a_to_b);
+					const repliesBToA = Number(event.b_to_a);
+					const totalReplies = repliesAToB + repliesBToA;
 
-          // Get user B name
-          const userBResult = await context.db.query(
-            `SELECT display_name, username, global_name
-             FROM members
-             WHERE guild_id = $1 AND user_id = $2`,
-            [context.guildId, event.user_b]
-          );
+					const [messagesResult, facts] = await Promise.all([
+						context.db.query(
+							`SELECT m.content, m.created_at, m.author_id
+               FROM messages m
+               JOIN messages p ON p.id = m.referenced_message_id
+               WHERE m.guild_id = $1 AND m.active = true AND m.created_at >= $2
+                 AND ((m.author_id = $3 AND p.author_id = $4)
+                   OR (m.author_id = $4 AND p.author_id = $3))
+               ORDER BY m.created_at DESC
+               LIMIT 5`,
+							[context.guildId, lookbackTime, event.user_a, event.user_b],
+						),
+						getPairFacts(
+							context.db,
+							context.guildId,
+							event.user_a,
+							event.user_b,
+						),
+					]);
 
-          const userBName =
-            userBResult.success &&
-            userBResult.data &&
-            userBResult.data.length > 0
-              ? userBResult.data[0].display_name ||
-                userBResult.data[0].global_name ||
-                userBResult.data[0].username
-              : "Unknown";
+					const samples: Array<{ content: string; author_id: string }> =
+						messagesResult.success && messagesResult.data
+							? messagesResult.data
+							: [];
 
-          // Get sample messages between these users (recent interactions)
-          const messagesResult = await context.db.query(
-            `SELECT m.content, m.created_at, m.author_id
-             FROM messages m
-             WHERE m.guild_id = $1
-               AND m.created_at >= $2
-               AND (
-                 (m.author_id = $3 AND m.content LIKE '%' || $4 || '%') OR
-                 (m.author_id = $4 AND m.content LIKE '%' || $3 || '%')
-               )
-             ORDER BY m.created_at DESC
-             LIMIT 5`,
-            [context.guildId, lookbackTime, event.user_a, event.user_b]
-          );
+					const sampleMessages = samples.map((msg) => ({
+						content:
+							msg.content.length > 100
+								? `${msg.content.substring(0, 100)}...`
+								: msg.content,
+						author: msg.author_id === event.user_a ? userAName : userBName,
+					}));
 
-          const sampleMessages =
-            messagesResult.success && messagesResult.data
-              ? messagesResult.data.map((msg: any) => ({
-                  content:
-                    msg.content.length > 100
-                      ? `${msg.content.substring(0, 100)}...`
-                      : msg.content,
-                  timestamp: new Date(msg.created_at),
-                  author:
-                    msg.author_id === event.user_a ? userAName : userBName,
-                }))
-              : [];
+					const negativeCount = samples.filter((msg) => {
+						const content = (msg.content || "").toLowerCase();
+						return NEGATIVE_KEYWORDS.some((keyword) =>
+							content.includes(keyword),
+						);
+					}).length;
 
-          // Analyze sentiment (basic negative keyword detection)
-          const negativeKeywords = [
-            "hate",
-            "stupid",
-            "idiot",
-            "dumb",
-            "shut up",
-            "wrong",
-            "disagree",
-            "annoying",
-            "cringe",
-            "toxic",
-            "trash",
-          ];
+					// Heuristic: reply volume plus negative-word hits in the latest replies
+					const dramaIntensity = Math.min(
+						100,
+						Math.min(60, totalReplies * 2) + negativeCount * 10,
+					);
+					const longTermCloseness = facts
+						? describeStrength(facts)
+						: "never interacted before";
 
-          let negativeCount = 0;
-          if (messagesResult.success && messagesResult.data) {
-            for (const msg of messagesResult.data) {
-              const content = (msg.content || "").toLowerCase();
-              for (const keyword of negativeKeywords) {
-                if (content.includes(keyword)) {
-                  negativeCount++;
-                  break;
-                }
-              }
-            }
-          }
+					return {
+						userA: { id: event.user_a, name: userAName },
+						userB: { id: event.user_b, name: userBName },
+						metrics: {
+							recentReplies: totalReplies,
+							repliesAToB,
+							repliesBToA,
+							negativeSamples: negativeCount,
+							dramaIntensity,
+						},
+						longTermCloseness,
+						lastInteraction: new Date(event.last_interaction),
+						sampleMessages,
+						analysis: {
+							conflictLevel:
+								dramaIntensity > 70
+									? "High"
+									: dramaIntensity > 40
+										? "Moderate"
+										: "Low",
+							indicators: [
+								totalReplies > 50 && "Very high reply volume",
+								negativeCount > 2 && "Negative language detected",
+								facts &&
+									facts.share >= 0.1 &&
+									"Close pair, may be friendly banter",
+								!facts && "No prior history together",
+							].filter((i): i is string => typeof i === "string"),
+						},
+					};
+				}),
+			);
 
-          const sentimentScore = Math.max(
-            0,
-            100 - negativeCount * 15 - (100 - event.affinity_score)
-          );
-
-          // Calculate drama intensity (0-100)
-          const dramaIntensity = Math.min(
-            100,
-            (event.total_interactions / 5 + // More interactions = more drama
-              (100 - event.affinity_score) + // Lower affinity = more drama
-              negativeCount * 10) / // Negative words = more drama
-              2.5
-          );
-
-          return {
-            userA: {
-              id: event.user_a,
-              name: userAName,
-            },
-            userB: {
-              id: event.user_b,
-              name: userBName,
-            },
-            metrics: {
-              totalInteractions: event.total_interactions,
-              messagesAToB: event.msg_a_to_b,
-              messagesBToA: event.msg_b_to_a,
-              mentions: event.mentions,
-              replies: event.replies,
-              reactions: event.reactions,
-              affinityScore: event.affinity_score,
-              sentimentScore,
-              dramaIntensity: Math.round(dramaIntensity),
-            },
-            lastInteraction: new Date(event.last_interaction),
-            sampleMessages,
-            analysis: {
-              conflictLevel:
-                dramaIntensity > 70
-                  ? "High"
-                  : dramaIntensity > 40
-                  ? "Moderate"
-                  : "Low",
-              indicators: [
-                event.affinity_score < 20 && "Very low affinity",
-                event.total_interactions > 50 && "High interaction frequency",
-                negativeCount > 2 && "Negative language detected",
-                event.replies > 10 && "Frequent back-and-forth",
-              ].filter((i): i is string => typeof i === "string"),
-            },
-          };
-        })
-      );
-
-      // Format as natural text
-      const formatted = `Drama/Conflict Analysis (past ${lookbackHours}h):
+			const formatted = `Drama/Conflict Analysis (past ${lookbackHours}h):
 
 ${enriched
-  .map(
-    (
-      drama: {
-        lastInteraction: Date;
-        userA: { name: string };
-        userB: { name: string };
-        analysis: { conflictLevel: string; indicators: string[] };
-        metrics: {
-          dramaIntensity: number;
-          affinityScore: number;
-          totalInteractions: number;
-        };
-        sampleMessages: Array<{ author: string; content: string }>;
-      },
-      i: number
-    ) => {
-      const hoursAgo = Math.round(
-        (Date.now() - drama.lastInteraction.getTime()) / (1000 * 60 * 60)
-      );
-      const timeAgo =
-        hoursAgo < 1
-          ? "Less than 1 hour ago"
-          : hoursAgo === 1
-          ? "1 hour ago"
-          : `${hoursAgo} hours ago`;
+	.map((drama, i) => {
+		const hoursAgo = Math.round(
+			(Date.now() - drama.lastInteraction.getTime()) / (1000 * 60 * 60),
+		);
+		const timeAgo =
+			hoursAgo < 1
+				? "Less than 1 hour ago"
+				: hoursAgo === 1
+					? "1 hour ago"
+					: `${hoursAgo} hours ago`;
+		const exchange =
+			drama.sampleMessages.length > 0
+				? `\n   Recent Exchanges:\n${drama.sampleMessages
+						.map((msg) => `   • ${msg.author}: "${msg.content}"`)
+						.join("\n")}`
+				: "";
 
-      return `${i + 1}. ${drama.userA.name} ↔ ${drama.userB.name}
-   Conflict Level: ${drama.analysis.conflictLevel} (${
-        drama.metrics.dramaIntensity
-      }/100)
-   Affinity: ${drama.metrics.affinityScore}% | Interactions: ${
-        drama.metrics.totalInteractions
-      }
+		return `${i + 1}. ${drama.userA.name} ↔ ${drama.userB.name}
+   Conflict Level: ${drama.analysis.conflictLevel} (${drama.metrics.dramaIntensity}/100)
+   Recent replies: ${drama.metrics.recentReplies} (${drama.metrics.repliesAToB} / ${drama.metrics.repliesBToA}) | Long-term: ${drama.longTermCloseness}
    Last Interaction: ${timeAgo}
-   Indicators: ${drama.analysis.indicators.join(", ") || "None"}
-   ${
-     drama.sampleMessages.length > 0
-       ? `Recent Exchanges:
-${drama.sampleMessages
-  .map(
-    (msg: { author: string; content: string }) =>
-      `   • ${msg.author}: "${msg.content}"`
-  )
-  .join("\n")}`
-       : ""
-   }`;
-    }
-  )
-  .join("\n\n")}
+   Indicators: ${drama.analysis.indicators.join(", ") || "None"}${exchange}`;
+	})
+	.join("\n\n")}
 
 Total Drama Pairs Found: ${enriched.length}`;
 
-      return {
-        success: true,
-        summary: `Detected ${enriched.length} potential drama/conflict pairs`,
-        data: {
-          dramaEvents: enriched,
-          lookbackHours,
-          criteria: {
-            minInteractions,
-            maxAffinityPercent,
-          },
-        },
-        formatted,
-      };
-    } catch (error) {
-      console.error("🔸 Error in detectDramaEvents:", error);
-      return {
-        success: false,
-        error: "Unable to detect drama events",
-      };
-    }
-  },
+			return {
+				success: true,
+				summary: `Detected ${enriched.length} potential drama/conflict pairs`,
+				data: {
+					dramaEvents: enriched,
+					lookbackHours,
+					criteria: { minInteractions },
+				},
+				formatted,
+			};
+		} catch (error) {
+			console.error("🔸 Error in detectDramaEvents:", error);
+			return {
+				success: false,
+				error: "Unable to detect drama events",
+			};
+		}
+	},
 };
 
 export const dramaAnalysisTools = [detectDramaEvents];

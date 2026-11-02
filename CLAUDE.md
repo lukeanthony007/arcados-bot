@@ -51,7 +51,8 @@ Syncs Discord data to PostgreSQL with real-time updates:
 
 #### Social Intelligence (`src/features/social-intelligence/`)
 Transforms raw Discord interactions into structured relationship and conversation insights:
-- **Relationship Mapping** (`relationship-mapping/`): Tracks user interactions, calculates affinity scores, maintains relationship graphs (`user_profiles.relationship_network`)
+- **Facts** (`facts/closeness.ts`): the one definition of closeness between two members, computed on demand from `messages` + `conversation_segments` (never stored): replies (3 pts), direct mentions (2), shared conversations (1), 180-day half-life decay; per pair `strength`, `share` of the subject's interactions, `reciprocity`. `getConnections`, `getPairFacts`, `getGuildGraph`, `describeStrength`
+- **Relationship Mapping** (`relationship-mapping/`): `RelationshipMapper.recordInteraction` keeps live `relationship_edges` counters (used only by conversation grouping and enrichment scheduling)
 - **Conversation Detection** (`conversation-detection/`): Groups messages into multi-participant conversation segments using multi-strategy grouping
 - **Semantic Analysis** (`semantic-analysis/`): Extracts keywords (TF-IDF + semantic), generates embeddings, labels topics with AI
 - **Psychological Profiling** (`psychological-profiling/`): Statistical analyzers plus Big Five/MBTI estimators → `user_profiles.psych_profile`, `behavior_patterns`, `temporal_profile`
@@ -110,7 +111,7 @@ AI infrastructure built on the omp SDK:
 **AI tools** integrate with the database:
 - Tools receive guild/user/channel context through `ToolContext`
 - User tools retrieve member profiles, summaries, keywords, emojis, notes
-- Relationship tools calculate affinity, list top connections
+- Relationship tools (`getUserConnections`, `getRelationship`, `getMutualConnections`) and `getServerNetwork` read `facts/closeness.ts`; user params accept an ID or a name (`resolveUserId`: exact, then fuzzy `word_similarity` over names and aliases)
 - Conversation tools fetch segments, participants, embeddings
 - Analysis tools provide metadata and trends
 
@@ -185,7 +186,7 @@ Commands only receive the interaction. Shared services are attached to the Disco
 - [ReconciliationSync.ts](src/features/discord-sync/ReconciliationSync.ts) - Background healing
 
 ### Social Intelligence
-- [RelationshipMapper.ts](src/features/social-intelligence/relationship-mapping/RelationshipMapper.ts) - Affinity/relationship logic
+- [closeness.ts](src/features/social-intelligence/facts/closeness.ts) - The one definition of closeness between members
 - [ConversationDetector.ts](src/features/social-intelligence/conversation-detection/ConversationDetector.ts) - Conversation detection and grouping
 - [EnrichmentPipelineOrchestrator.ts](src/features/social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator.ts) - Enrichment layers, cascades and queue processing
 - [UserProfileEnrichmentPipeline.ts](src/features/social-intelligence/enrichment-pipeline/layers/UserProfileEnrichmentPipeline.ts) - Incremental user profile summaries
@@ -212,10 +213,10 @@ Commands only receive the interaction. Shared services are attached to the Disco
 - To change the model or fallback, edit `MODEL_PROVIDER`/`MODEL_ID`/`FALLBACK_MODELS` in [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts); the provider needs an omp login or a key set via `authStorage.keys.setRuntime`
 
 **Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
-- `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
+- `UserPersonaService.buildPersona` refreshes the member's profile (UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and their closest connections, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
 - `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes the persona to `generateChatResponse` (voice is unaffected)
-- Each turn, `personaContext.ts` adds (1) who the persona member actually interacts with most (`getTopInteractions`: replies and direct mentions both ways over their whole message history, group pings and bots excluded), which overrides the profile on who they're close to, and (2) their real history with the people involved (speaker, @mentions, members named in the message): interaction counts, shared conversation summaries (slurs masked), and recent messages between them (group pings, bare mentions/links and slurs filtered)
-- The profile writer gets the same `getTopInteractions` ranking, so rebuilt profiles describe the right people
+- Each turn, `personaContext.ts` adds (1) who the persona member is actually closest to (`getConnections`, see Facts above), which overrides the profile on who they're close to, and (2) their real history with the people involved (speaker, @mentions, members named in the message): pair facts, shared conversation summaries (slurs masked), and recent messages between them (group pings, bare mentions/links and slurs filtered)
+- The profile writer gets the same `getConnections` ranking, so rebuilt profiles describe the right people
 - `generateChatResponse` strips a copied speaker label from replies and turns bare `@123…` ids into `<@123…>` mentions
 - The service is attached to the Discord client as `client.userPersonas`
 
