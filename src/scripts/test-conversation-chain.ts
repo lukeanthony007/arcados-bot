@@ -30,12 +30,6 @@ function processUserInput(input: string): string {
 
 	userContent = userContent.replace(/^@bot\b/i, "").trim();
 
-	const selfQueryRegex =
-		/(who\s+am\s+i\b|whoami\b|tell\s+me\s+about\s+me\b|what\s+do\s+you\s+know\s+about\s+me\b|who\s+is\s+me\b)/i;
-	if (selfQueryRegex.test(userContent) && userId) {
-		userContent = `tell me about <@${userId}>`;
-	}
-
 	userContent = userContent.replace(/@(\d{10,})/g, "<@$1>");
 
 	return userContent;
@@ -122,6 +116,7 @@ async function processTurn(userInput: string): Promise<void> {
 			db,
 			guildId: guildId as string,
 			userId,
+			speakerName: process.env.SPEAKER_NAME || "Tester",
 			channelId: "test-channel",
 			messageId: `test-${turnCount}`,
 			content: processedInput,

@@ -196,9 +196,6 @@ export class MessageHandler {
     const detectedMode = detectModeFromMessage(userContent);
     userContent = stripModeKeywords(userContent);
 
-    // Map self-referential queries to explicit self-mention
-    userContent = this.mapSelfReferentialQuery(userContent, message.author.id);
-
     // For AI, keep the raw content (with <@id> intact) so tools can extract IDs reliably
     const rawForAI = userContent;
 
@@ -220,6 +217,7 @@ export class MessageHandler {
       db: this.db,
       guildId: message.guildId!,
       userId: message.author.id,
+      speakerName: this.speakerName(message),
       channelId: message.channel.id,
       messageId: message.id,
       content: rawForAI,
@@ -263,7 +261,7 @@ export class MessageHandler {
     startSession({
       initialBotMessage: reply,
       userId: message.author.id,
-      initialUserMessage: resolvedContent,
+      initialUserMessage: `${this.speakerName(message)}: ${resolvedContent}`,
       initialAssistantMessage: sentText,
     });
   }
@@ -300,14 +298,9 @@ export class MessageHandler {
     const detectedMode = detectModeFromMessage(message.content);
     let contentToProcess = stripModeKeywords(message.content);
 
-    // Resolve mentions in user message
+    // Keep the raw text (with <@id> intact) for the AI; resolve mentions for session history
     let resolvedContent = contentToProcess;
-    resolvedContent = this.mapSelfReferentialQuery(
-      resolvedContent,
-      message.author.id
-    );
-
-    const rawForAI = resolvedContent; // keep raw (with <@id>) for AI
+    const rawForAI = contentToProcess;
 
     if (this.db.isConnected()) {
       try {
@@ -391,6 +384,7 @@ export class MessageHandler {
       db: this.db,
       guildId: message.guildId!,
       userId: message.author.id,
+      speakerName: this.speakerName(message),
       channelId: message.channel.id,
       messageId: message.id,
       content: rawForAI,
@@ -419,12 +413,12 @@ export class MessageHandler {
         )}), skipping response.`
       );
       // Still append user's turn to session for history
-      appendUserTurn(found.sessionId, resolvedContent);
+      appendUserTurn(found.sessionId, `${this.speakerName(message)}: ${resolvedContent}`);
       return;
     }
 
     // Append user's turn to session (store resolved version)
-    appendUserTurn(found.sessionId, resolvedContent);
+    appendUserTurn(found.sessionId, `${this.speakerName(message)}: ${resolvedContent}`);
 
     // Send response using chunking
     const { message: reply, sentText } = await this.sendChunked(
@@ -446,17 +440,10 @@ export class MessageHandler {
   }
 
   /**
-   * Map self-referential queries to explicit user mentions
+   * Name shown to the model for the message author (server nickname when set)
    */
-  private mapSelfReferentialQuery(content: string, userId: string): string {
-    const selfQueryRegex =
-      /(who\s+am\s+i\b|whoami\b|tell\s+me\s+about\s+me\b|what\s+do\s+you\s+know\s+about\s+me\b|who\s+is\s+me\b)/i;
-
-    if (selfQueryRegex.test(content)) {
-      return `tell me about <@${userId}>`;
-    }
-
-    return content;
+  private speakerName(message: Message): string {
+    return message.member?.displayName ?? message.author.displayName;
   }
 
   /**

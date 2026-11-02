@@ -95,7 +95,7 @@ AI infrastructure built on the omp SDK:
 #### Message Handling (`src/handlers/chat/MessageHandler.ts`)
 **Bot mentions** (`handleBotMention`):
 1. Detects @bot mentions that are not replies
-2. Handles voice join/leave phrases, strips yin/yang keywords, maps self-referential queries (e.g., "who am I") to explicit mentions for tool resolution
+2. Handles voice join/leave phrases and strips yin/yang keywords; the prompt names the speaker (`Name (<@id>): message`) so the model knows who it is talking to
 3. Generates the response via `generateChatResponse` (with the active member persona, if any)
 4. Sends response in Discord-safe chunks with sanitized @everyone mentions
 5. Starts a new chat session

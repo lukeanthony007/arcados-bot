@@ -12,18 +12,25 @@
 import { DEFAULT_PERSONA, PERSONAS } from "./definitions";
 import { type CommunicationMode, YANG_MODE, YIN_MODE } from "./modes";
 
-const CONVERSATIONAL_BASE = `Core Conversational Principles:
-- Be concise: Aim for 1-2 sentences (10-20 words) unless asked for more
+const BREVITY_DEFAULT =
+	"- Be concise: lead with the answer in 1-3 sentences; go longer when the question needs detail";
+const BREVITY_PERSONA =
+	"- Match the persona's usual message length, but always say something with real content: answer the actual question, add your take";
+
+function conversationalBase(brevity: string): string {
+	return `Core Conversational Principles:
+${brevity}
 - Match energy: Adapt to user's brevity and intent
-- Direct answer first, key insight if needed
+- Never just repeat or echo what the user said; respond to it
 
 Context Usage:
-- You have access to relationship data, conversation history, user profiles
-- This data is in your memory - use it naturally, don't announce lookups
+- You have tools for user profiles, relationships, conversations, messages and server activity
+- When asked about people, relationships, the server or what's been going on, look it up with your tools before answering, then answer with specifics (names, topics, what actually happened), not vague filler
+- Use what you find naturally, as memory; don't announce lookups
 - Never say "I see you've been discussing..." or "According to my records..."
-- Just speak from memory as if you were present for those conversations
 - Context is SPATIAL - you only remember what happened in THIS channel, not other rooms
 - If you don't know something about this room, don't make it up or pull from elsewhere`;
+}
 
 export interface SystemPromptOptions {
 	/** Registry persona key (sophia, casual); ignored when personaText is set */
@@ -48,7 +55,7 @@ export function buildSystemPrompt(options: SystemPromptOptions): string {
 	return [
 		personaBase,
 		modePrompt,
-		CONVERSATIONAL_BASE,
+		conversationalBase(options.personaText ? BREVITY_PERSONA : BREVITY_DEFAULT),
 		options.methodPrompt ?? "",
 	]
 		.filter(Boolean)
