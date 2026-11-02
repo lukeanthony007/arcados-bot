@@ -8,10 +8,8 @@
  */
 
 import type { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
-import type { AIEngine } from "../../../../ai/core/AIEngine";
-import type { AIResponse } from "../../../../ai/providers/base/AIProvider";
-import { AIRequestBuilder } from "../../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../../ai/core/AIContext.js";
+import { OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
+import { ENRICHMENT_SYSTEM_PROMPT } from "../enrichmentPrompt";
 import { EnrichmentRateLimiter } from "../EnrichmentRateLimiter";
 import {
 	IncrementalEnrichment,
@@ -26,20 +24,18 @@ import { PsychologicalProfiler } from "../../psychological-profiling/Psychologic
 
 export class UserProfileEnrichmentPipeline {
 	private db: PostgreSQLManager;
-	private aiEngine: AIEngine;
 	private rateLimiter: EnrichmentRateLimiter;
 	private bigFiveEstimator: BigFiveEstimator;
 	private mbtiEstimator: MBTIEstimator;
 	// Shares data gathering with the profiler so both feed the analyzers the same inputs
 	private profiler: PsychologicalProfiler;
 
-	constructor(db: PostgreSQLManager, aiEngine: AIEngine) {
+	constructor(db: PostgreSQLManager) {
 		this.db = db;
-		this.aiEngine = aiEngine;
 		this.rateLimiter = EnrichmentRateLimiter.getInstance();
-		this.bigFiveEstimator = new BigFiveEstimator(aiEngine);
-		this.mbtiEstimator = new MBTIEstimator(aiEngine);
-		this.profiler = new PsychologicalProfiler(db, aiEngine);
+		this.bigFiveEstimator = new BigFiveEstimator();
+		this.mbtiEstimator = new MBTIEstimator();
+		this.profiler = new PsychologicalProfiler(db);
 	}
 
 	/**
@@ -248,7 +244,7 @@ export class UserProfileEnrichmentPipeline {
 				contextRange,
 			);
 
-			const delta = await this.generateDelta(deltaPrompt, guildId);
+			const delta = await this.generateDelta(deltaPrompt, "enrichment.user-delta");
 			if (!delta) {
 				throw new Error("failed to generate summary delta");
 			}
@@ -285,7 +281,7 @@ export class UserProfileEnrichmentPipeline {
 					IncrementalEnrichment.createConsolidationPrompt("user", newHistory);
 				const consolidatedSummary = await this.generateDelta(
 					consolidationPrompt,
-					guildId,
+					"enrichment.user-consolidation",
 				);
 
 				if (consolidatedSummary) {
@@ -381,32 +377,13 @@ export class UserProfileEnrichmentPipeline {
 	/**
 	 * Generate delta using LLM
 	 */
-	private async generateDelta(prompt: string, guildId: string): Promise<string | null> {
-		let provider = "grok";
-		if (!process.env.GROK_API_KEY) {
-			if (process.env.OLLAMA_URL) {
-				provider = "ollama";
-			}
-		}
-
+	private async generateDelta(prompt: string, label: string): Promise<string | null> {
 		try {
-			const builder = new AIRequestBuilder(this.aiEngine);
-			const ctx = new AIContextBuilder()
-				.user("system-enricher")
-				.guild(guildId)
-				.build();
-			// Structured mode: the chat preset caps output at 60 tokens, truncating summaries
-			const result = await builder
-				.blocking()
-				.mode("structured")
-				.maxTokens(500)
-				.withContext(ctx)
-				.provider(provider as "grok" | "ollama")
-				.persona("casual")
-				.withoutTools()
-				.generate(prompt);
-
-			const response = result as AIResponse;
+			const response = await OmpRuntime.get().generate({
+				systemPrompt: ENRICHMENT_SYSTEM_PROMPT,
+				prompt,
+				label,
+			});
 			if (response.success && response.content) {
 				return response.content.trim();
 			}

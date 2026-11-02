@@ -11,7 +11,6 @@
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { pgvector } from "../../../database/PostgreSQLManager.js";
-import type { AIEngine } from "../../../ai/core/AIEngine";
 import { CommunicationStyleAnalyzer } from "./analyzers/CommunicationStyleAnalyzer";
 import { TemporalPatternAnalyzer } from "./analyzers/TemporalPatternAnalyzer";
 import { ResponsePatternAnalyzer } from "./analyzers/ResponsePatternAnalyzer";
@@ -47,21 +46,15 @@ const MIN_TOPIC_LIFT = 2;
 
 export class PsychologicalProfiler {
 	private db: PostgreSQLManager;
-	private aiEngine: AIEngine | null;
-	private bigFiveEstimator: BigFiveEstimator | null;
+	private bigFiveEstimator: BigFiveEstimator;
 	private mbtiEstimator: MBTIEstimator;
 	private config: Required<PsychologicalProfilerConfig>;
 	private stats: ProfilingStats;
 
-	constructor(
-		db: PostgreSQLManager,
-		aiEngine?: AIEngine,
-		config: PsychologicalProfilerConfig = {}
-	) {
+	constructor(db: PostgreSQLManager, config: PsychologicalProfilerConfig = {}) {
 		this.db = db;
-		this.aiEngine = aiEngine || null;
-		this.bigFiveEstimator = aiEngine ? new BigFiveEstimator(aiEngine) : null;
-		this.mbtiEstimator = new MBTIEstimator(aiEngine);
+		this.bigFiveEstimator = new BigFiveEstimator();
+		this.mbtiEstimator = new MBTIEstimator();
 
 		this.config = {
 			minMessagesForProfiling: config.minMessagesForProfiling ?? 10,
@@ -117,7 +110,7 @@ export class PsychologicalProfiler {
 
 			// 4. Run Big Five estimator (AI)
 			let bigFive = undefined;
-			if (!this.config.skipBigFive && this.bigFiveEstimator) {
+			if (!this.config.skipBigFive) {
 				const result = await this.bigFiveEstimator.estimate(
 					data,
 					communicationStyle.data,

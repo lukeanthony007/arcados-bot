@@ -7,7 +7,6 @@
  */
 
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
-import { AIFactory } from "../../../../ai/core/AIFactory";
 import { EnhancementOrchestrator } from "../EnhancementOrchestrator";
 import { config } from "../../../../config/index.js";
 
@@ -44,12 +43,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Initialize AI
-  const { engine } = await AIFactory.create();
-  console.log("\n🔧 Initializing AI engine...");
-
   // Initialize enhancement orchestrator
-  const orchestrator = new EnhancementOrchestrator(db, engine, {
+  const orchestrator = new EnhancementOrchestrator(db, {
     lookbackHours: hoursBack,
     enableSummaries: true,
     enableOrphans: false,

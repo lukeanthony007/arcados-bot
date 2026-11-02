@@ -8,7 +8,6 @@ The runtime is Bun (`bun.lock`). There is no build step; TypeScript runs directl
 
 ### Running the bot
 - **Start:** `npm start` (`bun run src/main.ts`)
-- **Start under Node:** `npm run start:node` (`tsx src/main.ts`)
 
 ### Code quality
 - **Type-check:** `npx tsc --noEmit -p .`
@@ -69,27 +68,27 @@ Transforms raw Discord interactions into structured relationship and conversatio
 - Returns `DatabaseResult<T>` with `success` flag, `data`, and optional `error` field
 
 #### AI Module (`src/ai/`)
-Centralized AI infrastructure with multi-provider support:
-- **Core** (`core/`):
-  - AIEngine: Core execution interface; builds the system prompt (persona → yin/yang mode → conversational base → method prompt) and runs the tool loop
-  - AIFactory: Creates the engine, providers and tool registry
-  - AIRequestBuilder: Fluent API for building AI requests (`.chat().blocking().provider().generate()`)
-  - AIContext: Request context (guild, user, channel, history, communication mode)
-  - ChatSessionManager: Multi-turn chat session state keyed by bot reply message IDs
-- **Providers** (`providers/`): GrokProvider (primary, Vercel AI SDK), OpenAIProvider, OllamaProvider; GeminiProvider exists but is disabled in AIFactory
-- **Tools** (`tools/`): DatabaseTools registry with user, relationship, conversation, message, server, context, analysis, media and voice tools
-- **Personas** (`personas/`): "sophia" (philosophical) and "casual" (friendly) persona definitions; yin/yang communication modes
-- **Utils** (`utils/`): MentionResolver and ResponseLengthPolicy utilities
-
-**Response length policy**: `.chat()` sets mode "chat", which caps output at 60 tokens via ResponseLengthPolicy unless `.maxTokens()` is set. Background jobs (summaries, profiling, JSON output) must use `.blocking().mode("structured").maxTokens(n)` instead of `.chat()`.
+AI infrastructure built on the omp SDK:
+- **Runtime** (`runtime/`): `OmpRuntime.get()` is the single AI entry point, built on the omp SDK (`@oh-my-pi/pi-coding-agent`). Every request runs in a fresh, isolated in-memory omp session (~20-60ms to create) with a replaced system prompt, no built-in coding tools, and state under `.omp-bot/` (gitignored), not `~/.omp`.
+  - `generate({ systemPrompt, prompt, history?, tools?, label })` → `AIResponse { success, content, error?, executedTools? }`
+  - `stream(...)` → `{ tokens: AsyncIterable<string>, result }` (voice)
+  - `generateStructured<T>({ systemPrompt, prompt, schema, label })` → schema-validated object via a `submit` tool, or null
+  - `tools: { context: ToolContext, names?, webSearch? }` exposes the bot tool catalog (default: all) plus omp's `web_search`
+  - Model is fixed in `OmpRuntime.ts` (`xai/grok-4-1-fast-non-reasoning`, key from `GROK_API_KEY`); cost tracking (APICostTracker) and timeouts happen inside the runtime
+  - The omp SDK requires Bun; run scripts with `bun run`, not Node/tsx
+- **Tools** (`tools/`): `getToolCatalog()` in `tools/index.ts` loads every `DatabaseTool` (user, relationship, conversation, message, server, context, analysis, live, drama, search, storyline, voice, music, media, stream); `runtime/toolAdapter.ts` binds them to a request's `ToolContext` for omp
+- **Personas** (`personas/`): "sophia" and "casual" definitions, yin/yang modes, and `buildSystemPrompt()` (persona → yin/yang → conversational base → method prompt) for chat and voice
+- **Context** (`context/`): `getServerSummaryPreface()` frames the first turn of a conversation
+- **Utils** (`utils/`): MentionResolver
 
 #### Discord Handlers (`src/handlers/`)
 - **Chat** (`chat/`):
   - MessageHandler: Bot mentions and replies; resolves the guild's active member persona
-  - ChatAIManager: Domain adapter for chat interactions (wraps AIEngine)
+  - `chatResponse.ts`: `generateChatResponse()` builds the chat system prompt and calls OmpRuntime
+  - ChatSessionManager: Multi-turn chat session state keyed by bot reply message IDs
 - **Voice** (`voice/`):
   - VoiceAssistantManager: Voice channel orchestration
-  - VoiceAIManager: Domain adapter for voice interactions (wraps AIEngine)
+  - VoiceAIManager: Voice replies through OmpRuntime (or the optional RAIA runtime when `RAIA_RUNTIME_URL` is set)
   - TTS services (`tts/`): Cartesia, Google, Whisper transcription
   - `/join` and `/leave` slash commands live in `src/commands/`
 
@@ -97,7 +96,7 @@ Centralized AI infrastructure with multi-provider support:
 **Bot mentions** (`handleBotMention`):
 1. Detects @bot mentions that are not replies
 2. Handles voice join/leave phrases, strips yin/yang keywords, maps self-referential queries (e.g., "who am I") to explicit mentions for tool resolution
-3. Generates the response via ChatAIManager (with the active member persona, if any)
+3. Generates the response via `generateChatResponse` (with the active member persona, if any)
 4. Sends response in Discord-safe chunks with sanitized @everyone mentions
 5. Starts a new chat session
 
@@ -109,7 +108,7 @@ Centralized AI infrastructure with multi-provider support:
 ### Supporting Systems
 
 **AI tools** integrate with the database:
-- Tools receive guild/user context from AIContext
+- Tools receive guild/user/channel context through `ToolContext`
 - User tools retrieve member profiles, summaries, keywords, emojis, notes
 - Relationship tools calculate affinity, list top connections
 - Conversation tools fetch segments, participants, embeddings
@@ -193,15 +192,14 @@ Commands only receive the interaction. Shared services are attached to the Disco
 - [PsychologicalProfiler.ts](src/features/social-intelligence/psychological-profiling/PsychologicalProfiler.ts) - Behavioral and personality profiling
 
 ### AI Infrastructure
-- [AIEngine.ts](src/ai/core/AIEngine.ts) - Core AI execution interface
-- [AIFactory.ts](src/ai/core/AIFactory.ts) - Engine and provider factory
-- [AIRequestBuilder.ts](src/ai/core/AIRequestBuilder.ts) - Fluent API for AI requests
-- [GrokProvider.ts](src/ai/providers/GrokProvider.ts) - Primary provider using Vercel AI SDK
-- [DatabaseTools.ts](src/ai/tools/registry/DatabaseTools.ts) - Tool registry for AI
+- [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts) - AI entry point on the omp SDK
+- [toolAdapter.ts](src/ai/runtime/toolAdapter.ts) - Bot tools as omp custom tools
+- [tools/index.ts](src/ai/tools/index.ts) - Tool catalog
+- [systemPrompt.ts](src/ai/personas/systemPrompt.ts) - Chat/voice system prompt composition
 
 ### Discord Handlers
 - [MessageHandler.ts](src/handlers/chat/MessageHandler.ts) - Chat message handling
-- [ChatAIManager.ts](src/handlers/chat/ChatAIManager.ts) - Chat AI adapter
+- [chatResponse.ts](src/handlers/chat/chatResponse.ts) - Chat AI entry point
 - [VoiceAssistantManager.ts](src/handlers/voice/VoiceAssistantManager.ts) - Voice orchestration
 - [VoiceAIManager.ts](src/handlers/voice/VoiceAIManager.ts) - Voice AI adapter
 
@@ -209,28 +207,20 @@ Commands only receive the interaction. Shared services are attached to the Disco
 
 **Modify AI behavior**:
 - Personas are defined in [personas/definitions.ts](src/ai/personas/definitions.ts)
-- Use AIRequestBuilder's `.persona()` method to select persona
-- Example: `new AIRequestBuilder(engine).chat().blocking().provider("grok").persona("casual").generate(prompt)`
-- Use `.customPersona(text)` for ad-hoc persona text that replaces the registry persona; the yin/yang layer is then skipped unless a mode is explicitly requested
-- AI providers are in [src/ai/providers/](src/ai/providers/)
+- Compose chat/voice prompts with `buildSystemPrompt({ persona, personaText?, communicationMode?, methodPrompt? })`; `personaText` replaces the registry persona (yin/yang is then skipped unless explicitly requested)
+- Example: `OmpRuntime.get().generate({ systemPrompt: buildSystemPrompt({ persona: "casual" }), prompt, tools: { context }, label: "feature.name" })`
+- To change the model, edit `MODEL_PROVIDER`/`MODEL_ID` in [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts) and supply that provider's key via `authStorage.keys.setRuntime`
 
 **Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
 - `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has Grok write a character profile, and stores it in `user_personas` with real messages as voice examples
-- `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes `buildPersonaPrompt(...)` to ChatAIManager (voice is unaffected)
+- `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes `buildPersonaPrompt(...)` to `generateChatResponse` (voice is unaffected)
 - The service is attached to the Discord client as `client.userPersonas`
 
 **Add a database table or column**: add `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` to `PostgreSQLManager.initializeSchema()`; it runs on every startup.
 
-**Add an enrichment step**: background LLM calls must throw on failure (so `EnrichmentQueue` records and retries them) and return `null` only for legitimate skips; avoid `.chat()` (60-token cap).
+**Add an enrichment step**: use `OmpRuntime.generate` with a task-focused system prompt (or `generateStructured` for JSON); throw on `success: false` so `EnrichmentQueue` records and retries the job, and return `null` only for legitimate skips.
 
 **Track new interaction types**: ConversationDetector uses multi-strategy grouping; add new strategies in `conversation-detection/strategies/` directory.
-
-**Integrate new LLM provider**:
-1. Create provider class extending [BaseAIProvider](src/ai/providers/base/BaseAIProvider.ts) in [src/ai/providers/](src/ai/providers/)
-2. Register in [AIFactory.ts](src/ai/core/AIFactory.ts) provider map
-3. Add API key to [config/index.ts](src/config/index.ts)
-4. Use Vercel AI SDK for OpenAI-compatible APIs, or native SDKs for platform-specific features
-5. Provider will be automatically available via AIRequestBuilder's `.provider()` method
 
 **Debug conversation detection**: ConversationDetector buffers messages per channel with 10-min inactivity timeouts; check `streaming_conversations` table or add logging.
 

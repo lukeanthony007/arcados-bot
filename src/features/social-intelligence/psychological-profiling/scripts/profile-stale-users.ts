@@ -9,7 +9,6 @@
 
 import { config } from "../../../../config/index.js";
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager.js";
-import { AIFactory } from "../../../../ai/core/AIFactory.js";
 import { PsychologicalProfiler } from "../PsychologicalProfiler.js";
 
 async function main() {
@@ -30,12 +29,8 @@ async function main() {
 	const db = new PostgreSQLManager();
 	await db.connect();
 
-	// Initialize AI engine
-	console.log("Initializing AI engine...");
-	const { engine } = await AIFactory.create();
-
 	// Initialize profiler
-	const profiler = new PsychologicalProfiler(db, engine, {
+	const profiler = new PsychologicalProfiler(db, {
 		minMessagesForProfiling: 10,
 		stalenessThreshold: 50,
 		batchSize: 10,

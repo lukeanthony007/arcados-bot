@@ -8,19 +8,17 @@
 import type { Client, Message } from "discord.js";
 import { ChannelType } from "discord.js";
 import type { PostgreSQLManager } from "../../database/PostgreSQLManager";
-import { ChatAIManager } from "./ChatAIManager";
-import { AIContextBuilder } from "../../ai/core/AIContext";
+import { generateChatResponse } from "./chatResponse";
+import type { ChatMessage } from "../../ai/runtime/OmpRuntime";
 import {
   getSessionByRepliedMessageId,
   appendUserTurn,
   appendAssistantTurnAndTrackMessage,
   getSessionHistory,
   startSession,
-} from "../../ai/core/ChatSessionManager";
+} from "./ChatSessionManager";
 import { resolveMentionsInText } from "../../ai/utils/MentionResolver";
 import { VoiceAssistantManager } from "../voice/VoiceAssistantManager";
-import { AIFactory } from "../../ai/core/AIFactory";
-import type { AIEngine } from "../../ai/core/AIEngine";
 import { detectModeFromMessage, stripModeKeywords } from "../../ai/personas/modes";
 import { buildPersonaPrompt } from "../../features/user-personas/personaPrompt";
 
@@ -28,8 +26,6 @@ export class MessageHandler {
   private client: Client;
   private db: PostgreSQLManager;
   private provider: string;
-  private chatAI: ChatAIManager | null = null;
-  private enginePromise: Promise<AIEngine> | null = null;
   
   // Deduplication: track recently processed messages to prevent duplicate responses
   private recentMessageIds: Set<string> = new Set();
@@ -39,20 +35,6 @@ export class MessageHandler {
     this.client = client;
     this.db = db;
     this.provider = provider;
-
-    // Lazy initialization of AI engine to avoid segfaults in test environments
-  }
-
-  private async getChatAI(): Promise<ChatAIManager> {
-    if (this.chatAI) {
-      return this.chatAI;
-    }
-    if (!this.enginePromise) {
-      this.enginePromise = AIFactory.create().then(({ engine }) => engine);
-    }
-    const engine = await this.enginePromise;
-    this.chatAI = new ChatAIManager(engine);
-    return this.chatAI;
   }
 
   /**
@@ -234,27 +216,16 @@ export class MessageHandler {
       }
     }
 
-    // Build AIContext from message with communication mode
-    const contextBuilder = new AIContextBuilder()
-      .guild(message.guildId!)
-      .user(message.author.id)
-      .channel(message.channel.id)
-      .message(message.id)
-      .domain("chat")
-      .withDatabase(this.db);
-
-    if (detectedMode) {
-      contextBuilder.communicationMode(detectedMode);
-    }
-
-    const context = contextBuilder.build();
-
-    const chatAI = await this.getChatAI();
-    const contentResponse = await chatAI.generateMentionResponse(
-      rawForAI,
-      context,
-      await this.getActivePersonaPrompt(message.guildId!)
-    );
+    const contentResponse = await generateChatResponse({
+      db: this.db,
+      guildId: message.guildId!,
+      userId: message.author.id,
+      channelId: message.channel.id,
+      messageId: message.id,
+      content: rawForAI,
+      communicationMode: detectedMode,
+      personaPrompt: await this.getActivePersonaPrompt(message.guildId!),
+    });
 
     if (!contentResponse?.success || !contentResponse.content) {
       console.error(
@@ -411,34 +382,22 @@ export class MessageHandler {
     const history = getSessionHistory(found.sessionId);
 
     // Convert history format
-    const historyFormatted = history.map((msg) => ({
+    const historyFormatted: ChatMessage[] = history.map((msg) => ({
       role: msg.role === "user" ? "user" : "assistant",
       content: msg.content,
     }));
 
-    // Build AIContext from message with communication mode
-    const contextBuilder = new AIContextBuilder()
-      .guild(message.guildId!)
-      .user(message.author.id)
-      .channel(message.channel.id)
-      .message(message.id)
-      .domain("chat")
-      .withDatabase(this.db)
-      .withHistory(historyFormatted);
-
-    if (detectedMode) {
-      contextBuilder.communicationMode(detectedMode);
-    }
-
-    const context = contextBuilder.build();
-
-    const chatAI = await this.getChatAI();
-    const contentResponse = await chatAI.generateReplyResponse(
-      rawForAI,
-      context,
-      historyFormatted,
-      await this.getActivePersonaPrompt(message.guildId!)
-    );
+    const contentResponse = await generateChatResponse({
+      db: this.db,
+      guildId: message.guildId!,
+      userId: message.author.id,
+      channelId: message.channel.id,
+      messageId: message.id,
+      content: rawForAI,
+      communicationMode: detectedMode,
+      personaPrompt: await this.getActivePersonaPrompt(message.guildId!),
+      history: historyFormatted,
+    });
 
     if (!contentResponse?.success || !contentResponse.content) {
       return;

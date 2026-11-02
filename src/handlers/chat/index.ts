@@ -6,6 +6,6 @@
  */
 
 export { MessageHandler } from "./MessageHandler";
-export { ChatAIManager } from "./ChatAIManager";
-export * from "../../ai/core/ChatSessionManager";
+export { generateChatResponse, type ChatResponseRequest } from "./chatResponse";
+export * from "./ChatSessionManager";
 

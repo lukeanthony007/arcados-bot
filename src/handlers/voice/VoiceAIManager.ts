@@ -1,7 +1,64 @@
-import type { AIEngine } from "../../ai/core/AIEngine";
-import { AIRequestBuilder } from "../../ai/core/AIRequestBuilder";
-import type { AIContext } from "../../ai/core/AIContext";
-import type { AIResponse } from "../../ai/providers/base/AIProvider";
+import { getServerSummaryPreface } from "../../ai/context/serverSummary";
+import { buildSystemPrompt } from "../../ai/personas/systemPrompt";
+import {
+	type AIResponse,
+	type ChatMessage,
+	OmpRuntime,
+	type StreamHandle,
+	type ToolAccess,
+} from "../../ai/runtime/OmpRuntime";
+import type { PostgreSQLManager } from "../../database/PostgreSQLManager";
+
+/** Voice media-control instructions (formerly AIRequestBuilder.voice()) */
+const VOICE_METHOD_PROMPT = `You control the built-in media player for this Discord server.
+
+Play & queue requests:
+- When the user asks to play, queue, or put on music/audio, you MUST call the playMedia tool with their query.
+- Do NOT respond with bot commands like "m!p ..." or instructions to use another bot.
+- Do NOT describe that you are calling tools or the media player.
+
+Voice control:
+- For pause/resume/skip/stop/volume, use the appropriate voice/media tools when available.
+
+Response style:
+- When you successfully trigger media playback or control, you should not send any spoken explanation – an empty or minimal response is ideal, because the audio itself is the response.`;
+
+const VOICE_SYSTEM_PROMPT = buildSystemPrompt({
+	persona: "casual",
+	methodPrompt: VOICE_METHOD_PROMPT,
+});
+
+const VOICE_STREAM_SYSTEM_PROMPT = buildSystemPrompt({
+	persona: "casual",
+	methodPrompt: `${VOICE_METHOD_PROMPT}\n\nStreaming voice. Separate paragraphs with \\n.`,
+});
+
+/** Per-request voice scope. `db` is absent when PostgreSQL is unavailable: then no tools are offered. */
+export interface VoiceAIContext {
+	userId: string;
+	guildId: string;
+	channelId?: string;
+	db?: PostgreSQLManager;
+	history?: Array<{ role: string; content: string }>;
+}
+
+export interface VoiceRequestOptions {
+	timeoutMs?: number;
+	signal?: AbortSignal;
+}
+
+/** `result` is absent on the RAIA path, which reports no tool usage */
+export type VoiceTokenStream = Pick<StreamHandle, "tokens"> & Partial<Pick<StreamHandle, "result">>;
+
+function toChatHistory(history: VoiceAIContext["history"]): ChatMessage[] {
+	const messages: ChatMessage[] = [];
+	for (const message of history ?? []) {
+		if (message.role === "user" || message.role === "assistant") {
+			messages.push({ role: message.role, content: message.content });
+		}
+	}
+	return messages;
+}
 
 const RAIA_RUNTIME_URL = process.env.RAIA_RUNTIME_URL?.replace(/\/+$/, "") || "";
 
@@ -23,19 +80,13 @@ const RAIA_RUNTIME_URL = process.env.RAIA_RUNTIME_URL?.replace(/\/+$/, "") || ""
  * - Audio processing (stays in VoiceAssistantManager)
  */
 export class VoiceAIManager {
-	private engine: AIEngine;
-
-	constructor(aiEngine: AIEngine) {
-		this.engine = aiEngine;
-	}
-
 	private useRaiaRuntime(): boolean {
 		return RAIA_RUNTIME_URL.length > 0;
 	}
 
 	private async callRaiaBlocking(
 		query: string,
-		context: AIContext
+		context: VoiceAIContext
 	): Promise<AIResponse> {
 		const response = await fetch(`${RAIA_RUNTIME_URL}/api/cycle/stream`, {
 			method: "POST",
@@ -89,9 +140,28 @@ export class VoiceAIManager {
 		};
 	}
 
+	/** The RAIA path has no timeout of its own; the omp path enforces it inside the runtime */
+	private raiaBlockingWithTimeout(
+		query: string,
+		context: VoiceAIContext,
+		options: VoiceRequestOptions
+	): Promise<AIResponse> {
+		const call = this.callRaiaBlocking(query, context);
+		const timeoutMs = options.timeoutMs;
+		if (!timeoutMs) return call;
+		const timeout = new Promise<AIResponse>((_, reject) => {
+			AbortSignal.timeout(timeoutMs).addEventListener(
+				"abort",
+				() => reject(new Error(`AI response timeout after ${timeoutMs}ms`)),
+				{ once: true }
+			);
+		});
+		return Promise.race([call, timeout]);
+	}
+
 	private async *callRaiaStreaming(
 		query: string,
-		context: AIContext
+		context: VoiceAIContext
 	): AsyncIterable<string> {
 		const response = await fetch(`${RAIA_RUNTIME_URL}/api/cycle/stream`, {
 			method: "POST",
@@ -159,31 +229,21 @@ export class VoiceAIManager {
 	 */
 	async generateCommandResponse(
 		query: string,
-		context: AIContext
+		context: VoiceAIContext,
+		options: VoiceRequestOptions = {}
 	): Promise<AIResponse> {
 		if (this.useRaiaRuntime()) {
-			return this.callRaiaBlocking(query, context);
+			return this.raiaBlockingWithTimeout(query, context, options);
 		}
 
-		const builder = new AIRequestBuilder(this.engine);
-
-		const result = await builder
-			.voice()
-			.blocking()
-			.withContext(context)
-			.provider("grok")
-			.generate(query);
-
-		// Blocking mode always returns AIResponse
-		if (typeof result === "object" && "success" in result) {
-			return result as AIResponse;
-		}
-
-		// Fallback (shouldn't happen in blocking mode)
-		return {
-			success: false,
-			content: "Unexpected response type",
-		};
+		return OmpRuntime.get().generate({
+			systemPrompt: VOICE_SYSTEM_PROMPT,
+			prompt: await this.withServerPreface(query, context, []),
+			tools: this.toolAccess(context),
+			label: "voice.command",
+			timeoutMs: options.timeoutMs,
+			signal: options.signal,
+		});
 	}
 
 	/**
@@ -203,37 +263,23 @@ export class VoiceAIManager {
 	 */
 	async streamConversationResponse(
 		query: string,
-		context: AIContext
-	): Promise<AsyncIterable<string>> {
+		context: VoiceAIContext,
+		options: VoiceRequestOptions = {}
+	): Promise<VoiceTokenStream> {
 		if (this.useRaiaRuntime()) {
-			return this.callRaiaStreaming(query, context);
+			return { tokens: this.callRaiaStreaming(query, context) };
 		}
 
-		const builder = new AIRequestBuilder(this.engine);
-
-		const result = await builder
-			.voiceStream()
-			.withContext(context)
-			.provider("grok")
-			.generate(query);
-
-		// Streaming mode returns AsyncIterable<string>
-		if (result && typeof result === "object" && Symbol.asyncIterator in result) {
-			return result as AsyncIterable<string>;
-		}
-
-		// Fallback: convert AIResponse to async iterable
-		if (typeof result === "object" && "content" in result) {
-			const response = result as AIResponse;
-			return (async function* () {
-				yield response.content || "";
-			})();
-		}
-
-		// Final fallback
-		return (async function* () {
-			yield "";
-		})();
+		const history = toChatHistory(context.history);
+		return OmpRuntime.get().stream({
+			systemPrompt: VOICE_STREAM_SYSTEM_PROMPT,
+			prompt: await this.withServerPreface(query, context, history),
+			history,
+			tools: this.toolAccess(context),
+			label: "voice.conversation",
+			timeoutMs: options.timeoutMs,
+			signal: options.signal,
+		});
 	}
 
 	/**
@@ -249,31 +295,46 @@ export class VoiceAIManager {
 	 */
 	async generateConversationResponse(
 		query: string,
-		context: AIContext
+		context: VoiceAIContext,
+		options: VoiceRequestOptions = {}
 	): Promise<AIResponse> {
 		if (this.useRaiaRuntime()) {
-			return this.callRaiaBlocking(query, context);
+			return this.raiaBlockingWithTimeout(query, context, options);
 		}
 
-		const builder = new AIRequestBuilder(this.engine);
+		const history = toChatHistory(context.history);
+		return OmpRuntime.get().generate({
+			systemPrompt: VOICE_SYSTEM_PROMPT,
+			prompt: await this.withServerPreface(query, context, history),
+			history,
+			tools: this.toolAccess(context),
+			label: "voice.conversation",
+			timeoutMs: options.timeoutMs,
+			signal: options.signal,
+		});
+	}
 
-		const result = await builder
-			.voice()
-			.blocking()
-			.withContext(context)
-			.history(context.history || [])
-			.provider("grok")
-			.generate(query);
+	/** Prepend the server summary on the first turn only (no history), matching chat */
+	private async withServerPreface(
+		query: string,
+		context: VoiceAIContext,
+		history: ChatMessage[]
+	): Promise<string> {
+		if (history.length > 0 || !context.db) return query;
+		const preface = await getServerSummaryPreface(context.db, context.guildId);
+		return preface ? `${preface}\n\n${query}` : query;
+	}
 
-		// Blocking mode always returns AIResponse
-		if (typeof result === "object" && "success" in result) {
-			return result as AIResponse;
-		}
-
-		// Fallback (shouldn't happen in blocking mode)
+	private toolAccess(context: VoiceAIContext): ToolAccess | undefined {
+		if (!context.db) return undefined;
 		return {
-			success: false,
-			content: "Unexpected response type",
+			context: {
+				userId: context.userId,
+				guildId: context.guildId,
+				db: context.db,
+				channelId: context.channelId,
+			},
+			webSearch: true,
 		};
 	}
 }

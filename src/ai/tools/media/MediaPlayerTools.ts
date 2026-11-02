@@ -2,8 +2,7 @@ import type { DatabaseTool, ToolContext, DatabaseToolResult } from "../registry/
 import { MediaPlayerManager } from "../../../features/media-player/MediaPlayerManager.js";
 import { VoiceAssistantManager } from "../../../handlers/voice/VoiceAssistantManager.js";
 import { VoiceConnectionManager } from "../../../handlers/voice/tts/services/VoiceConnectionManager.js";
-import { AIRequestBuilder } from "../../core/AIRequestBuilder.js";
-import type { AIResponse } from "../../providers/base/AIProvider.js";
+import { OmpRuntime } from "../../runtime/OmpRuntime.js";
 import type { TextChannel, VoiceChannel } from "discord.js";
 import { ChannelType } from "discord.js";
 
@@ -409,6 +408,40 @@ export const setVolumeTool: DatabaseTool = {
 	},
 };
 
+/**
+ * Ask the model for exactly `count` song titles matching `query`.
+ * Returns an empty list if the model never submits a valid playlist.
+ */
+export async function generatePlaylistSongs(
+	query: string,
+	count: number
+): Promise<string[]> {
+	const result = await OmpRuntime.get().generateStructured<{ songs: string[] }>({
+		systemPrompt:
+			"You are a music curator. Pick real, well-known songs that fit the request. Each entry is a single 'Artist - Title' string suitable for a music search.",
+		prompt: `Generate a playlist of exactly ${count} songs based on this request: "${query}"`,
+		schema: {
+			type: "object",
+			properties: {
+				songs: {
+					type: "array",
+					items: { type: "string" },
+					minItems: count,
+					maxItems: count,
+					description: `Exactly ${count} song titles, each formatted 'Artist - Title'`,
+				},
+			},
+			required: ["songs"],
+		},
+		label: "voice.playlist",
+	});
+
+	return (result?.songs ?? [])
+		.filter((s) => typeof s === "string" && s.trim().length > 0)
+		.map((s) => s.trim())
+		.slice(0, count);
+}
+
 export const generatePlaylistTool: DatabaseTool = {
 	name: "generatePlaylist",
 	description:
@@ -529,87 +562,12 @@ export const generatePlaylistTool: DatabaseTool = {
 			}
 
 			// Generate playlist using AI
-			if (!context.aiEngine) {
-				return JSON.stringify({
-					success: false,
-					error: "AI engine not available in tool context",
-				});
-			}
-
-			const playlistPrompt = `Generate a playlist of exactly ${songCount} songs based on this request: "${query}"
-
-Return ONLY a JSON array of song titles, one per line, in this exact format:
-["Song Title 1", "Song Title 2", "Song Title 3", ...]
-
-Do not include any explanations, descriptions, or additional text. Only return the JSON array.`;
-
-			const builder = new AIRequestBuilder(context.aiEngine);
-			const result = await builder
-				.chat()
-				.blocking()
-				.provider("grok")
-				.persona("casual")
-				.withoutTools() // Don't need database tools for playlist generation
-				.generate(playlistPrompt);
-
-			const playlistResponse = result as AIResponse;
-
-			if (!playlistResponse.success || !playlistResponse.content) {
-				return JSON.stringify({
-					success: false,
-					error: "Failed to generate playlist",
-				});
-			}
-
-			// Parse playlist from response
-			let songs: string[] = [];
-			const content = playlistResponse.content.trim();
-
-			try {
-				const jsonMatch = content.match(/\[[\s\S]*?\]/);
-				if (jsonMatch) {
-					songs = JSON.parse(jsonMatch[0]);
-				} else {
-					songs = JSON.parse(content);
-				}
-
-				if (!Array.isArray(songs)) {
-					throw new Error("Response is not an array");
-				}
-
-				songs = songs
-					.filter((s) => typeof s === "string" && s.trim().length > 0)
-					.map((s) => s.trim())
-					.slice(0, songCount);
-			} catch (parseError) {
-				const lines = content
-					.split("\n")
-					.map((line) => line.trim())
-					.filter((line) => line.length > 0 && !line.startsWith("```"));
-
-				const cleanedLines = lines
-					.map((line) =>
-						line.replace(/^```(?:json)?/i, "").replace(/```$/, "")
-					)
-					.map((line) => line.trim())
-					.filter((line) => line.length > 0);
-
-				songs = cleanedLines
-					.map((line) => {
-						const quotedMatch = line.match(/["']([^"']+)["']/);
-						if (quotedMatch && quotedMatch[1]) {
-							return quotedMatch[1];
-						}
-						return line.replace(/^[-*•]\s*/, "").replace(/^\d+\.\s*/, "");
-					})
-					.filter((s): s is string => typeof s === "string" && s.length > 0)
-					.slice(0, songCount);
-			}
+			const songs = await generatePlaylistSongs(query, songCount);
 
 			if (songs.length === 0) {
 				return JSON.stringify({
 					success: false,
-					error: "Could not parse songs from playlist generation",
+					error: "Failed to generate playlist",
 				});
 			}
 

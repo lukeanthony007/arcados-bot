@@ -9,7 +9,6 @@
  */
 
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
-import { AIFactory } from "../../../../ai/core/AIFactory";
 import { EnrichmentPipelineOrchestrator } from "../EnrichmentPipelineOrchestrator";
 import { EnrichmentQueue, EnrichmentLayer } from "../EnrichmentQueue";
 import { config } from "../../../../config/index.js";
@@ -43,12 +42,9 @@ async function main() {
 		process.exit(1);
 	}
 
-	// Initialize AI engine
-	const { engine } = await AIFactory.create();
-
 	// Initialize orchestrator
 	const orchestrator = EnrichmentPipelineOrchestrator.getInstance();
-	await orchestrator.initialize(db, engine);
+	await orchestrator.initialize(db);
 
 	// Query users to enrich
 	let query: string;

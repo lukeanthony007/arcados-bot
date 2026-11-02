@@ -5,9 +5,7 @@
  * communication patterns, statistical metrics, and message samples.
  */
 
-import type { AIEngine } from "../../../../ai/core/AIEngine";
-import { AIRequestBuilder } from "../../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../../ai/core/AIContext";
+import { OmpRuntime, type JsonObjectSchema } from "../../../../ai/runtime/OmpRuntime";
 import type {
 	AnalyzerResult,
 	BigFiveProxies,
@@ -18,13 +16,35 @@ import type {
 } from "../types";
 import { buildBigFivePrompt } from "../prompts";
 
+const BIG_FIVE_TRAITS = [
+	"extraversion",
+	"agreeableness",
+	"conscientiousness",
+	"neuroticism",
+	"openness",
+] as const;
+
+const TRAIT_SCHEMA = {
+	type: "object",
+	properties: {
+		score: { type: "number", minimum: 0, maximum: 1 },
+		confidence: { type: "number", minimum: 0, maximum: 1 },
+		indicators: { type: "array", items: { type: "string" } },
+	},
+	required: ["score", "confidence", "indicators"],
+};
+
+const BIG_FIVE_SCHEMA: JsonObjectSchema = {
+	type: "object",
+	properties: Object.fromEntries(BIG_FIVE_TRAITS.map((trait) => [trait, TRAIT_SCHEMA])),
+	required: [...BIG_FIVE_TRAITS],
+};
+
+const BIG_FIVE_SYSTEM_PROMPT =
+	"You are a personality-analysis component inside a Discord analytics pipeline. " +
+	"Analyze the supplied user data and report your estimates only by calling the submit tool.";
+
 export class BigFiveEstimator {
-	private aiEngine: AIEngine;
-
-	constructor(aiEngine: AIEngine) {
-		this.aiEngine = aiEngine;
-	}
-
 	/**
 	 * Estimate Big Five personality traits using AI
 	 */
@@ -51,24 +71,13 @@ export class BigFiveEstimator {
 				emojiSignature
 			);
 
-			// Call Grok 4.1
-			const response = await this.callGrok(prompt, data.guildId);
-
-			if (!response.success || !response.content) {
-				return {
-					success: false,
-					error: response.error || "AI response failed",
-					confidence: 0,
-				};
-			}
-
-			// Parse JSON response
-			const bigFive = this.parseResponse(response.content);
+			// Call the model
+			const bigFive = await this.requestTraits(prompt);
 
 			if (!bigFive) {
 				return {
 					success: false,
-					error: "Failed to parse AI response as valid Big Five data",
+					error: "AI did not return valid Big Five data",
 					confidence: 0,
 				};
 			}
@@ -182,151 +191,37 @@ Top emojis: ${Object.entries(emojiSignature.top_emojis)
 	}
 
 	/**
-	 * Call Grok 4.1 API
+	 * Ask the model for structured trait estimates; null when it never submits or the
+	 * submission is malformed. Scores and confidences are clamped to 0-1.
 	 */
-	private async callGrok(prompt: string, guildId: string): Promise<{
-		success: boolean;
-		content?: string;
-		error?: string;
-	}> {
-		try {
-			const ctx = new AIContextBuilder()
-				.user("system-profiler")
-				.guild(guildId)
-				.build();
-
-			const builder = new AIRequestBuilder(this.aiEngine);
-			const result = await builder
-				.blocking()
-				.mode("structured")
-				.maxTokens(512)
-				.withContext(ctx)
-				.provider("grok") // Use Grok 4.1
-				.withoutTools() // No database tools needed for this
-				.generate(prompt);
-
-			if (result && "content" in result && result.content) {
-				return {
-					success: true,
-					content: result.content,
-				};
-			}
-
-			return {
-				success: false,
-				error: "No content in AI response",
-			};
-		} catch (error) {
-			return {
-				success: false,
-				error: `Grok API call failed: ${error}`,
-			};
+	private async requestTraits(prompt: string): Promise<BigFiveProxies | null> {
+		const submitted = await OmpRuntime.get().generateStructured<BigFiveProxies>({
+			systemPrompt: BIG_FIVE_SYSTEM_PROMPT,
+			prompt,
+			schema: BIG_FIVE_SCHEMA,
+			label: "profiling.big-five",
+		});
+		if (!submitted) {
+			return null;
 		}
-	}
 
-	/**
-	 * Parse AI response into BigFiveProxies
-	 */
-	private parseResponse(content: string): BigFiveProxies | null {
-		try {
-			// Remove markdown code blocks if present
-			let cleaned = content.replace(/```json\s*|\s*```/g, "").trim();
-
-			// If the model added any leading/trailing text around the JSON object,
-			// try to isolate the JSON portion between the first "{" and the last "}".
-			const firstBrace = cleaned.indexOf("{");
-			const lastBrace = cleaned.lastIndexOf("}");
-			if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-				cleaned = cleaned.slice(firstBrace, lastBrace + 1);
-			}
-
-			let parsed: any;
-
-			try {
-				// First attempt: direct parse
-				parsed = JSON.parse(cleaned);
-			} catch (primaryError) {
-				// Some Grok responses duplicate a line (e.g. "indicators") where the first
-				// occurrence is truncated and the second is complete. This produces invalid
-				// JSON like:
-				//   "indicators": ["casual_greetings", "group_addr
-				//   "indicators": ["casual_greetings", "group_addressing", ...]
-				//
-				// As a robustness fallback, drop obviously truncated indicator lines when
-				// they are immediately followed by a full "indicators" line.
-				const lines = cleaned.split("\n");
-				const repairedLines: string[] = [];
-
-				for (let i = 0; i < lines.length; i++) {
-					const line = lines[i] ?? "";
-					const next = lines[i + 1] ?? "";
-
-					if (
-						line.includes(`"indicators"`) &&
-						!line.includes("]") &&
-						next.includes(`"indicators"`) &&
-						next.includes("]")
-					) {
-						// Skip this truncated line; the next line has the full field.
-						continue;
-					}
-
-					repairedLines.push(line);
-				}
-
-				const repaired = repairedLines.join("\n");
-
-				try {
-					parsed = JSON.parse(repaired);
-					console.warn(
-						"BigFiveEstimator: repaired malformed JSON from Grok response"
-					);
-				} catch {
-					// Re-throw original error so outer catch logs the full content once.
-					throw primaryError;
-				}
-			}
-
-			// Validate structure
+		for (const trait of BIG_FIVE_TRAITS) {
+			const t = submitted[trait];
 			if (
-				!parsed.extraversion ||
-				!parsed.agreeableness ||
-				!parsed.conscientiousness ||
-				!parsed.neuroticism ||
-				!parsed.openness
+				!t ||
+				typeof t.score !== "number" ||
+				typeof t.confidence !== "number" ||
+				!Array.isArray(t.indicators)
 			) {
-				console.error("Invalid Big Five structure:", parsed);
+				console.error(`Invalid ${trait} structure:`, t);
 				return null;
 			}
 
-			// Validate each trait
-			for (const trait of [
-				"extraversion",
-				"agreeableness",
-				"conscientiousness",
-				"neuroticism",
-				"openness",
-			]) {
-				const t = parsed[trait];
-				if (
-					typeof t.score !== "number" ||
-					typeof t.confidence !== "number" ||
-					!Array.isArray(t.indicators)
-				) {
-					console.error(`Invalid ${trait} structure:`, t);
-					return null;
-				}
-
-				// Clamp scores and confidence to 0-1 range
-				t.score = Math.max(0, Math.min(1, t.score));
-				t.confidence = Math.max(0, Math.min(1, t.confidence));
-			}
-
-			return parsed as BigFiveProxies;
-		} catch (error) {
-			console.error("Failed to parse Big Five response:", error);
-			console.error("Content:", content);
-			return null;
+			// Clamp scores and confidence to 0-1 range
+			t.score = Math.max(0, Math.min(1, t.score));
+			t.confidence = Math.max(0, Math.min(1, t.confidence));
 		}
+
+		return submitted;
 	}
 }

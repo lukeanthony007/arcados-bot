@@ -1,11 +1,8 @@
 import "dotenv/config";
 import * as readline from "readline";
-import { ChatAIManager } from "../handlers/chat/ChatAIManager.js";
-import { AIContextBuilder } from "../ai/core/AIContext.js";
-import { AIFactory } from "../ai/core/AIFactory.js";
+import { generateChatResponse } from "../handlers/chat/chatResponse.js";
 import { PostgreSQLManager } from "../database/PostgreSQLManager.js";
 
-const provider = process.env.PROVIDER || "grok"; // grok | openai | ollama | gemini
 const userId = process.env.USER_ID || "test-user";
 const guildId = process.env.GUILD_ID;
 const botUserId = process.env.BOT_USER_ID; // optional: the bot's Discord user ID
@@ -17,8 +14,6 @@ interface ConversationMessage {
 
 let conversationHistory: ConversationMessage[] = [];
 let turnCount = 0;
-let chatAI: ChatAIManager;
-let context: AIContextBuilder;
 let db: PostgreSQLManager;
 let dbConnected = false;
 
@@ -122,21 +117,16 @@ async function processTurn(userInput: string): Promise<void> {
 	console.log(`🤤: ${processedInput}`);
 
 	try {
-		let response;
-
-		if (turnCount === 1) {
-			// First turn - use generateMentionResponse (no history)
-			const builtContext = context.build();
-			response = await chatAI.generateMentionResponse(processedInput, builtContext);
-		} else {
-			// Subsequent turns - use generateReplyResponse (with history)
-			const builtContext = context.build();
-			response = await chatAI.generateReplyResponse(
-				processedInput,
-				builtContext,
-				conversationHistory.slice(0, -1) // Exclude current user message
-			);
-		}
+		// First turn has no history; later turns pass the prior messages
+		const response = await generateChatResponse({
+			db,
+			guildId: guildId as string,
+			userId,
+			channelId: "test-channel",
+			messageId: `test-${turnCount}`,
+			content: processedInput,
+			history: turnCount === 1 ? undefined : conversationHistory.slice(0, -1),
+		});
 
 		if (!response.success) {
 			console.error("Error:", response.error || "Unknown error");
@@ -178,7 +168,7 @@ async function startInteractiveMode(): Promise<void> {
 		prompt: "> ",
 	});
 
-	console.log(`\nConversation Chain Test (${provider})`);
+	console.log(`\nConversation Chain Test`);
 	console.log(`Type /help for commands\n`);
 
 	rl.prompt();
@@ -246,9 +236,6 @@ async function main(): Promise<void> {
 		process.exit(1);
 	}
 
-	// Initialize new AI architecture
-	const { engine } = await AIFactory.create();
-	chatAI = new ChatAIManager(engine);
 
 	// Initialize database (optional but enables environment context)
 	db = new PostgreSQLManager();
@@ -257,12 +244,6 @@ async function main(): Promise<void> {
 		console.warn("Database not connected.");
 	}
 
-	// Build AIContext builder (we'll build the context for each turn)
-	context = new AIContextBuilder().guild(guildId).user(userId).domain("chat");
-
-	if (dbConnected) {
-		context.withDatabase(db);
-	}
 
 	// Check for command-line arguments (batch mode)
 	const args = process.argv.slice(2);

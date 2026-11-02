@@ -1,6 +1,4 @@
-import type { AIEngine } from "../../../ai/core/AIEngine";
-import type { AIResponse } from "../../../ai/providers/base/AIProvider";
-import { AIRequestBuilder } from "../../../ai/core/AIRequestBuilder";
+import { OmpRuntime, type AIResponse } from "../../../ai/runtime/OmpRuntime";
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { EmbeddingService } from "./EmbeddingService";
 import { TFIDFExtractor } from "./TFIDFExtractor";
@@ -38,15 +36,17 @@ export interface ConversationSplit {
 }
 
 export interface TopicDriftDetectorOptions {
-  aiEngine?: AIEngine;
   aiFailureCooldownMs?: number;
 }
+
+const TOPIC_SYSTEM_PROMPT =
+  "You are a topic classification component inside a Discord analytics pipeline. " +
+  "Answer in exactly the format the user message requests, with no extra commentary.";
 
 /**
  * Service for detecting topic drift in conversations using embeddings and AI
  */
 export class TopicDriftDetector {
-  private aiEngine: AIEngine | null;
   private embeddingService: EmbeddingService;
   private db: PostgreSQLManager;
   private tfidfExtractor: TFIDFExtractor;
@@ -63,9 +63,6 @@ export class TopicDriftDetector {
   private readonly KEYWORD_HIGH_OVERLAP = 0.4; // High keyword overlap = same topic
   private readonly KEYWORD_LOW_OVERLAP = 0.15; // Low keyword overlap = different topic
 
-  // Use Ollama (GPT-OSS) for topic labeling (switched from Gemini due to high API costs)
-  // Final AI assistant responses use Grok
-  private readonly TOPIC_MODEL = "ollama" as const;
   private readonly AI_USAGE_WINDOW_MS = 60 * 1000; // Track AI usage per minute
   private readonly AI_MAX_CALLS_PER_WINDOW = 20; // Max AI calls per window
   private readonly AI_THROTTLE_COOLDOWN_MS = 60 * 1000; // Cooldown after hitting limit
@@ -77,7 +74,6 @@ export class TopicDriftDetector {
     db: PostgreSQLManager,
     options: TopicDriftDetectorOptions = {}
   ) {
-    this.aiEngine = options.aiEngine ?? null;
     this.embeddingService = EmbeddingService.getInstance();
     this.db = db;
     this.tfidfExtractor = new TFIDFExtractor();
@@ -85,18 +81,15 @@ export class TopicDriftDetector {
     this.aiFailureCooldownMs = options.aiFailureCooldownMs ?? 30 * 60 * 1000;
   }
 
-  setAIEngine(aiEngine: AIEngine | null): void {
-    this.aiEngine = aiEngine ?? null;
-    if (!aiEngine) {
-      this.aiCooldownUntil = null;
-    }
+  private askModel(prompt: string, label: string): Promise<AIResponse> {
+    return OmpRuntime.get().generate({
+      systemPrompt: TOPIC_SYSTEM_PROMPT,
+      prompt,
+      label,
+    });
   }
 
   private canUseAI(): boolean {
-    if (!this.aiEngine) {
-      return false;
-    }
-
     const now = Date.now();
 
     if (this.aiCooldownUntil && now < this.aiCooldownUntil) {
@@ -108,7 +101,7 @@ export class TopicDriftDetector {
     if (this.aiUsageHistory.length >= this.AI_MAX_CALLS_PER_WINDOW) {
       if (now - this.lastAiThrottleLog > this.AI_THROTTLE_LOG_INTERVAL_MS) {
         console.warn(
-          "🔸 TopicDriftDetector throttling Ollama usage to avoid rate limits."
+          "🔸 TopicDriftDetector throttling AI usage to avoid rate limits."
         );
         this.lastAiThrottleLog = now;
       }
@@ -188,16 +181,7 @@ Respond with ONLY the topic label, nothing else. Examples: "planning dinner", "g
     if (this.canUseAI()) {
       try {
         this.recordAIUsage();
-        const builder = new AIRequestBuilder(this.aiEngine!);
-        const result = await builder
-          .blocking()
-          .mode("structured")
-          .maxTokens(150)
-          .provider("ollama")
-          .persona("casual")
-          .withoutTools()
-          .generate(prompt);
-        const response = result as AIResponse;
+        const response = await this.askModel(prompt, "topic-drift.label");
 
         if (response.success && response.content) {
           const label = response.content.trim().toLowerCase();
@@ -623,16 +607,7 @@ Response format: Either "continue" OR "split: [2-5 word topic label]"`;
     if (this.canUseAI()) {
       try {
         this.recordAIUsage();
-        const builder = new AIRequestBuilder(this.aiEngine!);
-        const result = await builder
-          .blocking()
-          .mode("structured")
-          .maxTokens(200)
-          .provider("ollama")
-          .persona("casual")
-          .withoutTools()
-          .generate(prompt);
-        const response = result as AIResponse;
+        const response = await this.askModel(prompt, "topic-drift.split");
 
         if (response.success && response.content) {
           const rawContent = response.content.trim();
@@ -732,17 +707,7 @@ Be balanced - group related subtopics together, but split clearly different disc
     if (this.canUseAI()) {
       try {
         this.recordAIUsage();
-        const builder = new AIRequestBuilder(this.aiEngine!);
-        // Structured mode: the chat preset caps output at 60 tokens
-        const result = await builder
-          .blocking()
-          .mode("structured")
-          .maxTokens(150)
-          .provider("ollama")
-          .persona("casual")
-          .withoutTools()
-          .generate(prompt);
-        const response = result as AIResponse;
+        const response = await this.askModel(prompt, "topic-drift.compare");
 
         if (response.success && response.content) {
           const content = response.content.trim().toLowerCase();

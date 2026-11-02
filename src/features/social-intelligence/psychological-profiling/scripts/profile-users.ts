@@ -11,7 +11,6 @@
 
 import { config } from "../../../../config/index.js";
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager.js";
-import { AIFactory } from "../../../../ai/core/AIFactory.js";
 import { PsychologicalProfiler } from "../PsychologicalProfiler.js";
 
 async function main() {
@@ -110,12 +109,8 @@ async function main() {
 
 	console.log("");
 
-	// Initialize AI engine
-	console.log("Initializing AI engine...");
-	const { engine } = await AIFactory.create();
-
 	// Initialize profiler
-	const profiler = new PsychologicalProfiler(db, engine, {
+	const profiler = new PsychologicalProfiler(db, {
 		minMessagesForProfiling: 10,
 		batchSize: 10,
 		sleepBetweenBatchesMs: 1000, // 1 second between batches (Grok)

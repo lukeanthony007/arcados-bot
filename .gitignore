@@ -190,3 +190,6 @@ api-costs/
 # Ignore all log files
 log/
 
+
+# Bot-local omp SDK state (auth/model cache)
+.omp-bot/

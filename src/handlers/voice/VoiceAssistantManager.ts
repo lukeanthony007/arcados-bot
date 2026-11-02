@@ -5,13 +5,8 @@ import { WhisperTranscriber } from "./tts/services/WhisperTranscriber.js";
 import { WhisperServerManager } from "./tts/services/WhisperServerManager.js";
 import { TTSManager } from "./tts/services/TTSManager.js";
 import { TriggerWordDetector } from "./tts/services/TriggerWordDetector.js";
-import { VoiceAIManager } from "./VoiceAIManager.js";
-import { AIContextBuilder } from "../../ai/core/AIContext.js";
-import { enrichAIContext } from "../../ai/core/ContextEnricher.js";
-import { AIFactory } from "../../ai/core/AIFactory.js";
-import type { AIEngine } from "../../ai/core/AIEngine.js";
-import type { AIResponse } from "../../ai/providers/base/AIProvider.js";
-import { HIDDEN_BEHAVIORS } from "../../ai/personas/definitions.js";
+import { VoiceAIManager, type VoiceAIContext } from "./VoiceAIManager.js";
+import type { AIResponse } from "../../ai/runtime/OmpRuntime.js";
 import { config } from "../../config/index.js";
 import { VoiceLogger } from "./utils/VoiceLogger.js";
 import { AudioToneGenerator } from "./utils/AudioToneGenerator.js";
@@ -68,7 +63,6 @@ export class VoiceAssistantManager {
   private tts: TTSManager;
   private triggerDetector: TriggerWordDetector;
   private voiceAI: VoiceAIManager | null = null;
-  private enginePromise: Promise<AIEngine> | null = null;
   private mediaPlayer: MediaPlayerManager;
   private client?: Client;
   private db?: any; // PostgreSQLManager instance (optional, for tool context)
@@ -114,8 +108,9 @@ export class VoiceAssistantManager {
   // Track request start times for response time metrics (keyed by guildId:userId)
   private requestStartTimes: Map<string, number> = new Map();
 
-  // Feature flag for streaming TTS (set to false to enable tool calling)
-  // TODO: Implement streaming with tool support for low-latency tool execution
+  // Feature flag for streaming TTS. The streaming path supports tools and history, but stays
+  // off: it can't suppress speech once a media tool runs (text may already be spoken), and it
+  // lacks the blocking path's media pause-for-TTS and conversation-mode history bookkeeping.
   private useStreamingTTS = false;
   private recentUtterances: Map<
     Snowflake,
@@ -198,15 +193,10 @@ export class VoiceAssistantManager {
     this.logger = new VoiceLogger("🎤");
   }
 
-  private async getVoiceAI(): Promise<VoiceAIManager> {
-    if (this.voiceAI) {
-      return this.voiceAI;
+  private getVoiceAI(): VoiceAIManager {
+    if (!this.voiceAI) {
+      this.voiceAI = new VoiceAIManager();
     }
-    if (!this.enginePromise) {
-      this.enginePromise = AIFactory.create().then(({ engine }) => engine);
-    }
-    const engine = await this.enginePromise;
-    this.voiceAI = new VoiceAIManager(engine);
     return this.voiceAI;
   }
 
@@ -598,53 +588,6 @@ export class VoiceAssistantManager {
    * @param text Text that may contain blank audio markers
    * @returns Text with blank audio markers removed
    */
-  /**
-   * Strip hidden behavior trigger words and variations from query
-   * Prevents trigger words like "Temagami" from being sent to the AI
-   */
-  private stripHiddenBehaviorTriggers(text: string): string {
-    if (!text || text.trim().length === 0) {
-      return text;
-    }
-
-    let cleaned = text;
-    const normalizedText = text.toLowerCase();
-
-    // Check all hidden behaviors and strip their triggers
-    for (const behavior of Object.values(HIDDEN_BEHAVIORS)) {
-      // Check main trigger
-      const triggerLower = behavior.trigger.toLowerCase();
-      if (normalizedText.includes(triggerLower)) {
-        // Remove trigger word (case-insensitive)
-        const triggerRegex = new RegExp(`\\b${behavior.trigger}\\b`, "gi");
-        cleaned = cleaned.replace(triggerRegex, "").trim();
-      }
-
-      // Check all variations
-      for (const variation of behavior.variations) {
-        const variationLower = variation.toLowerCase();
-        if (normalizedText.includes(variationLower)) {
-          // Remove variation (case-insensitive, word boundary)
-          const variationRegex = new RegExp(`\\b${variation}\\b`, "gi");
-          cleaned = cleaned.replace(variationRegex, "").trim();
-        }
-      }
-    }
-
-    // Clean up extra whitespace and punctuation
-    cleaned = cleaned.replace(/\s+/g, " ").trim();
-    cleaned = cleaned.replace(/^[,;.!?\s]+/, "").trim(); // Remove leading punctuation
-    cleaned = cleaned.replace(/[,;.!?\s]+$/, "").trim(); // Remove trailing punctuation
-
-    if (cleaned !== text) {
-      this.logger.debug(
-        `[TRIGGER] Stripped hidden behavior triggers from query: "${text}" → "${cleaned}"`
-      );
-    }
-
-    return cleaned;
-  }
-
   private stripBlankAudioMarkers(text: string): string {
     if (!text) return text;
 
@@ -1372,17 +1315,6 @@ export class VoiceAssistantManager {
       }
     }
 
-    // Strip hidden behavior trigger words from query (prevent them from being sent to AI)
-    const queryBeforeHidden = query;
-    if (query) {
-      query = this.stripHiddenBehaviorTriggers(query);
-      if (query !== queryBeforeHidden) {
-        this.logger.debug(
-          `[processTranscriptionBuffer] Query after stripHiddenBehaviorTriggers: "${query}" (was: "${queryBeforeHidden}")`
-        );
-      }
-    }
-
     // If query is empty after cleaning, don't process
     if (shouldProcess && (!query || query.trim().length === 0)) {
       this.logger.info(
@@ -2010,31 +1942,23 @@ export class VoiceAssistantManager {
         return;
       }
 
-      // Build AIContext for voice streaming
-      const contextBuilder = new AIContextBuilder()
-        .guild(session.guildId)
-        .user(userId)
-        .channel(session.channelId)
-        .domain("voice")
-        .streaming(true)
-        .withHistory(session.conversationHistory || []);
+      // Build voice AI context (db absent => no tools, see VoiceAIContext)
+      const context: VoiceAIContext = {
+        userId,
+        guildId: session.guildId,
+        channelId: session.channelId,
+        db: this.db,
+        history: session.conversationHistory || [],
+      };
 
-      // Add database if available (needed for some tools)
-      if (this.db) {
-        contextBuilder.withDatabase(this.db);
-      }
-
-      const baseContext = contextBuilder.build();
-
-      const context = await enrichAIContext(baseContext, {}, { query });
-      this.logger.debug(`[STREAMING] Context enriched for guild ${session.guildId}`);
-
-      // Start streaming tokens from LLM
-      const voiceAI = await this.getVoiceAI();
+      // Start streaming tokens from LLM; aborting stops the model and its tool calls
+      const generationAbort = new AbortController();
+      const voiceAI = this.getVoiceAI();
       this.logger.debug(`[STREAMING] Getting token stream for guild ${session.guildId}`);
-      const tokenStream = await voiceAI.streamConversationResponse(
+      const { tokens: tokenStream } = await voiceAI.streamConversationResponse(
         query,
-        context
+        context,
+        { timeoutMs: AI_CONSTANTS.RESPONSE_TIMEOUT_MS, signal: generationAbort.signal }
       );
       this.logger.debug(`[STREAMING] Token stream obtained for guild ${session.guildId}`);
 
@@ -2081,6 +2005,8 @@ export class VoiceAssistantManager {
           this.logger.info(
             `[STREAMING] Finalizing streaming queue for guild ${session.guildId}`
           );
+          // Stop the model if playback was aborted mid-generation (no-op once complete)
+          generationAbort.abort();
           streamingQueue.finalize();
           const queueStats = streamingQueue.getStats();
             this.logger.debug(
@@ -2212,7 +2138,7 @@ export class VoiceAssistantManager {
       this.requestStartTimes.delete(errorRequestKey);
 
       const errorType =
-        error instanceof Error && error.message.includes("timeout")
+        error instanceof Error && /time(out|d out)/i.test(error.message)
           ? VoiceAssistantErrorType.AI_FAILED
           : VoiceAssistantErrorType.UNKNOWN;
 
@@ -2252,30 +2178,15 @@ export class VoiceAssistantManager {
         this.mediaPausedForTTS.add(session.guildId);
       }
 
-      // Generate AI response with timeout
-      const timeoutPromise = new Promise<AIResponse>((_, reject) => {
-        setTimeout(
-          () =>
-            reject(
-              new Error(
-                `AI response timeout after ${AI_CONSTANTS.RESPONSE_TIMEOUT_MS}ms`
-              )
-            ),
-          AI_CONSTANTS.RESPONSE_TIMEOUT_MS
-        );
-      });
-
-      // Build AIContext for voice
-      const contextBuilder = new AIContextBuilder()
-        .guild(session.guildId)
-        .user(userId)
-        .channel(session.channelId)
-        .domain("voice");
-
-      // Add database if available (needed for some tools)
-      if (this.db) {
-        contextBuilder.withDatabase(this.db);
-      }
+      // Build voice AI context (db absent => no tools, see VoiceAIContext)
+      const baseContext: VoiceAIContext = {
+        userId,
+        guildId: session.guildId,
+        channelId: session.channelId,
+        db: this.db,
+      };
+      // The runtime enforces the response timeout itself
+      const requestOptions = { timeoutMs: AI_CONSTANTS.RESPONSE_TIMEOUT_MS };
 
       let responsePromise: Promise<AIResponse>;
 
@@ -2299,30 +2210,23 @@ export class VoiceAssistantManager {
           );
         }
 
-        // Build context with history (excluding current user message)
-        const baseContext = contextBuilder
-          .withHistory(session.conversationHistory.slice(0, -1))
-          .build();
-
-        const context = await enrichAIContext(baseContext, {}, { query });
-
         this.logger.debug("Calling generateConversationResponse...");
-        const voiceAI = await this.getVoiceAI();
+        const voiceAI = this.getVoiceAI();
+        // History excludes the current user message
         responsePromise = voiceAI.generateConversationResponse(
           query,
-          context
+          { ...baseContext, history: session.conversationHistory.slice(0, -1) },
+          requestOptions
         );
       } else {
         // Command mode - use generateCommandResponse
-        const baseContext = contextBuilder.build();
-        const context = await enrichAIContext(baseContext, {}, { query });
         this.logger.debug("Calling generateCommandResponse...");
-        const voiceAI = await this.getVoiceAI();
-        responsePromise = voiceAI.generateCommandResponse(query, context);
+        const voiceAI = this.getVoiceAI();
+        responsePromise = voiceAI.generateCommandResponse(query, baseContext, requestOptions);
       }
 
       this.logger.debug("Waiting for AI response...");
-      const response = await Promise.race([responsePromise, timeoutPromise]);
+      const response = await responsePromise;
 
       if (!response.success) {
         this.logger.error(`AI response failed: ${response.error || "Unknown error"}`);
@@ -2387,7 +2291,7 @@ export class VoiceAssistantManager {
 
       // Determine error type
       const errorType =
-        error instanceof Error && error.message.includes("timeout")
+        error instanceof Error && /time(out|d out)/i.test(error.message)
           ? VoiceAssistantErrorType.AI_FAILED
           : VoiceAssistantErrorType.UNKNOWN;
 

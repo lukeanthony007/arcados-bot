@@ -7,9 +7,7 @@
  */
 
 import { PostgreSQLManager } from "../../../database/PostgreSQLManager";
-import { AIFactory } from "../../../ai/core/AIFactory";
-import { AIRequestBuilder } from "../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../ai/core/AIContext";
+import { OmpRuntime } from "../../../ai/runtime/OmpRuntime";
 import { config } from "../../../config/index.js";
 
 const db = new PostgreSQLManager();
@@ -302,52 +300,14 @@ TASK:
 
 Server summary:`;
 
-    const { engine, providers } = await AIFactory.create();
+    const response = await OmpRuntime.get().generate({
+      systemPrompt:
+        "You write concise descriptions of Discord communities for an AI assistant. " +
+        "Follow the task instructions exactly, including the sentence count, and output only the description.",
+      prompt,
+      label: "server-lore.summary",
+    });
 
-    // Choose a provider based on what's actually configured
-    const availableProviders = Array.from(providers.keys());
-    let providerName: string | undefined;
-
-    if (availableProviders.includes("grok")) {
-      providerName = "grok";
-    } else if (availableProviders.includes("openai")) {
-      providerName = "openai";
-    } else if (availableProviders.includes("gemini")) {
-      providerName = "gemini";
-    } else if (availableProviders.length > 0) {
-      providerName = availableProviders[0];
-    }
-
-    if (!providerName) {
-      console.error("❌ No AI providers configured. Set GROK_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY.");
-      await db.disconnect();
-      process.exit(1);
-    }
-
-    console.log(`Using provider: ${providerName}\n`);
-
-    const builder = new AIRequestBuilder(engine);
-    const ctx = new AIContextBuilder()
-      .user("server-summarizer")
-      .guild(guildId)
-      .build();
-
-    const result = await builder
-      .withContext(ctx)
-      .chat()
-      .blocking()
-      .provider(providerName)
-      .persona("sophia")
-      .withoutTools()
-      .generate(prompt);
-
-    if (!result || typeof result !== "object" || !("success" in result)) {
-      console.error("❌ Unexpected AI response type.");
-      await db.disconnect();
-      process.exit(1);
-    }
-
-    const response = result;
     if (!response.success || !response.content) {
       console.error("❌ Failed to generate server summary:", response.error);
       await db.disconnect();

@@ -14,10 +14,7 @@
  * 4. Store in user_personas
  */
 
-import { AIContextBuilder } from "../../ai/core/AIContext";
-import type { AIEngine } from "../../ai/core/AIEngine";
-import { AIFactory } from "../../ai/core/AIFactory";
-import { AIRequestBuilder } from "../../ai/core/AIRequestBuilder";
+import { OmpRuntime } from "../../ai/runtime/OmpRuntime";
 import type {
 	DatabaseResult,
 	PostgreSQLManager,
@@ -90,7 +87,6 @@ interface NameRow {
 export class UserPersonaService {
 	private db: PostgreSQLManager;
 	private relationshipMapper: RelationshipMapper;
-	private enginePromise: Promise<AIEngine> | null = null;
 	private building = new Set<string>();
 
 	constructor(db: PostgreSQLManager, relationshipMapper: RelationshipMapper) {
@@ -172,8 +168,6 @@ export class UserPersonaService {
 				};
 			}
 
-			const engine = await this.getEngine();
-
 			// 1. Refresh the social-intelligence profile
 			await onProgress?.("Mapping relationships…");
 			const relationshipResult =
@@ -191,7 +185,6 @@ export class UserPersonaService {
 			// A failed enrichment shouldn't block the persona; the profiler below fills in
 			const enrichedProfileVersion = await new UserProfileEnrichmentPipeline(
 				this.db,
-				engine,
 			)
 				.enrichUser(userId, guildId)
 				.catch((error: unknown) => {
@@ -203,7 +196,7 @@ export class UserPersonaService {
 				});
 			const psychProfiled =
 				enrichedProfileVersion === null
-					? await new PsychologicalProfiler(this.db, engine).profileUser(
+					? await new PsychologicalProfiler(this.db).profileUser(
 							userId,
 							guildId,
 						)
@@ -224,12 +217,7 @@ export class UserPersonaService {
 				conversations,
 				names.users,
 			);
-			const characterProfile = await this.writeCharacterProfile(
-				engine,
-				guildId,
-				name,
-				dossier,
-			);
+			const characterProfile = await this.writeCharacterProfile(name, dossier);
 			if (!characterProfile) {
 				return {
 					success: false,
@@ -271,13 +259,6 @@ export class UserPersonaService {
 		} finally {
 			this.building.delete(key);
 		}
-	}
-
-	private getEngine(): Promise<AIEngine> {
-		if (!this.enginePromise) {
-			this.enginePromise = AIFactory.create().then(({ engine }) => engine);
-		}
-		return this.enginePromise;
 	}
 
 	private async getMember(
@@ -511,38 +492,19 @@ export class UserPersonaService {
 	}
 
 	private async writeCharacterProfile(
-		engine: AIEngine,
-		guildId: string,
 		name: string,
 		dossier: string,
 	): Promise<string | null> {
-		const context = new AIContextBuilder()
-			.user("system-persona-builder")
-			.guild(guildId)
-			.build();
-		const result = await new AIRequestBuilder(engine)
-			.blocking()
-			.mode("structured")
-			.withContext(context)
-			.provider("grok")
-			.customPersona(PROFILE_WRITER_PERSONA)
-			.withoutTools()
-			.noWebSearch()
-			.maxTokens(1500)
-			.generate(buildProfileRequest(name, dossier));
+		const result = await OmpRuntime.get().generate({
+			systemPrompt: PROFILE_WRITER_PERSONA,
+			prompt: buildProfileRequest(name, dossier),
+			label: "persona.profile",
+		});
 
-		if (
-			typeof result === "object" &&
-			"success" in result &&
-			result.success &&
-			result.content
-		) {
+		if (result.success && result.content) {
 			return result.content.trim();
 		}
-		console.error(
-			"🔸 Persona: profile generation failed:",
-			"error" in result ? result.error : result,
-		);
+		console.error("🔸 Persona: profile generation failed:", result.error);
 		return null;
 	}
 

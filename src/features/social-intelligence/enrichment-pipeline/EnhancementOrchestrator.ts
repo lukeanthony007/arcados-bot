@@ -1,9 +1,6 @@
 import { pgvector, PostgreSQLManager } from "../../../database/PostgreSQLManager.js";
-import type { AIEngine } from "../../../ai/core/AIEngine";
-import type { AIResponse } from "../../../ai/providers/base/AIProvider";
-import { AIRequestBuilder } from "../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../ai/core/AIContext.js";
-import { AIFactory } from "../../../ai/core/AIFactory";
+import { OmpRuntime, type AIResponse } from "../../../ai/runtime/OmpRuntime";
+import { ENRICHMENT_SYSTEM_PROMPT } from "./enrichmentPrompt";
 import { EmbeddingService } from "../semantic-analysis/EmbeddingService.js";
 import { PsychologicalProfiler } from "../psychological-profiling/PsychologicalProfiler";
 
@@ -96,8 +93,6 @@ export interface EnhancementStats {
  */
 export class EnhancementOrchestrator {
   private db: PostgreSQLManager;
-  private aiEngine: AIEngine | null = null;
-  private aiEnginePromise: Promise<AIEngine> | null = null;
   private config: Required<EnhancementConfig>;
   private stats: EnhancementStats;
   private apiCallTimestamps: number[] = [];
@@ -108,16 +103,9 @@ export class EnhancementOrchestrator {
 
   constructor(
     db: PostgreSQLManager,
-    aiEngine?: AIEngine,
     config: EnhancementConfig = {}
   ) {
     this.db = db;
-    if (aiEngine) {
-      this.aiEngine = aiEngine;
-    } else {
-      // Lazy initialization: engine will be created on first use
-      this.aiEnginePromise = AIFactory.create().then(({ engine }) => engine);
-    }
     this.config = {
       lookbackHours: config.lookbackHours ?? 24,
       minMessagesForSplit: config.minMessagesForSplit ?? 20,
@@ -146,17 +134,6 @@ export class EnhancementOrchestrator {
       apiCallsMade: 0,
       startTime: new Date(),
     };
-  }
-
-  private async getAIEngine(): Promise<AIEngine> {
-    if (this.aiEngine) {
-      return this.aiEngine;
-    }
-    if (!this.aiEnginePromise) {
-      this.aiEnginePromise = AIFactory.create().then(({ engine }) => engine);
-    }
-    this.aiEngine = await this.aiEnginePromise;
-    return this.aiEngine;
   }
 
   /**
@@ -445,65 +422,44 @@ Top recurring terms (by frequency): ${topicHintText || "none"}
 
 Summary:`;
 
-          // Try Grok first (better rate limits), fallback to Ollama
-          let provider = "grok";
-          if (!process.env.GROK_API_KEY && process.env.OLLAMA_URL) {
-            provider = "ollama";
-          }
-
           // Retry logic for rate limits
           let response: AIResponse | undefined;
           let retries = 3;
-          let lastError: Error | null = null;
 
           while (retries > 0) {
             try {
-              const engine = await this.getAIEngine();
-              const builder = new AIRequestBuilder(engine);
-              // Use a simple synthetic context for summarization calls
-              const ctx = new AIContextBuilder()
-                .user("system-summarizer")
-                .guild(guildId)
-                .build();
-              const result = await builder
-                // Structured mode: the chat preset caps output at 60 tokens, truncating summaries.
-                // The prompt asks for 1-2 sentences; 300 tokens is headroom, not a target.
-                .blocking()
-                .mode("structured")
-                .maxTokens(300)
-                .withContext(ctx)
-                .provider(provider as "grok" | "ollama")
-                .persona("casual")
-                .withoutTools() // Summaries don't need database tools
-                .generate(prompt);
-              // Blocking mode returns AIResponse
-              response = result as AIResponse;
-              break; // Success, exit retry loop
+              response = await OmpRuntime.get().generate({
+                systemPrompt: ENRICHMENT_SYSTEM_PROMPT,
+                prompt,
+                label: "enrichment.conversation-summary",
+              });
             } catch (error) {
-              lastError =
-                error instanceof Error ? error : new Error(String(error));
-              const errorMsg = lastError.message.toLowerCase();
+              const message = error instanceof Error ? error.message : String(error);
+              response = { success: false, content: "", error: message };
+            }
+            if (response.success) {
+              break; // Success, exit retry loop
+            }
 
-              // Check if it's a rate limit error
-              if (
-                errorMsg.includes("429") ||
-                errorMsg.includes("quota") ||
-                errorMsg.includes("rate limit")
-              ) {
-                retries--;
-                if (retries > 0) {
-                  const waitTime = 10000; // Wait 10 seconds
-                  console.log(
-                    `      ⏳ Rate limit hit, waiting ${
-                      waitTime / 1000
-                    }s before retry...`
-                  );
-                  await this.sleep(waitTime);
-                }
-              } else {
-                // Not a rate limit error, don't retry
-                break;
+            const errorMsg = (response.error ?? "").toLowerCase();
+            if (
+              errorMsg.includes("429") ||
+              errorMsg.includes("quota") ||
+              errorMsg.includes("rate limit")
+            ) {
+              retries--;
+              if (retries > 0) {
+                const waitTime = 10000; // Wait 10 seconds
+                console.log(
+                  `      ⏳ Rate limit hit, waiting ${
+                    waitTime / 1000
+                  }s before retry...`
+                );
+                await this.sleep(waitTime);
               }
+            } else {
+              // Not a rate limit error, don't retry
+              break;
             }
           }
 
@@ -562,8 +518,8 @@ Summary:`;
             this.stats.summariesGenerated++;
             this.stats.apiCallsMade++;
           } else {
-            const errorMsg = lastError
-              ? lastError.message.substring(0, 100)
+            const errorMsg = response?.error
+              ? response.error.substring(0, 100)
               : "Unknown error";
             console.warn(
               `      ⚠️  Segment ${segment.id.slice(
@@ -662,8 +618,7 @@ Summary:`;
     console.log(`   Found ${userIds.length} users to profile`);
 
     // Initialize profiler
-    const aiEngine = await this.getAIEngine();
-    const profiler = new PsychologicalProfiler(this.db, aiEngine, {
+    const profiler = new PsychologicalProfiler(this.db, {
       minMessagesForProfiling: this.config.minMessagesForProfiling,
       batchSize: this.config.profilingBatchSize,
       sleepBetweenBatchesMs: 1000, // 1 second for Grok (better rate limits)

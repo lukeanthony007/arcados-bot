@@ -146,7 +146,7 @@ This is context engineering in practice—managing what an LLM knows and when it
 - Bridging node identification between communities
 - Influence flow mapping across network topology
 - Anomaly detection for behavioral shifts
-- Multi-provider LLM orchestration (Grok, Gemini, OpenAI, Ollama)
+- LLM orchestration on the omp SDK (Grok via xAI), with the bot's database tools as agent tools and web search
 - Real-time RAG pipelines with zero-lag retrieval
 - Dynamic tool registry for programmatic intelligence access
 - Conversation detection with multi-strategy grouping

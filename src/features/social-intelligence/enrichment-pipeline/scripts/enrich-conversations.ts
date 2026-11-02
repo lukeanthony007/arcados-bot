@@ -10,10 +10,7 @@
  */
 
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
-import { AIFactory } from "../../../../ai/core/AIFactory";
-import type { AIEngine } from "../../../../ai/core/AIEngine";
-import { AIRequestBuilder } from "../../../../ai/core/AIRequestBuilder";
-import type { AIResponse } from "../../../../ai/providers/base/AIProvider";
+import { OmpRuntime, type JsonObjectSchema } from "../../../../ai/runtime/OmpRuntime";
 import { SocialIntelligence } from "../../index.js";
 import { EnhancementOrchestrator } from "../EnhancementOrchestrator";
 import { config } from "../../../../config/index.js";
@@ -46,6 +43,27 @@ interface EnrichmentAction {
 	reason: string;
 	details?: any;
 }
+
+const ENRICHMENT_ACTION_SCHEMA: JsonObjectSchema = {
+	type: "object",
+	properties: {
+		type: { type: "string", enum: ["merge", "split", "assign_orphan", "no_action"] },
+		confidence: { type: "number", minimum: 0, maximum: 1 },
+		reason: { type: "string" },
+		details: {
+			type: "object",
+			properties: {
+				conversation_ids: { type: "array", items: { type: "string" } },
+				conversation_id: { type: "string" },
+				split_after_message_id: { type: "string" },
+				orphan_message_ids: { type: "array", items: { type: "string" } },
+				target_conversation_id: { type: "string" },
+				reason: { type: "string" },
+			},
+		},
+	},
+	required: ["type", "confidence", "reason", "details"],
+};
 
 interface CliOptions {
 	lookbackHours: number;
@@ -141,9 +159,7 @@ async function main() {
 		process.exit(1);
 	}
 
-	// Initialize AI
-	const { engine } = await AIFactory.create();
-	console.log("\n🔧 Initializing AI engine...");
+	console.log("\n🔧 Initializing AI...");
 
 	// Fetch all messages and conversations
 	console.log("\n📥 Loading data from database...");
@@ -184,7 +200,7 @@ async function main() {
 		);
 
 		// Analyze this group with AI
-		const action = await analyzeGroup(group, engine, guildId);
+		const action = await analyzeGroup(group, guildId);
 
 		if (action.type !== "no_action") {
 			console.log(`\n   🎯 Action: ${action.type.toUpperCase()}`);
@@ -328,7 +344,7 @@ async function main() {
 				console.log(
 					`\n   📄 ${summaryAction} summaries for ${summaryTargetCount} conversations...`
 				);
-				const orchestrator = new EnhancementOrchestrator(db, engine, {
+				const orchestrator = new EnhancementOrchestrator(db, {
 					lookbackHours: hoursBack,
 					enableSummaries: true,
 					enableOrphans: false,
@@ -576,7 +592,6 @@ function createGroup(
 
 async function analyzeGroup(
 	group: AnalysisGroup,
-	aiEngine: AIEngine,
 	guildId: string
 ): Promise<EnrichmentAction> {
 	// Build context for AI
@@ -603,61 +618,31 @@ Look for:
 
 IMPORTANT: When referencing messages, use their message IDs from the [id:...] prefix shown in the data.
 
-Respond with a JSON object:
-{
-  "type": "merge" | "split" | "assign_orphan" | "no_action",
-  "confidence": 0.0-1.0,
-  "reason": "Brief explanation of why this action is needed",
-  "details": {
-    // For "merge": { "conversation_ids": ["conv_id1", "conv_id2", ...] }  <- Use the full conversation IDs shown above
-    // For "split": { "conversation_id": "conv_id", "split_after_message_id": "msg_id", "reason": "topic shift from X to Y" }
-    // For "assign_orphan": { "orphan_message_ids": ["msg_id1", "msg_id2", ...], "target_conversation_id": "conv_id" }  <- Use message IDs from [id:...]
-    // For "no_action": {}
-  }
-}
-
-Only return the JSON, nothing else.`;
+Report your decision with the fields type, confidence (0.0-1.0), reason (brief explanation of why this action is needed) and details:
+  // For "merge": details = { "conversation_ids": ["conv_id1", "conv_id2", ...] }  <- Use the full conversation IDs shown above
+  // For "split": details = { "conversation_id": "conv_id", "split_after_message_id": "msg_id", "reason": "topic shift from X to Y" }
+  // For "assign_orphan": details = { "orphan_message_ids": ["msg_id1", "msg_id2", ...], "target_conversation_id": "conv_id" }  <- Use message IDs from [id:...]
+  // For "no_action": details = {}`;
 
 	try {
-		// Use Grok (no quota issues), fall back to Ollama
-		const provider = process.env.GROK_API_KEY ? "grok" : "ollama";
+		const action = await OmpRuntime.get().generateStructured<EnrichmentAction>({
+			systemPrompt:
+				"You are a conversation-grouping analysis component inside a Discord analytics pipeline. " +
+				"Report your decision only by calling the submit tool.",
+			prompt,
+			schema: ENRICHMENT_ACTION_SCHEMA,
+			label: "enrichment.conversation-grouping",
+		});
 
-		const builder = new AIRequestBuilder(aiEngine);
-		const result = await builder
-			// Structured mode: the chat preset caps output at 60 tokens, which truncates the JSON reply
-			.blocking()
-			.mode("structured")
-			.maxTokens(800)
-			.provider(provider as "grok" | "ollama")
-			.persona("casual")
-			.withoutTools() // Don't need database tools for this analysis
-			.generate(prompt);
-
-		const response = result as AIResponse;
-
-		if (!response.success || !response.content) {
-			console.error(`   ⚠️  Invalid AI response:`, response);
+		if (!action) {
+			console.error(`   ⚠️  AI did not submit a grouping decision`);
 			return {
 				type: "no_action",
 				confidence: 0,
-				reason: "Invalid AI response format",
+				reason: "AI did not return a grouping decision",
 			};
 		}
 
-		const responseText = response.content;
-
-		// Parse JSON response
-		const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-		if (!jsonMatch) {
-			console.error(`   ⚠️  No JSON found in response:`, responseText.substring(0, 200));
-			return {
-				type: "no_action",
-				confidence: 0,
-				reason: "Failed to parse AI response - no JSON found",
-			};
-		}
-
-		const action = JSON.parse(jsonMatch[0]) as EnrichmentAction;
 		return action;
 	} catch (error) {
 		console.error(`   ⚠️  AI analysis failed:`, error);

@@ -11,10 +11,8 @@
  */
 
 import { pgvector, type PostgreSQLManager } from "../../../../database/PostgreSQLManager.js";
-import type { AIEngine } from "../../../../ai/core/AIEngine";
-import type { AIResponse } from "../../../../ai/providers/base/AIProvider";
-import { AIRequestBuilder } from "../../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../../ai/core/AIContext.js";
+import { OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
+import { ENRICHMENT_SYSTEM_PROMPT } from "../enrichmentPrompt";
 import { EmbeddingService } from "../../semantic-analysis/EmbeddingService.js";
 import { EnrichmentRateLimiter } from "../EnrichmentRateLimiter";
 
@@ -38,13 +36,11 @@ export interface EnrichmentResult {
 
 export class ConversationEnrichmentPipeline {
 	private db: PostgreSQLManager;
-	private aiEngine: AIEngine;
 	private rateLimiter: EnrichmentRateLimiter;
 	private embeddingService: EmbeddingService;
 
-	constructor(db: PostgreSQLManager, aiEngine: AIEngine) {
+	constructor(db: PostgreSQLManager) {
 		this.db = db;
-		this.aiEngine = aiEngine;
 		this.rateLimiter = EnrichmentRateLimiter.getInstance();
 		this.embeddingService = EmbeddingService.getInstance();
 	}
@@ -154,7 +150,6 @@ export class ConversationEnrichmentPipeline {
 
 			// Generate summary using AI
 			const summary = await this.generateSummary(
-				guildId,
 				messages.length,
 				participantCount,
 				messagePreview,
@@ -422,7 +417,6 @@ export class ConversationEnrichmentPipeline {
 	 * Generate summary using AI
 	 */
 	private async generateSummary(
-		guildId: string,
 		messageCount: number,
 		participantCount: number,
 		messagePreview: string,
@@ -465,62 +459,38 @@ Top recurring terms (by frequency): ${topicHintText || "none"}
 
 Summary:`;
 
-		// Try Grok first (better rate limits), fallback to Ollama
-		let provider = "grok";
-		if (!process.env.GROK_API_KEY) {
-			if (process.env.OLLAMA_URL) {
-				provider = "ollama";
-			}
-		}
-
 		// Retry logic for rate limits
+		const isRateLimit = (message: string): boolean => {
+			const lower = message.toLowerCase();
+			return lower.includes("429") || lower.includes("quota") || lower.includes("rate limit");
+		};
+
 		let retries = 3;
-		let lastError: Error | null = null;
 
 		while (retries > 0) {
+			let failure: string;
 			try {
-				const builder = new AIRequestBuilder(this.aiEngine);
-				const ctx = new AIContextBuilder()
-					.user("system-summarizer")
-					.guild(guildId)
-					.build();
-				// Structured mode: the chat preset caps output at 60 tokens, truncating summaries.
-				// The prompt asks for 1-2 sentences; 300 tokens is headroom, not a target.
-				const result = await builder
-					.blocking()
-					.mode("structured")
-					.maxTokens(300)
-					.withContext(ctx)
-					.provider(provider as "grok" | "ollama")
-					.persona("casual")
-					.withoutTools()
-					.generate(prompt);
-
-				const response = result as AIResponse;
+				const response = await OmpRuntime.get().generate({
+					systemPrompt: ENRICHMENT_SYSTEM_PROMPT,
+					prompt,
+					label: "enrichment.conversation-summary",
+				});
 				if (response.success && response.content) {
 					return response.content.trim();
 				}
-				break;
+				failure = response.error ?? "";
 			} catch (error) {
-				lastError = error instanceof Error ? error : new Error(String(error));
-				const errorMsg = lastError.message.toLowerCase();
+				failure = error instanceof Error ? error.message : String(error);
+			}
 
-				if (
-					errorMsg.includes("429") ||
-					errorMsg.includes("quota") ||
-					errorMsg.includes("rate limit")
-				) {
-					retries--;
-					if (retries > 0) {
-						const waitTime = 10000; // Wait 10 seconds
-						console.log(
-							`⏳ Rate limit hit, waiting ${waitTime / 1000}s before retry...`,
-						);
-						await new Promise((resolve) => setTimeout(resolve, waitTime));
-					}
-				} else {
-					break;
-				}
+			if (!isRateLimit(failure)) {
+				break;
+			}
+			retries--;
+			if (retries > 0) {
+				const waitTime = 10000; // Wait 10 seconds
+				console.log(`⏳ Rate limit hit, waiting ${waitTime / 1000}s before retry...`);
+				await new Promise((resolve) => setTimeout(resolve, waitTime));
 			}
 		}
 

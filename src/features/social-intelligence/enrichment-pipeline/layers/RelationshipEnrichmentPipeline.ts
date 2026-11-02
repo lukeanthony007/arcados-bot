@@ -11,10 +11,8 @@
  */
 
 import type { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
-import type { AIEngine } from "../../../../ai/core/AIEngine";
-import type { AIResponse } from "../../../../ai/providers/base/AIProvider";
-import { AIRequestBuilder } from "../../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../../ai/core/AIContext.js";
+import { OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
+import { ENRICHMENT_SYSTEM_PROMPT } from "../enrichmentPrompt";
 import { EnrichmentRateLimiter } from "../EnrichmentRateLimiter";
 import {
 	IncrementalEnrichment,
@@ -45,12 +43,10 @@ const MIN_SHARED_CONVERSATIONS = 3;
 
 export class RelationshipEnrichmentPipeline {
 	private db: PostgreSQLManager;
-	private aiEngine: AIEngine;
 	private rateLimiter: EnrichmentRateLimiter;
 
-	constructor(db: PostgreSQLManager, aiEngine: AIEngine) {
+	constructor(db: PostgreSQLManager) {
 		this.db = db;
-		this.aiEngine = aiEngine;
 		this.rateLimiter = EnrichmentRateLimiter.getInstance();
 	}
 
@@ -204,7 +200,7 @@ export class RelationshipEnrichmentPipeline {
 					conversationSummaries,
 					contextRange,
 				);
-				const delta = await this.generate(deltaPrompt, guildId, 400);
+				const delta = await this.generate(deltaPrompt, "enrichment.relationship-delta");
 
 				enrichmentHistory = IncrementalEnrichment.appendDelta(
 					existingHistory ?? IncrementalEnrichment.createHistory(baseSummary),
@@ -230,7 +226,7 @@ export class RelationshipEnrichmentPipeline {
 					"relationship",
 					enrichmentHistory,
 				);
-				const consolidated = await this.generate(consolidationPrompt, guildId, 500);
+				const consolidated = await this.generate(consolidationPrompt, "enrichment.relationship-consolidation");
 				enrichmentHistory = IncrementalEnrichment.consolidate(consolidated);
 			}
 
@@ -386,7 +382,7 @@ ${conversationSummaries}
 
 **Relationship Summary**:`;
 
-		return await this.generate(prompt, guildId, 400);
+		return await this.generate(prompt, "enrichment.relationship-summary");
 	}
 
 	/**
@@ -429,31 +425,12 @@ ${conversationSummaries}
 	/**
 	 * Generate text with the LLM. Throws if generation fails or returns nothing.
 	 */
-	private async generate(prompt: string, guildId: string, maxTokens: number): Promise<string> {
-		let provider = "grok";
-		if (!process.env.GROK_API_KEY) {
-			if (process.env.OLLAMA_URL) {
-				provider = "ollama";
-			}
-		}
-
-		const builder = new AIRequestBuilder(this.aiEngine);
-		const ctx = new AIContextBuilder()
-			.user("system-enricher")
-			.guild(guildId)
-			.build();
-		// Structured mode: the chat preset caps output at 60 tokens, truncating summaries
-		const result = await builder
-			.blocking()
-			.mode("structured")
-			.maxTokens(maxTokens)
-			.withContext(ctx)
-			.provider(provider as "grok" | "ollama")
-			.persona("casual")
-			.withoutTools()
-			.generate(prompt);
-
-		const response = result as AIResponse;
+	private async generate(prompt: string, label: string): Promise<string> {
+		const response = await OmpRuntime.get().generate({
+			systemPrompt: ENRICHMENT_SYSTEM_PROMPT,
+			prompt,
+			label,
+		});
 		if (!response.success || !response.content?.trim()) {
 			throw new Error(`LLM generation failed: ${response.error ?? "empty response"}`);
 		}

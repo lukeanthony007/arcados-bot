@@ -1,17 +1,13 @@
 import "dotenv/config";
-import { ChatAIManager } from "../handlers/chat/ChatAIManager.js";
-import { AIContextBuilder } from "../ai/core/AIContext.js";
-import { AIFactory } from "../ai/core/AIFactory.js";
+import { generateChatResponse } from "../handlers/chat/chatResponse.js";
 import { PostgreSQLManager } from "../database/PostgreSQLManager.js";
 
-const provider = process.env.PROVIDER || "grok"; // grok | openai | ollama | gemini
 const input = process.argv.slice(2).join(" ") || process.env.PROMPT || "hello";
 const userId = process.env.USER_ID || "test-user";
 const guildId = process.env.GUILD_ID;
 const botUserId = process.env.BOT_USER_ID; // optional: the bot's Discord user ID
 
 async function main(): Promise<void> {
-  console.log(`Provider: ${provider}`);
 
   if (!process.env.BOT_TOKEN) {
     console.warn(
@@ -43,10 +39,6 @@ async function main(): Promise<void> {
 
   const rawForAI = userContent;
 
-  // Initialize new AI architecture
-  const { engine } = await AIFactory.create();
-  const chatAI = new ChatAIManager(engine);
-
   // Initialize database (optional but enables environment context)
   const db = new PostgreSQLManager();
   const dbConnected = await db.connect();
@@ -54,19 +46,14 @@ async function main(): Promise<void> {
     console.warn("🔸 Database not connected. Running without enriched environment context.");
   }
 
-  // Build AIContext
-  const contextBuilder = new AIContextBuilder()
-    .guild(guildId)
-    .user(userId)
-    .domain("chat");
-
-  if (dbConnected) {
-    contextBuilder.withDatabase(db);
-  }
-
-  const context = contextBuilder.build();
-
-  const res = await chatAI.generateMentionResponse(rawForAI, context);
+  const res = await generateChatResponse({
+    db,
+    guildId,
+    userId,
+    channelId: "test-channel",
+    messageId: "test-message",
+    content: rawForAI,
+  });
 
   if (!res.success) {
     console.error("🔸 Error:", res.error || "Unknown error");

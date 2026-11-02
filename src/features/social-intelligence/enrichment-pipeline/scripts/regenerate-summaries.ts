@@ -6,7 +6,6 @@
  */
 
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
-import { AIFactory } from "../../../../ai/core/AIFactory";
 import { EnhancementOrchestrator } from "../EnhancementOrchestrator";
 import { config } from "../../../../config/index.js";
 
@@ -28,11 +27,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Get AI engine instance
-  const { engine } = await AIFactory.create();
-
   // Create orchestrator with regenerate flag
-  const orchestrator = new EnhancementOrchestrator(db, engine, {
+  const orchestrator = new EnhancementOrchestrator(db, {
     lookbackHours: 24,
     batchSize: 5, // Smaller batches to avoid rate limits
     sleepBetweenBatches: 5000, // 5 seconds between batches

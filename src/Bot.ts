@@ -74,11 +74,8 @@ export class Bot {
         const { EnrichmentScheduler } = await import(
           "./features/social-intelligence/enrichment-pipeline/EnrichmentScheduler"
         );
-        const { AIFactory } = await import("./ai/core/AIFactory");
-
-        const { engine } = await AIFactory.create();
         const orchestrator = EnrichmentPipelineOrchestrator.getInstance();
-        await orchestrator.initialize(this.db, engine);
+        await orchestrator.initialize(this.db);
 
         // Start scheduler
         const scheduler = EnrichmentScheduler.getInstance();

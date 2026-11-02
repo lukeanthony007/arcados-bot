@@ -269,8 +269,6 @@ export const selectContentTool: DatabaseTool = {
   },
 };
 
-// Keep old name for backward compatibility
-export const selectStreamResultTool = selectContentTool;
 
 export const stopStreamTool: DatabaseTool = {
   name: "stopStream",
@@ -1088,7 +1086,6 @@ export const nextEpisodeTool: DatabaseTool = {
 export const streamPlayerTools: DatabaseTool[] = [
   streamContentTool,
   selectContentTool,
-  selectStreamResultTool, // Backward compatibility alias
   pauseStreamTool,
   resumeStreamTool,
   seekStreamTool,

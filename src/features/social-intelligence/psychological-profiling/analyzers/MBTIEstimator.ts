@@ -7,9 +7,7 @@
  * 3. Optional AI validation for low-confidence cases (5% of users)
  */
 
-import type { AIEngine } from "../../../../ai/core/AIEngine";
-import { AIRequestBuilder } from "../../../../ai/core/AIRequestBuilder";
-import { AIContextBuilder } from "../../../../ai/core/AIContext";
+import { OmpRuntime, type JsonObjectSchema } from "../../../../ai/runtime/OmpRuntime";
 import type {
 	AnalyzerResult,
 	BigFiveProxies,
@@ -40,13 +38,40 @@ const MBTI_DICHOTOMY_LETTERS = {
 	J_P: ["J", "P"],
 } as const;
 
+interface MBTIDichotomies {
+	E_I: MBTIDichotomy;
+	S_N: MBTIDichotomy;
+	T_F: MBTIDichotomy;
+	J_P: MBTIDichotomy;
+}
+
+const DICHOTOMY_SCHEMA = {
+	type: "object",
+	properties: {
+		score: { type: "number", minimum: -1, maximum: 1 },
+		preference: { type: "string", enum: ["E", "I", "S", "N", "T", "F", "J", "P", "X"] },
+		confidence: { type: "number", minimum: 0, maximum: 1 },
+		indicators: { type: "array", items: { type: "string" } },
+	},
+	required: ["score", "preference", "confidence", "indicators"],
+};
+
+const MBTI_SCHEMA: JsonObjectSchema = {
+	type: "object",
+	properties: {
+		E_I: DICHOTOMY_SCHEMA,
+		S_N: DICHOTOMY_SCHEMA,
+		T_F: DICHOTOMY_SCHEMA,
+		J_P: DICHOTOMY_SCHEMA,
+	},
+	required: ["E_I", "S_N", "T_F", "J_P"],
+};
+
+const MBTI_SYSTEM_PROMPT =
+	"You are a personality-analysis component inside a Discord analytics pipeline. " +
+	"Analyze the supplied user data and report your estimates only by calling the submit tool.";
+
 export class MBTIEstimator {
-	private aiEngine: AIEngine | null;
-
-	constructor(aiEngine?: AIEngine) {
-		this.aiEngine = aiEngine || null;
-	}
-
 	/**
 	 * Estimate MBTI type from Big Five + behavioral patterns
 	 * Only calls AI if confidence < 0.5
@@ -72,7 +97,6 @@ export class MBTIEstimator {
 
 			// Step 3: Optional AI validation for low confidence
 			if (
-				this.aiEngine &&
 				validated.confidence < 0.5 &&
 				data &&
 				data.messages.length >= 100
@@ -503,49 +527,24 @@ export class MBTIEstimator {
 	}
 
 	/**
-	 * Step 3: Optional AI validation for low confidence cases
+	 * Step 3: AI validation for low confidence cases. Falls back to the derived type
+	 * when the model never submits or its submission is malformed.
 	 */
 	private async aiValidate(
 		mbtiType: MBTIType,
 		data: UserAnalysisData
 	): Promise<AnalyzerResult<MBTIType>> {
-		if (!this.aiEngine) {
-			return {
-				success: true,
-				data: mbtiType,
-				confidence: mbtiType.confidence,
-			};
-		}
-
 		try {
 			const prompt = buildMBTIValidationPrompt(mbtiType, data);
 
-			const ctx = new AIContextBuilder()
-				.user("system-profiler")
-				.guild(data.guildId)
-				.build();
+			const submitted = await OmpRuntime.get().generateStructured<MBTIDichotomies>({
+				systemPrompt: MBTI_SYSTEM_PROMPT,
+				prompt,
+				schema: MBTI_SCHEMA,
+				label: "profiling.mbti-validation",
+			});
 
-			const builder = new AIRequestBuilder(this.aiEngine);
-			// Structured mode: the chat preset caps output at 60 tokens, truncating the JSON
-			const result = await builder
-				.blocking()
-				.mode("structured")
-				.maxTokens(800)
-				.withContext(ctx)
-				.provider("grok")
-				.withoutTools()
-				.generate(prompt);
-
-			if (!result || !("content" in result) || !result.content) {
-				return {
-					success: true,
-					data: mbtiType,
-					confidence: mbtiType.confidence,
-				};
-			}
-
-			// Parse AI response
-			const validated = this.parseAIResponse(result.content);
+			const validated = submitted ? this.normalizeDichotomies(submitted) : null;
 
 			if (!validated) {
 				return {
@@ -591,61 +590,33 @@ export class MBTIEstimator {
 	}
 
 	/**
-	 * Parse AI response into validated dichotomies
+	 * Validate and clamp the model's dichotomies; null when the structure is invalid
 	 */
-	private parseAIResponse(content: string): {
-		E_I: MBTIDichotomy;
-		S_N: MBTIDichotomy;
-		T_F: MBTIDichotomy;
-		J_P: MBTIDichotomy;
-	} | null {
-		try {
-			// Remove markdown code blocks if present
-			const cleaned = content.replace(/```json\s*|\s*```/g, "").trim();
-
-			// Parse JSON
-			const parsed = JSON.parse(cleaned);
-
-			// Validate structure
-			if (!parsed.E_I || !parsed.S_N || !parsed.T_F || !parsed.J_P) {
-				console.error("Invalid MBTI validation structure:", parsed);
+	private normalizeDichotomies(parsed: MBTIDichotomies): MBTIDichotomies | null {
+		for (const dichotomy of ["E_I", "S_N", "T_F", "J_P"] as const) {
+			const d = parsed[dichotomy];
+			if (
+				!d ||
+				typeof d.score !== "number" ||
+				typeof d.confidence !== "number" ||
+				typeof d.preference !== "string" ||
+				!Array.isArray(d.indicators)
+			) {
+				console.error(`Invalid ${dichotomy} structure:`, d);
 				return null;
 			}
 
-			// Validate each dichotomy
-			for (const dichotomy of ["E_I", "S_N", "T_F", "J_P"] as const) {
-				const d = parsed[dichotomy];
-				if (
-					typeof d.score !== "number" ||
-					typeof d.confidence !== "number" ||
-					typeof d.preference !== "string" ||
-					!Array.isArray(d.indicators)
-				) {
-					console.error(`Invalid ${dichotomy} structure:`, d);
-					return null;
-				}
+			// Clamp scores and confidence
+			d.score = Math.max(-1, Math.min(1, d.score));
+			d.confidence = Math.max(0, Math.min(1, d.confidence));
 
-				// Clamp scores and confidence
-				d.score = Math.max(-1, Math.min(1, d.score));
-				d.confidence = Math.max(0, Math.min(1, d.confidence));
-
-				// The score is authoritative: derive the letter from it so the model can't
-				// return a letter that contradicts its own score (positive = E/N/F/P).
-				const [low, high] = MBTI_DICHOTOMY_LETTERS[dichotomy];
-				d.preference =
-					d.score >= MBTI_LEAN_THRESHOLD ? high : d.score <= -MBTI_LEAN_THRESHOLD ? low : "X";
-			}
-
-			return parsed as {
-				E_I: MBTIDichotomy;
-				S_N: MBTIDichotomy;
-				T_F: MBTIDichotomy;
-				J_P: MBTIDichotomy;
-			};
-		} catch (error) {
-			console.error("Failed to parse MBTI validation response:", error);
-			console.error("Content:", content);
-			return null;
+			// The score is authoritative: derive the letter from it so the model can't
+			// return a letter that contradicts its own score (positive = E/N/F/P).
+			const [low, high] = MBTI_DICHOTOMY_LETTERS[dichotomy];
+			d.preference =
+				d.score >= MBTI_LEAN_THRESHOLD ? high : d.score <= -MBTI_LEAN_THRESHOLD ? low : "X";
 		}
+
+		return parsed;
 	}
 }

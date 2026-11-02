@@ -13,7 +13,6 @@
 
 import type { Message } from "discord.js";
 import type { PostgreSQLManager } from "../../database/PostgreSQLManager";
-import type { AIEngine } from "../../ai/core/AIEngine";
 import type {
 	StreamingConversation,
 	FinalizedConversation,
@@ -30,7 +29,6 @@ import { ConversationDetector } from "./conversation-detection/ConversationDetec
 import { RelationshipMapper } from "./relationship-mapping/RelationshipMapper";
 import { KeywordExtractor } from "./semantic-analysis/KeywordExtractor";
 import { EmbeddingService } from "./semantic-analysis/EmbeddingService";
-import { EnhancementOrchestrator } from "./enrichment-pipeline/EnhancementOrchestrator";
 
 /**
  * Main orchestrator for Social Intelligence System
@@ -49,8 +47,6 @@ export class SocialIntelligence {
 	private relationshipMapper: RelationshipMapper;
 	private keywordExtractor: KeywordExtractor;
 	private embeddingService: EmbeddingService;
-	private enhancementOrchestrator?: EnhancementOrchestrator;
-	private aiEngine?: AIEngine; // AIEngine instance (optional, for enrichment)
 
 	// Relationship rollup queue (shared with LiveEventSync logic)
 	private rollupQueue: Map<string, number> = new Map(); // userId:guildId -> interaction count
@@ -59,21 +55,14 @@ export class SocialIntelligence {
 	private readonly ROLLUP_TIME_THRESHOLD = 30 * 1000; // 30 seconds
 	private lastRollupTime = Date.now();
 
-	constructor(db: PostgreSQLManager, aiEngine?: AIEngine) {
+	constructor(db: PostgreSQLManager) {
 		this.db = db;
-		this.aiEngine = aiEngine;
 
 		// Initialize components
 		this.conversationDetector = new ConversationDetector(db);
 		this.relationshipMapper = new RelationshipMapper(db);
 		this.keywordExtractor = new KeywordExtractor(db);
 		this.embeddingService = EmbeddingService.getInstance();
-
-		// Initialize enhancement orchestrator (requires AIEngine for enrichment)
-		if (aiEngine) {
-			this.conversationDetector.setAIEngine(aiEngine);
-			this.enhancementOrchestrator = new EnhancementOrchestrator(db, aiEngine);
-		}
 
 		this.startRollupTimer();
 	}

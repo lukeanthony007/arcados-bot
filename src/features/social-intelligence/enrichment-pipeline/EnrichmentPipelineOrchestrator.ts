@@ -15,7 +15,7 @@
 import { EnrichmentQueue, EnrichmentLayer, type EnrichmentJob } from "./EnrichmentQueue";
 import { EnrichmentRateLimiter } from "./EnrichmentRateLimiter";
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
-import type { AIEngine } from "../../../ai/core/AIEngine";
+
 import type { ConversationEnrichmentPipeline } from "./layers/ConversationEnrichmentPipeline";
 import type { UserProfileEnrichmentPipeline } from "./layers/UserProfileEnrichmentPipeline";
 import type { RelationshipEnrichmentPipeline } from "./layers/RelationshipEnrichmentPipeline";
@@ -49,43 +49,28 @@ export class EnrichmentPipelineOrchestrator {
 	}
 
 	/**
-	 * Initialize with PostgreSQL manager and AI engine
+	 * Initialize with PostgreSQL manager
 	 */
-	public async initialize(postgresManager: PostgreSQLManager, aiEngine?: AIEngine) {
+	public async initialize(postgresManager: PostgreSQLManager) {
 		this.postgresManager = postgresManager;
 
-		// Initialize pipelines if AI engine provided
-		if (aiEngine) {
-			const { ConversationEnrichmentPipeline } = await import(
-				"./layers/ConversationEnrichmentPipeline"
-			);
-			const { UserProfileEnrichmentPipeline } = await import(
-				"./layers/UserProfileEnrichmentPipeline"
-			);
-			const { RelationshipEnrichmentPipeline } = await import(
-				"./layers/RelationshipEnrichmentPipeline"
-			);
-			const { ServerEnrichmentPipeline } = await import(
-				"./layers/ServerEnrichmentPipeline"
-			);
+		const { ConversationEnrichmentPipeline } = await import(
+			"./layers/ConversationEnrichmentPipeline"
+		);
+		const { UserProfileEnrichmentPipeline } = await import(
+			"./layers/UserProfileEnrichmentPipeline"
+		);
+		const { RelationshipEnrichmentPipeline } = await import(
+			"./layers/RelationshipEnrichmentPipeline"
+		);
+		const { ServerEnrichmentPipeline } = await import(
+			"./layers/ServerEnrichmentPipeline"
+		);
 
-			this.conversationPipeline = new ConversationEnrichmentPipeline(
-				postgresManager,
-				aiEngine,
-			);
-			this.userPipeline = new UserProfileEnrichmentPipeline(
-				postgresManager,
-				aiEngine,
-			);
-			this.relationshipPipeline = new RelationshipEnrichmentPipeline(
-				postgresManager,
-				aiEngine,
-			);
-			this.serverPipeline = new ServerEnrichmentPipeline(
-				postgresManager,
-				aiEngine,
-			);
-		}
+		this.conversationPipeline = new ConversationEnrichmentPipeline(postgresManager);
+		this.userPipeline = new UserProfileEnrichmentPipeline(postgresManager);
+		this.relationshipPipeline = new RelationshipEnrichmentPipeline(postgresManager);
+		this.serverPipeline = new ServerEnrichmentPipeline(postgresManager);
 
 		console.log("🔹 Enrichment Pipeline Orchestrator initialized");
 	}
