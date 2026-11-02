@@ -333,7 +333,7 @@ export class PuppeteerService {
       // );
 
       // Use real Chrome profile (requires Chrome to be closed)
-      const userDataDir = "/home/ln64/.config/google-chrome";
+      const userDataDir = "/home/luke/.config/google-chrome";
 
       console.log(`[PuppeteerService] Using Chrome profile: ${userDataDir}`);
 

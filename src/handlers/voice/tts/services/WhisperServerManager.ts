@@ -13,9 +13,9 @@ export class WhisperServerManager {
 	private startupTimeout: NodeJS.Timeout | null = null;
 
 	// Configuration
-	private readonly WHISPER_BINARY = "/home/ln64/.voicemode/services/whisper/build/bin/whisper-server";
+	private readonly WHISPER_BINARY = "/home/luke/.voicemode/services/whisper/build/bin/whisper-server";
 	private readonly WHISPER_MODEL_PATH =
-		"/home/ln64/.voicemode/services/whisper/models/ggml-large-v3.bin"; // Using large-v3 for better accuracy
+		"/home/luke/.voicemode/services/whisper/models/ggml-large-v3.bin"; // Using large-v3 for better accuracy
 	private readonly WHISPER_PORT = 8086;
 	private readonly STARTUP_TIMEOUT_MS = 30000; // 30 seconds to start
 	private readonly SHUTDOWN_TIMEOUT_MS = 5000; // 5 seconds to stop gracefully
