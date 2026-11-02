@@ -27,6 +27,19 @@ import {
 } from "../mbti-mappings";
 import { buildMBTIValidationPrompt } from "../prompts";
 
+/** |score| below this reports a neutral "X" letter (no lean at all). */
+const MBTI_LEAN_THRESHOLD = 0.1;
+/** |score| at/above this carries the full Big Five-derived confidence. */
+const MBTI_FULL_LEAN_SCORE = 0.6;
+
+/** Letters for a negative / positive dichotomy score. */
+const MBTI_DICHOTOMY_LETTERS = {
+	E_I: ["I", "E"],
+	S_N: ["S", "N"],
+	T_F: ["T", "F"],
+	J_P: ["J", "P"],
+} as const;
+
 export class MBTIEstimator {
 	private aiEngine: AIEngine | null;
 
@@ -151,21 +164,24 @@ export class MBTIEstimator {
 		bigFiveScore: number,
 		bigFiveConfidence: number,
 		mapping: (score: number) => number,
-		highPreference: string,
-		lowPreference: string,
+		highPreference: MBTIDichotomy["preference"],
+		lowPreference: MBTIDichotomy["preference"],
 		indicators: string[]
 	): MBTIDichotomy {
 		// Map Big Five score (0-1) to MBTI score (-1 to +1)
 		const mbtiScore = mapping(bigFiveScore);
 
-		// Determine preference (threshold = 0.3)
-		let preference: string;
-		if (mbtiScore > 0.3) {
+		// Always report the leaning letter; X only when the score is (near) exactly neutral.
+		// Stored Big Five scores sit on a 0.1 grid and 62-73% of E/I and S/N scores fall in
+		// 0.4-0.6, so a 0.3 neutral threshold turned most letters into X. How weak the lean is
+		// is carried by the dichotomy confidence below instead.
+		let preference: MBTIDichotomy["preference"];
+		if (mbtiScore >= MBTI_LEAN_THRESHOLD) {
 			preference = highPreference;
-		} else if (mbtiScore < -0.3) {
+		} else if (mbtiScore <= -MBTI_LEAN_THRESHOLD) {
 			preference = lowPreference;
 		} else {
-			preference = "X"; // Neutral
+			preference = "X"; // No lean
 		}
 
 		// Apply confidence penalty for correlation strength
@@ -179,11 +195,14 @@ export class MBTIEstimator {
 						? 0.7
 						: 0.75;
 
-		const confidence = bigFiveConfidence * correlationPenalty;
+		// A weak lean (score near 0) is a weak claim: scale confidence by how far the score is
+		// from neutral, reaching full weight at |score| >= MBTI_FULL_LEAN_SCORE.
+		const leanStrength = Math.min(1, Math.abs(mbtiScore) / MBTI_FULL_LEAN_SCORE);
+		const confidence = bigFiveConfidence * correlationPenalty * leanStrength;
 
 		return {
 			score: mbtiScore,
-			preference: preference as any,
+			preference,
 			confidence,
 			indicators: indicators.slice(0, 3), // Use Big Five indicators initially
 		};
@@ -283,21 +302,27 @@ export class MBTIEstimator {
 		}
 
 		// Rapid responses → E
-		if (responsePatterns.avg_response_latency_minutes < 15) {
-			indicators.push("rapid_responses");
-			score += 0.2;
-		} else if (responsePatterns.avg_response_latency_minutes > 60) {
-			indicators.push("thoughtful_responses");
-			score -= 0.2;
+		const latency = responsePatterns.avg_response_latency_minutes;
+		if (latency !== undefined) {
+			if (latency < 15) {
+				indicators.push("rapid_responses");
+				score += 0.2;
+			} else if (latency > 60) {
+				indicators.push("thoughtful_responses");
+				score -= 0.2;
+			}
 		}
 
 		// High conversation initiation → E
-		if (responsePatterns.conversation_initiation_rate > 0.4) {
-			indicators.push("conversation_initiator");
-			score += 0.2;
-		} else if (responsePatterns.conversation_initiation_rate < 0.2) {
-			indicators.push("conversation_responder");
-			score -= 0.2;
+		const initiation = responsePatterns.conversation_initiation_rate;
+		if (initiation !== undefined) {
+			if (initiation > 0.4) {
+				indicators.push("conversation_initiator");
+				score += 0.2;
+			} else if (initiation < 0.2) {
+				indicators.push("conversation_responder");
+				score -= 0.2;
+			}
 		}
 
 		// Verbose communication → I (introverts tend to elaborate more)
@@ -588,7 +613,7 @@ export class MBTIEstimator {
 			}
 
 			// Validate each dichotomy
-			for (const dichotomy of ["E_I", "S_N", "T_F", "J_P"]) {
+			for (const dichotomy of ["E_I", "S_N", "T_F", "J_P"] as const) {
 				const d = parsed[dichotomy];
 				if (
 					typeof d.score !== "number" ||
@@ -603,6 +628,12 @@ export class MBTIEstimator {
 				// Clamp scores and confidence
 				d.score = Math.max(-1, Math.min(1, d.score));
 				d.confidence = Math.max(0, Math.min(1, d.confidence));
+
+				// The score is authoritative: derive the letter from it so the model can't
+				// return a letter that contradicts its own score (positive = E/N/F/P).
+				const [low, high] = MBTI_DICHOTOMY_LETTERS[dichotomy];
+				d.preference =
+					d.score >= MBTI_LEAN_THRESHOLD ? high : d.score <= -MBTI_LEAN_THRESHOLD ? low : "X";
 			}
 
 			return parsed as {

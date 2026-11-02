@@ -31,8 +31,8 @@ export interface BigFiveProxies {
  * MBTI dichotomy (E/I, S/N, T/F, J/P)
  */
 export interface MBTIDichotomy {
-	score: number; // -1.0 to +1.0 (negative = first letter, positive = second letter)
-	preference: "E" | "I" | "S" | "N" | "T" | "F" | "J" | "P" | "X"; // X = neutral (|score| < 0.3)
+	score: number; // -1.0 to +1.0 (positive = E/N/F/P, negative = I/S/T/J)
+	preference: "E" | "I" | "S" | "N" | "T" | "F" | "J" | "P" | "X"; // Leaning letter; X = no lean (|score| < 0.1). Weak leans are reflected in `confidence`, not X.
 	confidence: number; // 0-1, based on data quality and consistency
 	indicators: string[]; // Behavioral evidence supporting this preference
 }
@@ -41,7 +41,7 @@ export interface MBTIDichotomy {
  * Myers-Briggs Type Indicator (MBTI) personality type
  */
 export interface MBTIType {
-	type: string; // e.g., "INTJ", "ENFP", "XXXX" for highly neutral
+	type: string; // e.g., "INTJ", "ENFP"; a letter is "X" only when that dichotomy has no lean at all
 	confidence: number; // Overall confidence (average of dichotomies)
 	dichotomies: {
 		E_I: MBTIDichotomy; // Extraversion vs Introversion
@@ -60,7 +60,7 @@ export type ElaborationStyle = "brief" | "balanced" | "verbose";
 
 export interface CommunicationStyle {
 	formality: number; // 0=casual, 1=formal
-	verbosity: number; // Avg message length percentile (0-1)
+	verbosity?: number; // Avg message length percentile within the guild (0-1); omitted without guild data
 	emoji_richness: number; // Diversity + frequency (0-1)
 	question_frequency: number; // Questions per 100 messages (0-1)
 	elaboration_style: ElaborationStyle;
@@ -70,12 +70,9 @@ export interface CommunicationStyle {
 // Topic Affinity
 // ============================================================================
 
-export type ExpertiseLevel = "novice" | "enthusiast" | "expert";
-
 export interface TopicAffinity {
-	frequency: number; // Number of conversations on this topic
-	consistency: number; // 0-1, how consistently user discusses this
-	expertise_level: ExpertiseLevel;
+	frequency: number; // Number of the user's recent conversations whose keywords include this topic
+	consistency: number; // 0-1, share of the user's active weeks (weeks with a conversation) that included this topic
 }
 
 export interface TopicAffinityMap {
@@ -109,11 +106,12 @@ export interface PsychProfile {
 // Response Patterns
 // ============================================================================
 
+// Fields are omitted when the underlying data is unavailable rather than defaulted.
 export interface ResponsePatterns {
-	avg_response_latency_minutes: number; // Average time to respond to mentions/replies
-	question_answer_rate: number; // 0-1, % of questions answered
-	turn_taking_balance: number; // 0-1, balance in conversation participation
-	conversation_initiation_rate: number; // 0-1, % of convos user initiated
+	avg_response_latency_minutes?: number; // Median time to reply to others' messages
+	question_answer_rate?: number; // 0-1, % of questions mentioning the user that were answered within 1h
+	turn_taking_balance?: number; // 0-1, balance in conversation participation
+	conversation_initiation_rate?: number; // 0-1, % of convos user initiated
 }
 
 // ============================================================================
@@ -134,9 +132,8 @@ export interface EmojiSignature {
 
 export interface InteractionStyle {
 	mentions_given_per_100msg: number; // Mentions given per 100 messages
-	reactions_given_per_100msg: number; // Reactions given per 100 messages
-	avg_conversation_length_messages: number; // Avg messages per conversation
-	solo_message_rate: number; // 0-1, % of messages not in conversations
+	avg_conversation_length_messages?: number; // Avg messages per conversation (omitted when the user has no conversations)
+	solo_message_rate?: number; // 0-1, % of messages (since the user's first tracked conversation) not in any conversation; omitted when no conversations
 }
 
 // ============================================================================
@@ -201,6 +198,8 @@ export interface ConversationData {
 	start_time: Date;
 	end_time: Date;
 	keywords?: string[];
+	user_message_count?: number; // Messages the user sent in this conversation
+	first_author_id?: string; // Author of the earliest message in the conversation
 }
 
 export interface RelationshipData {
@@ -218,6 +217,30 @@ export interface UserAnalysisData {
 	relationships: RelationshipData[];
 	keywords?: string[];
 	emojis?: string[];
+	/**
+	 * Message IDs from every conversation the user took part in since their first tracked
+	 * conversation, plus that conversation's start time. Undefined when no conversations exist.
+	 */
+	conversationCoverage?: { since: Date; messageIds: Set<string> };
+	/** Per-author average message length across the guild (for verbosity percentiles). */
+	guildAuthorAvgLengths?: number[];
+	/** Guild-wide number of conversations containing each term (topic distinctiveness baseline). */
+	guildTermStats?: { totalConversations: number; conversationCounts: Map<string, number> };
+	/** Reply/question interaction data the user's own messages cannot provide. */
+	responseInteractions?: ResponseInteractionData;
+}
+
+/**
+ * Facts about the user's interactions with other people's messages, queried from the
+ * database (the user's own message list does not contain them).
+ */
+export interface ResponseInteractionData {
+	/** Minutes between someone else's message and the user's reply to it (<= 24h). */
+	reply_latencies_minutes: number[];
+	/** Messages from others that mention the user and contain a question mark. */
+	questions_received: number;
+	/** Of those, how many the user answered by posting in the same channel within 1 hour. */
+	questions_answered: number;
 }
 
 // ============================================================================

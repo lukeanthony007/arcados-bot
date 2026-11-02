@@ -53,8 +53,8 @@ export class CommunicationStyleAnalyzer {
 					lengths.length
 			);
 
-			// Calculate verbosity percentile (relative to guild if available)
-			let verbosity = 0.5; // Default to median
+			// Verbosity percentile among the guild's authors (omitted without guild data)
+			let verbosity: number | undefined;
 			if (guildMessageLengths && guildMessageLengths.length > 0) {
 				const below = guildMessageLengths.filter((len) => len < avgLength).length;
 				verbosity = below / guildMessageLengths.length;
@@ -80,11 +80,11 @@ export class CommunicationStyleAnalyzer {
 
 			const style: CommunicationStyle = {
 				formality,
-				verbosity,
 				emoji_richness: emojiRichness,
 				question_frequency: questionFrequency,
 				elaboration_style: elaborationStyle,
 			};
+			if (verbosity !== undefined) style.verbosity = verbosity;
 
 			return {
 				success: true,

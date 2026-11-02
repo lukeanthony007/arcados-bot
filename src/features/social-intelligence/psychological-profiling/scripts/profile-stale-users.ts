@@ -48,7 +48,7 @@ async function main() {
 
 	if (staleUserIds.length === 0) {
 		console.log("🔹 No stale profiles found. All users are up to date!");
-		await db.close();
+		await db.disconnect();
 		process.exit(0);
 	}
 
@@ -97,9 +97,10 @@ async function main() {
 		const sampleUserId = staleUserIds[0];
 		const sampleProfile = await db.query(
 			`
-			SELECT display_name, psych_profile
-			FROM members
-			WHERE guild_id = $1 AND user_id = $2
+			SELECT m.display_name, up.psych_profile
+			FROM members m
+			JOIN user_profiles up ON up.guild_id = m.guild_id AND up.user_id = m.user_id
+			WHERE m.guild_id = $1 AND m.user_id = $2
 			`,
 			[guildId, sampleUserId]
 		);
@@ -143,7 +144,7 @@ async function main() {
 
 	console.log("");
 
-	await db.close();
+	await db.disconnect();
 }
 
 main().catch((error) => {

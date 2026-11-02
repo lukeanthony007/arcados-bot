@@ -148,10 +148,10 @@ export const MBTI_VALIDATION_PROMPT = `Validate this user's MBTI type estimate b
 
 **IMPORTANT**: Provide scores as decimals between -1.0 and 1.0 (e.g., -0.6 for I, 0.7 for N). Format your response as valid JSON.
 
-**Score interpretation:**
-- Positive score (> 0.3): Second letter preference (E, N, F, P)
-- Negative score (< -0.3): First letter preference (I, S, T, J)
-- Near-zero score (-0.3 to 0.3): Neutral/balanced (X)
+**Score interpretation (always pick the leaning letter; use confidence to express how weak the lean is):**
+- Positive score (>= 0.1): E, N, F or P
+- Negative score (<= -0.1): I, S, T or J
+- Score between -0.1 and 0.1: no lean at all (X)
 
 **Response Format (JSON only, no markdown):**
 
@@ -169,13 +169,13 @@ export const MBTI_VALIDATION_PROMPT = `Validate this user's MBTI type estimate b
     "indicators": ["abstract_topics", "conceptual_language", "asks_questions"]
   },
   "T_F": {
-    "score": 0.5,
+    "score": -0.5,
     "preference": "T",
     "confidence": 0.65,
     "indicators": ["analytical_tone", "logic_focus", "objective_language"]
   },
   "J_P": {
-    "score": 0.4,
+    "score": -0.4,
     "preference": "J",
     "confidence": 0.68,
     "indicators": ["structured_messages", "consistent_timing", "organized_thought"]
@@ -186,8 +186,12 @@ export function buildMBTIValidationPrompt(
 	mbtiType: MBTIType,
 	data: UserAnalysisData
 ): string {
-	// Format message samples
-	const messageSamples = data.messages
+	// Callers load messages newest-first; order chronologically so "last 15" and the
+	// activity span are correct regardless of input order
+	const chronological = [...data.messages].sort(
+		(a, b) => a.created_at.getTime() - b.created_at.getTime()
+	);
+	const messageSamples = chronological
 		.slice(-15)
 		.map((m) => {
 			const content = m.content.trim().substring(0, 200);
@@ -198,10 +202,11 @@ export function buildMBTIValidationPrompt(
 	const messageCount = data.messages.length;
 	const avgMessageLength =
 		data.messages.reduce((sum, m) => sum + m.content.length, 0) / messageCount;
+	const firstMessage = chronological[0];
+	const lastMessage = chronological[chronological.length - 1];
 	const totalDuration =
-		data.messages.length > 1
-			? data.messages[data.messages.length - 1].created_at.getTime() -
-				data.messages[0].created_at.getTime()
+		firstMessage && lastMessage && chronological.length > 1
+			? lastMessage.created_at.getTime() - firstMessage.created_at.getTime()
 			: 0;
 	const daysActive = totalDuration / (1000 * 60 * 60 * 24);
 	const messagesPerDay = daysActive > 0 ? messageCount / daysActive : 0;

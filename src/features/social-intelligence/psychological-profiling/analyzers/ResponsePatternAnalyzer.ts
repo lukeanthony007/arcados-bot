@@ -2,10 +2,12 @@
  * Response Pattern Analyzer
  *
  * Analyzes how users respond in conversations:
- * - Response latency (time to respond to mentions/replies)
+ * - Response latency (time to reply to other people's messages)
  * - Question answering rate
  * - Turn-taking balance
  * - Conversation initiation rate
+ *
+ * Each metric is only reported when the data behind it exists; nothing is defaulted.
  */
 
 import type {
@@ -13,16 +15,22 @@ import type {
 	ResponsePatterns,
 	MessageData,
 	ConversationData,
+	ResponseInteractionData,
 } from "../types";
 
 export class ResponsePatternAnalyzer {
 	/**
-	 * Analyze response patterns from user messages and conversations
+	 * Analyze response patterns from user messages and conversations.
+	 *
+	 * `interactions` carries reply latencies and questions-to-the-user, which live in other
+	 * people's messages and therefore cannot be derived from `messages`. Without it, the
+	 * latency and question-answer metrics are omitted.
 	 */
 	static async analyze(
 		userId: string,
 		messages: MessageData[],
-		conversations: ConversationData[]
+		conversations: ConversationData[],
+		interactions?: ResponseInteractionData
 	): Promise<AnalyzerResult<ResponsePatterns>> {
 		try {
 			if (messages.length < 5) {
@@ -33,39 +41,25 @@ export class ResponsePatternAnalyzer {
 				};
 			}
 
-			// Calculate response latency
-			const avgResponseLatency = this.calculateResponseLatency(userId, messages);
+			const patterns: ResponsePatterns = {};
 
-			// Calculate question answer rate
-			const questionAnswerRate = this.calculateQuestionAnswerRate(
-				userId,
-				messages
-			);
+			const latency = this.calculateResponseLatency(interactions);
+			if (latency !== undefined) patterns.avg_response_latency_minutes = latency;
 
-			// Calculate turn-taking balance
-			const turnTakingBalance = this.calculateTurnTakingBalance(
-				userId,
-				conversations
-			);
+			const answerRate = this.calculateQuestionAnswerRate(interactions);
+			if (answerRate !== undefined) patterns.question_answer_rate = answerRate;
 
-			// Calculate conversation initiation rate
-			const conversationInitiationRate = this.calculateInitiationRate(
-				userId,
-				conversations
-			);
+			const balance = this.calculateTurnTakingBalance(conversations);
+			if (balance !== undefined) patterns.turn_taking_balance = balance;
+
+			const initiation = this.calculateInitiationRate(userId, conversations);
+			if (initiation !== undefined) patterns.conversation_initiation_rate = initiation;
 
 			// Calculate confidence
 			const confidence = Math.min(
 				0.9,
 				0.4 + (messages.length / 100) * 0.5
 			);
-
-			const patterns: ResponsePatterns = {
-				avg_response_latency_minutes: avgResponseLatency,
-				question_answer_rate: questionAnswerRate,
-				turn_taking_balance: turnTakingBalance,
-				conversation_initiation_rate: conversationInitiationRate,
-			};
 
 			return {
 				success: true,
@@ -82,163 +76,76 @@ export class ResponsePatternAnalyzer {
 	}
 
 	/**
-	 * Calculate average response latency
-	 * (time between being mentioned and user's next message)
+	 * Median minutes between someone else's message and the user's reply to it
 	 */
 	private static calculateResponseLatency(
-		userId: string,
-		messages: MessageData[]
-	): number {
-		const responseTimes: number[] = [];
+		interactions?: ResponseInteractionData
+	): number | undefined {
+		const times = interactions?.reply_latencies_minutes;
+		if (!times || times.length === 0) return undefined;
 
-		// Sort messages by timestamp
-		const sorted = [...messages].sort(
-			(a, b) => a.created_at.getTime() - b.created_at.getTime()
-		);
-
-		for (let i = 0; i < sorted.length; i++) {
-			const msg = sorted[i];
-
-			// If this message references another message (reply)
-			if (msg.referenced_message_id) {
-				// Find the referenced message
-				const refIndex = sorted.findIndex(
-					(m) => m.id === msg.referenced_message_id
-				);
-
-				if (refIndex >= 0 && msg.author_id === userId) {
-					const timeDiff =
-						(msg.created_at.getTime() - sorted[refIndex].created_at.getTime()) /
-						(60 * 1000);
-
-					// Only count responses within 24 hours
-					if (timeDiff <= 24 * 60) {
-						responseTimes.push(timeDiff);
-					}
-				}
-			}
-		}
-
-		if (responseTimes.length === 0) return 0;
-
-		// Calculate median (more robust than mean for latency)
-		responseTimes.sort((a, b) => a - b);
-		const median =
-			responseTimes.length % 2 === 0
-				? (responseTimes[responseTimes.length / 2 - 1] +
-						responseTimes[responseTimes.length / 2]) /
-					2
-				: responseTimes[Math.floor(responseTimes.length / 2)];
-
-		return median;
+		// Median is more robust than mean for latency
+		const sorted = [...times].sort((a, b) => a - b);
+		const mid = Math.floor(sorted.length / 2);
+		const upper = sorted[mid];
+		const lower = sorted[mid - 1];
+		if (upper === undefined) return undefined;
+		return sorted.length % 2 === 0 && lower !== undefined
+			? (lower + upper) / 2
+			: upper;
 	}
 
 	/**
-	 * Calculate question answer rate
+	 * Share of questions mentioning the user that they answered within an hour
 	 */
 	private static calculateQuestionAnswerRate(
-		userId: string,
-		messages: MessageData[]
-	): number {
-		let questionsReceived = 0;
-		let questionsAnswered = 0;
-
-		// Sort messages by timestamp
-		const sorted = [...messages].sort(
-			(a, b) => a.created_at.getTime() - b.created_at.getTime()
-		);
-
-		// Detect questions directed at user (mentions + question mark)
-		const userMentionRegex = new RegExp(`<@${userId}>`, "g");
-		const questionRegex = /[?？]/;
-
-		for (let i = 0; i < sorted.length; i++) {
-			const msg = sorted[i];
-
-			// Is this a question mentioning the user?
-			if (
-				msg.author_id !== userId &&
-				userMentionRegex.test(msg.content) &&
-				questionRegex.test(msg.content)
-			) {
-				questionsReceived++;
-
-				// Did user respond within 1 hour?
-				const responseWindow = 60 * 60 * 1000; // 1 hour
-				const hasResponse = sorted.some(
-					(m, idx) =>
-						idx > i &&
-						m.author_id === userId &&
-						m.created_at.getTime() - msg.created_at.getTime() <= responseWindow
-				);
-
-				if (hasResponse) {
-					questionsAnswered++;
-				}
-			}
-		}
-
-		return questionsReceived > 0 ? questionsAnswered / questionsReceived : 0.5;
+		interactions?: ResponseInteractionData
+	): number | undefined {
+		if (!interactions || interactions.questions_received === 0) return undefined;
+		return interactions.questions_answered / interactions.questions_received;
 	}
 
 	/**
-	 * Calculate turn-taking balance in conversations
+	 * Turn-taking balance: how close the user's message share is to an equal share
+	 * (1 = exactly 1/participants of the messages, 0 = share is at least double/zero).
 	 */
 	private static calculateTurnTakingBalance(
-		userId: string,
 		conversations: ConversationData[]
-	): number {
-		if (conversations.length === 0) return 0.5;
-
+	): number | undefined {
 		const balanceScores: number[] = [];
 
 		for (const conv of conversations) {
-			// Check if user participated
-			if (!conv.participants.includes(userId)) continue;
-
 			const participantCount = conv.participants.length;
-			if (participantCount < 2) continue;
+			if (
+				participantCount < 2 ||
+				conv.user_message_count === undefined ||
+				conv.message_count <= 0
+			) {
+				continue;
+			}
 
-			// Ideal share = 1 / participant count
 			const idealShare = 1 / participantCount;
-
-			// Estimate user's share (we don't have per-user message counts here,
-			// so use a proxy: if they're in conversation, assume balanced participation)
-			// This is simplified - in full implementation, you'd count messages per participant
-			const userShare = idealShare; // Placeholder
-
-			// Balance score: 1 = perfect balance, 0 = total imbalance
-			const balance = 1 - Math.abs(userShare - idealShare) / idealShare;
-			balanceScores.push(balance);
+			const userShare = conv.user_message_count / conv.message_count;
+			balanceScores.push(1 - Math.min(1, Math.abs(userShare - idealShare) / idealShare));
 		}
 
-		if (balanceScores.length === 0) return 0.5;
+		if (balanceScores.length === 0) return undefined;
 
-		return (
-			balanceScores.reduce((sum, score) => sum + score, 0) /
-			balanceScores.length
-		);
+		return balanceScores.reduce((sum, score) => sum + score, 0) / balanceScores.length;
 	}
 
 	/**
-	 * Calculate conversation initiation rate
+	 * Share of the user's conversations whose first message the user sent
 	 */
 	private static calculateInitiationRate(
 		userId: string,
 		conversations: ConversationData[]
-	): number {
-		if (conversations.length === 0) return 0;
-
-		// In simplified version, assume if user is first participant they initiated
-		// In full version, check if user sent first message in conversation
-		const userConversations = conversations.filter((conv) =>
-			conv.participants.includes(userId)
+	): number | undefined {
+		const known = conversations.filter(
+			(conv) => conv.first_author_id !== undefined && conv.participants.includes(userId)
 		);
+		if (known.length === 0) return undefined;
 
-		if (userConversations.length === 0) return 0;
-
-		// Placeholder: assume 30% initiation rate as baseline
-		// Full implementation would check first message author
-		return 0.3;
+		return known.filter((conv) => conv.first_author_id === userId).length / known.length;
 	}
 }

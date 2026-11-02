@@ -106,9 +106,15 @@ export class BigFiveEstimator {
 		emojiSignature?: EmojiSignature
 	): string {
 		// Format communication style
+		const verbosityLine =
+			communicationStyle?.verbosity !== undefined
+				? `Verbosity: ${(communicationStyle.verbosity * 100).toFixed(0)}th percentile (${communicationStyle.elaboration_style})`
+				: communicationStyle
+					? `Elaboration style: ${communicationStyle.elaboration_style}`
+					: "";
 		const commStyleText = communicationStyle
 			? `Formality: ${(communicationStyle.formality * 100).toFixed(0)}% formal
-Verbosity: ${(communicationStyle.verbosity * 100).toFixed(0)}th percentile (${communicationStyle.elaboration_style})
+${verbosityLine}
 Emoji richness: ${(communicationStyle.emoji_richness * 100).toFixed(0)}%
 Question frequency: ${communicationStyle.question_frequency.toFixed(2)} questions per 100 messages`
 			: "Not available";
@@ -124,15 +130,32 @@ Top emojis: ${Object.entries(emojiSignature.top_emojis)
 			: "Not available";
 
 		// Format response patterns
-		const responseText = responsePatterns
-			? `Avg response latency: ${responsePatterns.avg_response_latency_minutes.toFixed(1)} minutes
-Question answer rate: ${(responsePatterns.question_answer_rate * 100).toFixed(0)}%
-Turn-taking balance: ${(responsePatterns.turn_taking_balance * 100).toFixed(0)}%
-Conversation initiation: ${(responsePatterns.conversation_initiation_rate * 100).toFixed(0)}%`
-			: "Not available";
+		const responseLines: string[] = [];
+		if (responsePatterns?.avg_response_latency_minutes !== undefined) {
+			responseLines.push(
+				`Median response latency: ${responsePatterns.avg_response_latency_minutes.toFixed(1)} minutes`
+			);
+		}
+		if (responsePatterns?.question_answer_rate !== undefined) {
+			responseLines.push(
+				`Question answer rate: ${(responsePatterns.question_answer_rate * 100).toFixed(0)}%`
+			);
+		}
+		if (responsePatterns?.turn_taking_balance !== undefined) {
+			responseLines.push(
+				`Turn-taking balance: ${(responsePatterns.turn_taking_balance * 100).toFixed(0)}%`
+			);
+		}
+		if (responsePatterns?.conversation_initiation_rate !== undefined) {
+			responseLines.push(
+				`Conversation initiation: ${(responsePatterns.conversation_initiation_rate * 100).toFixed(0)}%`
+			);
+		}
+		const responseText = responseLines.length > 0 ? responseLines.join("\n") : "Not available";
 
-		// Get message samples (last 15, sanitize content)
-		const messageSamples = data.messages
+		// Get message samples (latest 15 chronologically, sanitize content)
+		const messageSamples = [...data.messages]
+			.sort((a, b) => a.created_at.getTime() - b.created_at.getTime())
 			.slice(-15)
 			.map((m) => {
 				const content = m.content.trim().substring(0, 200);
@@ -235,8 +258,8 @@ Conversation initiation: ${(responsePatterns.conversation_initiation_rate * 100)
 				const repairedLines: string[] = [];
 
 				for (let i = 0; i < lines.length; i++) {
-					const line = lines[i];
-					const next = i + 1 < lines.length ? lines[i + 1] : "";
+					const line = lines[i] ?? "";
+					const next = lines[i + 1] ?? "";
 
 					if (
 						line.includes(`"indicators"`) &&

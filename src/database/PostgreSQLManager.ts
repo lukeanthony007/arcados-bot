@@ -1610,7 +1610,11 @@ export class PostgreSQLManager {
       let paramCount = 1;
 
       if (psychProfile !== undefined) {
-        updates.push(`psych_profile = $${paramCount}`);
+        // Replace the profile, but keep the previous AI estimates when this run produced none
+        updates.push(`psych_profile = jsonb_strip_nulls(jsonb_build_object(
+          'big_five_proxies', psych_profile->'big_five_proxies',
+          'mbti_type', psych_profile->'mbti_type'
+        )) || $${paramCount}::jsonb`);
         values.push(JSON.stringify(psychProfile));
         paramCount++;
       }

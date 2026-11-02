@@ -212,8 +212,27 @@ export function getMBTITypeString(
 }
 
 /**
- * Get descriptors for an MBTI type
+ * Get descriptors for an MBTI type. A type with neutral "X" letters (e.g. "INXJ") takes the
+ * descriptors most shared by the full types it could resolve to.
  */
 export function getMBTIDescriptors(type: string): string[] {
-	return MBTI_TYPE_DESCRIPTIONS[type] || MBTI_TYPE_DESCRIPTIONS.XXXX;
+	const exact = MBTI_TYPE_DESCRIPTIONS[type];
+	if (exact) return exact;
+
+	const letters = [...type];
+	if (letters.length !== 4 || letters.every((l) => l === "X")) {
+		return MBTI_TYPE_DESCRIPTIONS.XXXX ?? [];
+	}
+
+	const counts = new Map<string, number>();
+	for (const [candidate, descriptors] of Object.entries(MBTI_TYPE_DESCRIPTIONS)) {
+		if (candidate.includes("X")) continue;
+		if (!letters.every((l, i) => l === "X" || l === candidate[i])) continue;
+		for (const d of descriptors) counts.set(d, (counts.get(d) ?? 0) + 1);
+	}
+
+	return [...counts.entries()]
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, 6)
+		.map(([d]) => d);
 }

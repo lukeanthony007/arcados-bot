@@ -22,11 +22,7 @@ import { TemporalPatternAnalyzer } from "../../psychological-profiling/analyzers
 import { ResponsePatternAnalyzer } from "../../psychological-profiling/analyzers/ResponsePatternAnalyzer";
 import { BigFiveEstimator } from "../../psychological-profiling/analyzers/BigFiveEstimator";
 import { MBTIEstimator } from "../../psychological-profiling/analyzers/MBTIEstimator";
-import type {
-	UserAnalysisData,
-	MessageData,
-	EmojiSignature,
-} from "../../psychological-profiling/types";
+import { PsychologicalProfiler } from "../../psychological-profiling/PsychologicalProfiler";
 
 export class UserProfileEnrichmentPipeline {
 	private db: PostgreSQLManager;
@@ -34,6 +30,8 @@ export class UserProfileEnrichmentPipeline {
 	private rateLimiter: EnrichmentRateLimiter;
 	private bigFiveEstimator: BigFiveEstimator;
 	private mbtiEstimator: MBTIEstimator;
+	// Shares data gathering with the profiler so both feed the analyzers the same inputs
+	private profiler: PsychologicalProfiler;
 
 	constructor(db: PostgreSQLManager, aiEngine: AIEngine) {
 		this.db = db;
@@ -41,6 +39,7 @@ export class UserProfileEnrichmentPipeline {
 		this.rateLimiter = EnrichmentRateLimiter.getInstance();
 		this.bigFiveEstimator = new BigFiveEstimator(aiEngine);
 		this.mbtiEstimator = new MBTIEstimator(aiEngine);
+		this.profiler = new PsychologicalProfiler(db, aiEngine);
 	}
 
 	/**
@@ -161,7 +160,7 @@ export class UserProfileEnrichmentPipeline {
 			}
 
 			// Gather user data for analysis
-			const userData = await this.gatherUserData(userId, guildId);
+			const userData = await this.profiler.gatherUserData(userId, guildId);
 			if (!userData) {
 				console.warn(
 					`⚠️  Insufficient data for user ${userId.slice(0, 8)}`,
@@ -172,6 +171,7 @@ export class UserProfileEnrichmentPipeline {
 			// Run statistical analyzers
 			const communicationStyle = await CommunicationStyleAnalyzer.analyze(
 				userData.messages,
+				userData.guildAuthorAvgLengths,
 			);
 			const temporalProfile = await TemporalPatternAnalyzer.analyze(
 				userData.messages,
@@ -180,8 +180,9 @@ export class UserProfileEnrichmentPipeline {
 				userId,
 				userData.messages,
 				userData.conversations,
+				userData.responseInteractions,
 			);
-			const emojiSignature = this.extractEmojiSignature(userData.messages);
+			const emojiSignature = this.profiler.extractEmojiSignature(userData.messages);
 
 			// Generate Big Five and MBTI (if needed)
 			let bigFive = undefined;
@@ -375,111 +376,6 @@ export class UserProfileEnrichmentPipeline {
 				cause: error,
 			});
 		}
-	}
-
-	/**
-	 * Gather user data for analysis
-	 */
-	private async gatherUserData(
-		userId: string,
-		guildId: string,
-	): Promise<UserAnalysisData | null> {
-		// Get user messages (last 200)
-		const messagesResult = await this.db.query(
-			`
-			SELECT id, content, created_at, author_id, referenced_message_id, attachments, embeds
-			FROM messages
-			WHERE guild_id = $1 AND author_id = $2
-			ORDER BY created_at DESC
-			LIMIT 200
-			`,
-			[guildId, userId],
-		);
-
-		if (
-			!messagesResult.success ||
-			!messagesResult.data ||
-			messagesResult.data.length < 10
-		) {
-			return null;
-		}
-
-		const messages: MessageData[] = messagesResult.data.map((row: any) => ({
-			id: row.id,
-			content: row.content || "",
-			created_at: new Date(row.created_at),
-			author_id: row.author_id,
-			referenced_message_id: row.referenced_message_id,
-			attachments: row.attachments,
-			embeds: row.embeds,
-		}));
-
-		// Get user conversations
-		const conversationsResult = await this.db.query(
-			`
-			SELECT id, participants, message_count, start_time, end_time
-			FROM conversation_segments
-			WHERE guild_id = $1 AND $2 = ANY(participants)
-			AND status = 'finalized'
-			ORDER BY start_time DESC
-			LIMIT 50
-			`,
-			[guildId, userId],
-		);
-
-		const conversations =
-			conversationsResult.success && conversationsResult.data
-				? conversationsResult.data.map((row: any) => ({
-						id: row.id,
-						participants: row.participants,
-						message_count: row.message_count,
-						start_time: new Date(row.start_time),
-						end_time: new Date(row.end_time),
-					}))
-				: [];
-
-		return {
-			userId,
-			guildId,
-			messages,
-			conversations,
-			relationships: [],
-			keywords: [],
-			emojis: [],
-		};
-	}
-
-	/**
-	 * Extract emoji signature from messages
-	 */
-	private extractEmojiSignature(messages: MessageData[]): EmojiSignature {
-		const emojiRegex = /[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu;
-		const emojiCounts: Record<string, number> = {};
-		let totalEmojis = 0;
-
-		for (const msg of messages) {
-			const emojis = msg.content.match(emojiRegex) || [];
-			totalEmojis += emojis.length;
-
-			for (const emoji of emojis) {
-				emojiCounts[emoji] = (emojiCounts[emoji] || 0) + 1;
-			}
-		}
-
-		const topEmojis: Record<string, number> = {};
-		const sorted = Object.entries(emojiCounts)
-			.sort(([, a], [, b]) => b - a)
-			.slice(0, 10);
-
-		for (const [emoji, count] of sorted) {
-			topEmojis[emoji] = count;
-		}
-
-		return {
-			top_emojis: topEmojis,
-			emoji_per_message: messages.length > 0 ? totalEmojis / messages.length : 0,
-			emoji_timing: "mixed",
-		};
 	}
 
 	/**

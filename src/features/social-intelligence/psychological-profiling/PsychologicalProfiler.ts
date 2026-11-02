@@ -25,6 +25,10 @@ import type {
 	TemporalProfile,
 	MessageData,
 	EmojiSignature,
+	InteractionStyle,
+	TopicAffinityMap,
+	ResponseInteractionData,
+	ConversationData,
 } from "./types";
 
 export interface PsychologicalProfilerConfig {
@@ -35,6 +39,11 @@ export interface PsychologicalProfilerConfig {
 	skipBigFive?: boolean; // Skip Big Five AI analysis for testing (default: false)
 	skipMBTI?: boolean; // Skip MBTI analysis for testing (default: false)
 }
+
+/** A term must recur in this many of the user's conversations to count as a topic. */
+const MIN_TOPIC_CONVERSATIONS = 3;
+/** ...and be this many times more common in the user's conversations than the guild's. */
+const MIN_TOPIC_LIFT = 2;
 
 export class PsychologicalProfiler {
 	private db: PostgreSQLManager;
@@ -90,7 +99,8 @@ export class PsychologicalProfiler {
 
 			// 2. Run statistical analyzers
 			const communicationStyle = await CommunicationStyleAnalyzer.analyze(
-				data.messages
+				data.messages,
+				data.guildAuthorAvgLengths
 			);
 			const temporalProfile = await TemporalPatternAnalyzer.analyze(
 				data.messages
@@ -98,7 +108,8 @@ export class PsychologicalProfiler {
 			const responsePatterns = await ResponsePatternAnalyzer.analyze(
 				userId,
 				data.messages,
-				data.conversations
+				data.conversations,
+				data.responseInteractions
 			);
 
 			// 3. Extract emoji signature
@@ -158,7 +169,9 @@ export class PsychologicalProfiler {
 				profile_metadata: {
 					message_count_at_analysis: data.messages.length,
 					confidence_overall:
-						(communicationStyle.confidence || 0 + temporalProfile.confidence || 0 + responsePatterns.confidence || 0) /
+						((communicationStyle.confidence ?? 0) +
+							(temporalProfile.confidence ?? 0) +
+							(responsePatterns.confidence ?? 0)) /
 						3,
 					last_updated: new Date().toISOString(),
 					staleness_threshold: this.config.stalenessThreshold,
@@ -247,28 +260,27 @@ export class PsychologicalProfiler {
 	async detectStaleProfiles(guildId: string): Promise<string[]> {
 		const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
+		// psych_profile is owned by user_profiles (members.psych_profile is a legacy column
+		// that is no longer written). Members without a profile row are stale by definition.
 		const result = await this.db.query(
 			`
-      SELECT
-        m.user_id,
-        m.psych_profile->'profile_metadata'->>'message_count_at_analysis' as old_count,
-        m.psych_profile->'profile_metadata'->>'last_updated' as last_updated,
-        COUNT(msg.id) as current_count
+      SELECT m.user_id
       FROM members m
-      LEFT JOIN messages msg ON msg.author_id = m.user_id AND msg.guild_id = m.guild_id
+      LEFT JOIN user_profiles up ON up.guild_id = m.guild_id AND up.user_id = m.user_id
+      CROSS JOIN LATERAL (
+        SELECT COUNT(*)::int AS current_count
+        FROM messages msg
+        WHERE msg.author_id = m.user_id AND msg.guild_id = m.guild_id
+      ) mc
       WHERE m.guild_id = $1
         AND m.bot = false
         AND m.active = true
+        AND mc.current_count >= $4
         AND (
-          m.psych_profile->'profile_metadata'->>'last_updated' IS NULL
-          OR m.psych_profile->'profile_metadata'->>'last_updated' < $2
-          OR (
-            (COALESCE((m.psych_profile->'profile_metadata'->>'message_count_at_analysis')::int, 0)) + $3 <=
-            (SELECT COUNT(*) FROM messages WHERE author_id = m.user_id AND guild_id = m.guild_id)
-          )
+          up.psych_profile->'profile_metadata'->>'last_updated' IS NULL
+          OR (up.psych_profile->'profile_metadata'->>'last_updated')::timestamptz < $2
+          OR COALESCE((up.psych_profile->'profile_metadata'->>'message_count_at_analysis')::int, 0) + $3 <= mc.current_count
         )
-      GROUP BY m.user_id, m.psych_profile
-      HAVING COUNT(msg.id) >= $4
       `,
 			[
 				guildId,
@@ -278,11 +290,11 @@ export class PsychologicalProfiler {
 			]
 		);
 
-		if (result.success && result.data) {
-			return result.data.map((row: any) => row.user_id);
+		if (!result.success) {
+			throw new Error(`Failed to detect stale profiles for guild ${guildId}: ${result.error}`);
 		}
 
-		return [];
+		return (result.data ?? []).map((row: { user_id: string }) => row.user_id);
 	}
 
 	// ============================================================================
@@ -292,7 +304,7 @@ export class PsychologicalProfiler {
 	/**
 	 * Gather all data needed for user analysis
 	 */
-	private async gatherUserData(
+	async gatherUserData(
 		userId: string,
 		guildId: string
 	): Promise<UserAnalysisData | null> {
@@ -329,10 +341,15 @@ export class PsychologicalProfiler {
 		// Get user conversations (last 50)
 		const conversationsResult = await this.db.query(
 			`
-      SELECT id, participants, message_count, start_time, end_time, keywords
-      FROM conversations_unified
-      WHERE guild_id = $1 AND $2 = ANY(participants)
-      ORDER BY start_time DESC
+      SELECT c.id, c.participants, c.message_count, c.start_time, c.end_time, c.keywords,
+        (SELECT COUNT(*)::int FROM messages m
+          WHERE m.id = ANY(c.message_ids) AND m.author_id = $2) AS user_message_count,
+        (SELECT m.author_id FROM messages m
+          WHERE m.id = ANY(c.message_ids)
+          ORDER BY m.created_at, m.id LIMIT 1) AS first_author_id
+      FROM conversations_unified c
+      WHERE c.guild_id = $1 AND $2 = ANY(c.participants)
+      ORDER BY c.start_time DESC
       LIMIT 50
       `,
 			[guildId, userId]
@@ -346,6 +363,8 @@ export class PsychologicalProfiler {
 						message_count: row.message_count,
 						start_time: new Date(row.start_time),
 						end_time: new Date(row.end_time),
+						user_message_count: row.user_message_count,
+						first_author_id: row.first_author_id ?? undefined,
 						// Keywords are stored as JSONB; they may be an array of strings
 						// or a ConversationKeywords object with a `terms` array.
 						keywords: Array.isArray(row.keywords)
@@ -374,6 +393,131 @@ export class PsychologicalProfiler {
 				? (profileResult.data.emojis || [])
 				: [];
 
+		// Guild-wide conversation frequency of the user's recurring terms (topic distinctiveness)
+		let guildTermStats: UserAnalysisData["guildTermStats"];
+		const recurringTerms = [...PsychologicalProfiler.termWeeks(conversations).termWeeks.entries()]
+			.filter(([, weeks]) => weeks.length >= MIN_TOPIC_CONVERSATIONS)
+			.map(([term]) => term);
+		if (recurringTerms.length > 0) {
+			const termCountsResult = await this.db.query(
+				`
+      SELECT LOWER(t->>'word') AS term, COUNT(DISTINCT c.id)::int AS conversations
+      FROM conversations_unified c, jsonb_array_elements(c.keywords->'terms') t
+      WHERE c.guild_id = $1 AND LOWER(t->>'word') = ANY($2::text[])
+      GROUP BY 1
+      `,
+				[guildId, recurringTerms]
+			);
+			const totalResult = await this.db.query(
+				"SELECT COUNT(*)::int AS total FROM conversations_unified WHERE guild_id = $1",
+				[guildId]
+			);
+			const total: number | undefined = totalResult.success ? totalResult.data?.[0]?.total : undefined;
+			if (termCountsResult.success && termCountsResult.data && total !== undefined) {
+				const rows = termCountsResult.data as { term: string; conversations: number }[];
+				guildTermStats = {
+					totalConversations: total,
+					conversationCounts: new Map(rows.map((r) => [r.term, r.conversations])),
+				};
+			}
+		}
+
+		// Guild-wide per-author average message length (verbosity percentile baseline)
+		const lengthsResult = await this.db.query(
+			`
+      SELECT AVG(LENGTH(BTRIM(content)))::float AS avg_length
+      FROM messages
+      WHERE guild_id = $1 AND LENGTH(BTRIM(content)) > 0
+      GROUP BY author_id
+      HAVING COUNT(*) >= $2
+      `,
+			[guildId, this.config.minMessagesForProfiling]
+		);
+		const guildAuthorAvgLengths =
+			lengthsResult.success && lengthsResult.data
+				? (lengthsResult.data as { avg_length: number }[]).map((row) => row.avg_length)
+				: undefined;
+
+		// Replies the user sent to other people's messages, and questions others asked them.
+		// These live in other authors' messages, so they cannot come from the user's own list.
+		const latencyResult = await this.db.query(
+			`
+      SELECT EXTRACT(EPOCH FROM (r.created_at - ref.created_at)) / 60 AS minutes
+      FROM messages r
+      JOIN messages ref ON ref.id = r.referenced_message_id
+      WHERE r.guild_id = $1 AND r.author_id = $2
+        AND ref.author_id <> $2
+        AND r.created_at >= ref.created_at
+        AND r.created_at - ref.created_at <= INTERVAL '24 hours'
+      ORDER BY r.created_at DESC
+      LIMIT 200
+      `,
+			[guildId, userId]
+		);
+		const questionsResult = await this.db.query(
+			`
+      SELECT
+        COUNT(*)::int AS received,
+        COUNT(*) FILTER (WHERE EXISTS (
+          SELECT 1 FROM messages r
+          WHERE r.guild_id = q.guild_id AND r.author_id = $2
+            AND r.channel_id = q.channel_id
+            AND r.created_at > q.created_at
+            AND r.created_at <= q.created_at + INTERVAL '1 hour'
+        ))::int AS answered
+      FROM (
+        SELECT guild_id, channel_id, created_at
+        FROM messages
+        WHERE guild_id = $1 AND author_id <> $2
+          AND content ~ ('<@!?' || $2 || '>') AND content ~ '[?？]'
+        ORDER BY created_at DESC
+        LIMIT 200
+      ) q
+      `,
+			[guildId, userId]
+		);
+		const questionsRow: { received: number; answered: number } | undefined =
+			questionsResult.success ? questionsResult.data?.[0] : undefined;
+		const responseInteractions: ResponseInteractionData | undefined =
+			latencyResult.success && questionsResult.success && questionsRow
+				? {
+						reply_latencies_minutes: (
+							(latencyResult.data ?? []) as { minutes: number | string }[]
+						).map((row) => Number(row.minutes)),
+						questions_received: questionsRow.received,
+						questions_answered: questionsRow.answered,
+					}
+				: undefined;
+
+		// Conversation coverage: which of the user's messages belong to a tracked conversation.
+		// Conversation tracking may not span the whole message history, so coverage starts at
+		// the user's earliest tracked conversation within the analysed message window.
+		const oldestMessage = messages[messages.length - 1];
+		let conversationCoverage: UserAnalysisData["conversationCoverage"];
+		if (oldestMessage) {
+			const coverageResult = await this.db.query(
+				`
+      SELECT start_time, message_ids
+      FROM conversations_unified
+      WHERE guild_id = $1 AND $2 = ANY(participants) AND end_time >= $3
+      `,
+				[guildId, userId, oldestMessage.created_at]
+			);
+
+			if (coverageResult.success && coverageResult.data && coverageResult.data.length > 0) {
+				const messageIds = new Set<string>();
+				let since = oldestMessage.created_at;
+				let earliestStart: Date | undefined;
+				for (const row of coverageResult.data as { start_time: Date; message_ids: string[] | null }[]) {
+					const start = new Date(row.start_time);
+					if (!earliestStart || start < earliestStart) earliestStart = start;
+					for (const id of row.message_ids ?? []) messageIds.add(id);
+				}
+				if (earliestStart && earliestStart > since) since = earliestStart;
+				conversationCoverage = { since, messageIds };
+			}
+		}
+
 		return {
 			userId,
 			guildId,
@@ -382,13 +526,17 @@ export class PsychologicalProfiler {
 			relationships,
 			keywords,
 			emojis,
+			conversationCoverage,
+			guildAuthorAvgLengths,
+			guildTermStats,
+			responseInteractions,
 		};
 	}
 
 	/**
 	 * Extract emoji signature from messages
 	 */
-	private extractEmojiSignature(messages: MessageData[]): EmojiSignature {
+	extractEmojiSignature(messages: MessageData[]): EmojiSignature {
 		const emojiRegex = /[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu;
 		const emojiCounts: Record<string, number> = {};
 		let totalEmojis = 0;
@@ -423,43 +571,106 @@ export class PsychologicalProfiler {
 	}
 
 	/**
-	 * Build topic affinity map from keywords
+	 * Weeks (since epoch) in which each term appeared across the user's conversations, one
+	 * entry per conversation containing the term, plus the set of weeks with any conversation.
 	 */
-	private buildTopicAffinity(data: UserAnalysisData): any {
-		// Simplified: use top keywords as topics
-		const topicAffinity: any = {};
-
-		const topKeywords = (data.keywords || []).slice(0, 10);
-		for (const keyword of topKeywords) {
-			topicAffinity[keyword] = {
-				frequency: Math.floor(Math.random() * 50), // Placeholder
-				consistency: Math.random() * 0.5 + 0.5, // Placeholder 0.5-1.0
-				expertise_level: "enthusiast" as const,
-			};
+	private static termWeeks(conversations: ConversationData[]): {
+		termWeeks: Map<string, number[]>;
+		activeWeeks: Set<number>;
+	} {
+		const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+		const activeWeeks = new Set<number>();
+		const termWeeks = new Map<string, number[]>();
+		for (const conversation of conversations) {
+			const week = Math.floor(conversation.start_time.getTime() / WEEK_MS);
+			activeWeeks.add(week);
+			for (const term of new Set((conversation.keywords ?? []).map((k) => k.toLowerCase()))) {
+				const weeks = termWeeks.get(term);
+				if (weeks) {
+					weeks.push(week);
+				} else {
+					termWeeks.set(term, [week]);
+				}
+			}
 		}
-
-		return topicAffinity;
+		return { termWeeks, activeWeeks };
 	}
 
 	/**
-	 * Build interaction style metrics
+	 * Build topic affinity from the keywords of the user's recent conversations. A topic is a
+	 * term that (a) recurs in at least MIN_TOPIC_CONVERSATIONS of them and (b) is at least
+	 * MIN_TOPIC_LIFT times more common in the user's conversations than in the guild's overall
+	 * (so filler words like "what" don't count). Frequency is the number of the user's
+	 * conversations containing it; consistency is the share of the user's active weeks it
+	 * appears in. Returns undefined when nothing qualifies (no topic is invented).
 	 */
-	private buildInteractionStyle(data: UserAnalysisData): any {
-		const totalMessages = data.messages.length;
+	private buildTopicAffinity(data: UserAnalysisData): TopicAffinityMap | undefined {
+		const MAX_TOPICS = 10;
+		const guild = data.guildTermStats;
+		if (!guild || guild.totalConversations === 0 || data.conversations.length === 0) {
+			return undefined;
+		}
 
-		return {
+		const { termWeeks, activeWeeks } = PsychologicalProfiler.termWeeks(data.conversations);
+		const topics = [...termWeeks.entries()]
+			.filter(([term, weeks]) => {
+				if (weeks.length < MIN_TOPIC_CONVERSATIONS) return false;
+				const guildShare = (guild.conversationCounts.get(term) ?? weeks.length) / guild.totalConversations;
+				const userShare = weeks.length / data.conversations.length;
+				return userShare / guildShare >= MIN_TOPIC_LIFT;
+			})
+			.map(([term, weeks]) => ({
+				term,
+				frequency: weeks.length,
+				consistency: new Set(weeks).size / activeWeeks.size,
+			}))
+			.sort((a, b) => b.frequency - a.frequency || b.consistency - a.consistency)
+			.slice(0, MAX_TOPICS);
+
+		const topicAffinity: TopicAffinityMap = {};
+		for (const topic of topics) {
+			topicAffinity[topic.term] = {
+				frequency: topic.frequency,
+				consistency: Number(topic.consistency.toFixed(2)),
+			};
+		}
+
+		return topics.length > 0 ? topicAffinity : undefined;
+	}
+
+	/**
+	 * Build interaction style metrics. Reaction counts are not stored per user in the
+	 * database (relationship_edges.reactions is pair-level and undirected), so no
+	 * reactions metric is produced.
+	 */
+	private buildInteractionStyle(data: UserAnalysisData): InteractionStyle {
+		const totalMessages = data.messages.length;
+		const style: InteractionStyle = {
 			mentions_given_per_100msg:
-				(data.messages.filter((m) => /<@\d+>/.test(m.content)).length /
-					totalMessages) *
-				100,
-			reactions_given_per_100msg: 0, // Placeholder (need reaction data)
-			avg_conversation_length_messages:
-				data.conversations.length > 0
-					? data.conversations.reduce((sum, c) => sum + c.message_count, 0) /
-						data.conversations.length
+				totalMessages > 0
+					? (data.messages.filter((m) => /<@\d+>/.test(m.content)).length /
+							totalMessages) *
+						100
 					: 0,
-			solo_message_rate: 0.2, // Placeholder
 		};
+
+		if (data.conversations.length > 0) {
+			style.avg_conversation_length_messages =
+				data.conversations.reduce((sum, c) => sum + c.message_count, 0) /
+				data.conversations.length;
+		}
+
+		// Only judge messages from the period conversation tracking has covered
+		const coverage = data.conversationCoverage;
+		if (coverage) {
+			const covered = data.messages.filter((m) => m.created_at >= coverage.since);
+			if (covered.length > 0) {
+				const solo = covered.filter((m) => !coverage.messageIds.has(m.id)).length;
+				style.solo_message_rate = solo / covered.length;
+			}
+		}
+
+		return style;
 	}
 
 	/**

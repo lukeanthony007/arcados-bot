@@ -487,10 +487,6 @@ export class RelationshipMapper {
       cleaned.summary = entry.summary;
     }
 
-    if (entry.keywords && entry.keywords.length > 0) {
-      cleaned.keywords = entry.keywords;
-    }
-
     if (entry.emojis && entry.emojis.length > 0) {
       cleaned.emojis = entry.emojis;
     }
@@ -641,37 +637,56 @@ export class RelationshipMapper {
         throw new Error(`Failed to get edges: ${edgesResult.error}`);
       }
 
-      const edges = edgesResult.data;
-      const totalInteractions = edges.reduce((sum, e) => sum + (e.total || 0), 0);
+      const botsResult = await this.db.query(
+        "SELECT user_id FROM members WHERE guild_id = $1 AND bot = true",
+        [guildId]
+      );
+      const botIds = new Set<string>(
+        botsResult.success && botsResult.data
+          ? botsResult.data.map((row: { user_id: string }) => row.user_id)
+          : []
+      );
 
-      const relationships: RelationshipEntry[] = [];
-
-      for (const edge of edges) {
+      // Edges are directed (author → other), so merge both rows of each pair per person
+      const byUser = new Map<
+        string,
+        { total: number; interactions: number; lastInteraction: Date }
+      >();
+      for (const edge of edgesResult.data) {
         const otherUserId = edge.user_a === userId ? edge.user_b : edge.user_a;
-        
-        if (otherUserId === userId) continue; // Skip self
+        if (otherUserId === userId || botIds.has(otherUserId)) continue;
 
-        const relevancePercentage =
-          totalInteractions > 0
-            ? ((edge.total || 0) / totalInteractions) * 100
-            : 0;
-
-        const interactionCount =
-          (edge.user_a === userId ? edge.msg_a_to_b : edge.msg_b_to_a) +
+        const lastInteraction = new Date(edge.last_interaction);
+        const existing = byUser.get(otherUserId);
+        const total = (existing?.total ?? 0) + (edge.total || 0);
+        const interactions =
+          (existing?.interactions ?? 0) +
+          (edge.msg_a_to_b || 0) +
+          (edge.msg_b_to_a || 0) +
           (edge.mentions || 0) +
           (edge.replies || 0);
-
-        const relationship: RelationshipEntry = {
-          user_id: otherUserId,
-          affinity_percentage: Math.round(relevancePercentage * 100) / 100,
-          interaction_count: interactionCount,
-          last_interaction: new Date(edge.last_interaction),
-          raw_points: edge.total || 0,
-          total_messages: interactionCount,
-        };
-
-        relationships.push(relationship);
+        byUser.set(otherUserId, {
+          total,
+          interactions,
+          lastInteraction:
+            existing && existing.lastInteraction > lastInteraction
+              ? existing.lastInteraction
+              : lastInteraction,
+        });
       }
+
+      const totalInteractions = [...byUser.values()].reduce((sum, e) => sum + e.total, 0);
+      const relationships: RelationshipEntry[] = [...byUser].map(([otherUserId, pair]) => ({
+        user_id: otherUserId,
+        affinity_percentage:
+          totalInteractions > 0
+            ? Math.round((pair.total / totalInteractions) * 10000) / 100
+            : 0,
+        interaction_count: pair.interactions,
+        last_interaction: pair.lastInteraction,
+        raw_points: pair.total,
+        total_messages: pair.interactions,
+      }));
 
       relationships.sort(
         (a, b) => b.affinity_percentage - a.affinity_percentage

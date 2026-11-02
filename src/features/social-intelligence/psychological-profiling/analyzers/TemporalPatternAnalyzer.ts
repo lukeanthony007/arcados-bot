@@ -78,7 +78,7 @@ export class TemporalPatternAnalyzer {
 
 		for (const msg of messages) {
 			const hour = msg.created_at.getUTCHours();
-			hourCounts[hour]++;
+			hourCounts[hour] = (hourCounts[hour] ?? 0) + 1;
 		}
 
 		// Find peak hours (top 4 hours with most activity)
@@ -96,7 +96,7 @@ export class TemporalPatternAnalyzer {
 
 		// Calculate night owl score (activity 0-6 UTC relative to total)
 		const nightActivity = [0, 1, 2, 3, 4, 5, 6].reduce(
-			(sum, hour) => sum + hourCounts[hour],
+			(sum, hour) => sum + (hourCounts[hour] ?? 0),
 			0
 		);
 		const nightOwlScore = nightActivity / messages.length;
@@ -116,7 +116,7 @@ export class TemporalPatternAnalyzer {
 		if (peakHoursUTC.length === 0) return "UTC";
 
 		// Calculate modal peak hour
-		const modalPeak = peakHoursUTC[Math.floor(peakHoursUTC.length / 2)];
+		const modalPeak = peakHoursUTC[Math.floor(peakHoursUTC.length / 2)] ?? 0;
 
 		// Most people are active 18:00-23:00 local time
 		// Map UTC peak to local timezone offset
@@ -182,24 +182,26 @@ export class TemporalPatternAnalyzer {
 		}
 
 		// Group messages by day
-		const dayGroups: Record<string, MessageData[]> = {};
+		const dayGroups = new Map<string, MessageData[]>();
 		for (const msg of messages) {
-			const dayKey = msg.created_at.toISOString().split("T")[0]; // YYYY-MM-DD
-			if (!dayGroups[dayKey]) {
-				dayGroups[dayKey] = [];
+			const dayKey = msg.created_at.toISOString().slice(0, 10); // YYYY-MM-DD
+			const group = dayGroups.get(dayKey);
+			if (group) {
+				group.push(msg);
+			} else {
+				dayGroups.set(dayKey, [msg]);
 			}
-			dayGroups[dayKey].push(msg);
 		}
 
-		const days = Object.keys(dayGroups).sort();
+		const days = [...dayGroups.keys()].sort();
 		const totalDays = days.length;
 
 		// Calculate messages per day average
 		const messagesPerDayAvg = messages.length / Math.max(1, totalDays);
 
 		// Calculate active days per week
-		const firstDay = new Date(days[0]);
-		const lastDay = new Date(days[days.length - 1]);
+		const firstDay = new Date(days[0] ?? "");
+		const lastDay = new Date(days[days.length - 1] ?? "");
 		const totalWeeks =
 			(lastDay.getTime() - firstDay.getTime()) / (7 * 24 * 60 * 60 * 1000);
 		const activeDaysPerWeek = Math.min(7, totalDays / Math.max(1, totalWeeks));
@@ -228,8 +230,11 @@ export class TemporalPatternAnalyzer {
 		let currentStreak = 1;
 
 		for (let i = 1; i < days.length; i++) {
-			const prevDay = new Date(days[i - 1]);
-			const currDay = new Date(days[i]);
+			const prevKey = days[i - 1];
+			const currKey = days[i];
+			if (prevKey === undefined || currKey === undefined) continue;
+			const prevDay = new Date(prevKey);
+			const currDay = new Date(currKey);
 			const dayDiff =
 				(currDay.getTime() - prevDay.getTime()) / (24 * 60 * 60 * 1000);
 
@@ -254,8 +259,11 @@ export class TemporalPatternAnalyzer {
 		let burstMessages = 0;
 
 		for (let i = 1; i < messages.length; i++) {
+			const current = messages[i];
+			const previous = messages[i - 1];
+			if (!current || !previous) continue;
 			const timeDiff =
-				(messages[i].created_at.getTime() - messages[i - 1].created_at.getTime()) /
+				(current.created_at.getTime() - previous.created_at.getTime()) /
 				(60 * 1000);
 
 			if (timeDiff <= burstThresholdMinutes) {
@@ -274,6 +282,7 @@ export class TemporalPatternAnalyzer {
 		const messageCount = messages.length;
 		const firstMsg = messages[0];
 		const lastMsg = messages[messages.length - 1];
+		if (!firstMsg || !lastMsg) return 0;
 		const timeSpanDays =
 			(lastMsg.created_at.getTime() - firstMsg.created_at.getTime()) /
 			(24 * 60 * 60 * 1000);

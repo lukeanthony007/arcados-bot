@@ -6,6 +6,7 @@
  * Usage:
  *   GUILD_ID=123456789 npm run profile:users
  *   GUILD_ID=123456789 USER_LIMIT=50 npm run profile:users
+ *   GUILD_ID=123456789 USER_ID=987654321 npm run profile:users   (single user)
  */
 
 import { config } from "../../../../config/index.js";
@@ -18,6 +19,7 @@ async function main() {
 	const userLimit = process.env.USER_LIMIT
 		? Number.parseInt(process.env.USER_LIMIT, 10)
 		: undefined;
+	const targetUserId = process.env.USER_ID;
 
 	if (!guildId) {
 		console.error("❌ Error: GUILD_ID environment variable is required");
@@ -30,6 +32,9 @@ async function main() {
 	console.log("🧠 User Psychological Profiling");
 	console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 	console.log(`Guild ID: ${guildId}`);
+	if (targetUserId) {
+		console.log(`User ID: ${targetUserId}`);
+	}
 	if (userLimit) {
 		console.log(`User Limit: ${userLimit}`);
 	}
@@ -47,7 +52,7 @@ async function main() {
 
 	if (!guildResult.success || !guildResult.data || guildResult.data.length === 0) {
 		console.error(`❌ Error: Guild ${guildId} not found in database`);
-		await db.close();
+		await db.disconnect();
 		process.exit(1);
 	}
 
@@ -55,6 +60,18 @@ async function main() {
 	console.log(`Guild: ${guildName}\n`);
 
 	// Get active users
+	const userParams: (string | number)[] = [guildId];
+	let userFilter = "";
+	if (targetUserId) {
+		userParams.push(targetUserId);
+		userFilter = `AND m.user_id = $${userParams.length}`;
+	}
+	let limitClause = "";
+	if (userLimit) {
+		userParams.push(userLimit);
+		limitClause = `LIMIT $${userParams.length}`;
+	}
+
 	const usersResult = await db.query(
 		`
     SELECT m.user_id, m.display_name, COUNT(msg.id) as message_count
@@ -63,17 +80,18 @@ async function main() {
     WHERE m.guild_id = $1
       AND m.bot = false
       AND m.active = true
+      ${userFilter}
     GROUP BY m.user_id, m.display_name
     HAVING COUNT(msg.id) >= 10
     ORDER BY COUNT(msg.id) DESC
-    ${userLimit ? `LIMIT $2` : ""}
+    ${limitClause}
     `,
-		userLimit ? [guildId, userLimit] : [guildId]
+		userParams
 	);
 
 	if (!usersResult.success || !usersResult.data || usersResult.data.length === 0) {
 		console.error("❌ No users found for profiling (minimum 10 messages required)");
-		await db.close();
+		await db.disconnect();
 		process.exit(0);
 	}
 
@@ -125,9 +143,10 @@ async function main() {
 		const sampleUserId = users[0].user_id;
 		const sampleProfile = await db.query(
 			`
-			SELECT display_name, psych_profile
-			FROM members
-			WHERE guild_id = $1 AND user_id = $2
+			SELECT m.display_name, up.psych_profile
+			FROM members m
+			JOIN user_profiles up ON up.guild_id = m.guild_id AND up.user_id = m.user_id
+			WHERE m.guild_id = $1 AND m.user_id = $2
 			`,
 			[guildId, sampleUserId]
 		);
@@ -171,7 +190,7 @@ async function main() {
 
 	console.log("");
 
-	await db.close();
+	await db.disconnect();
 }
 
 main().catch((error) => {

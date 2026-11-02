@@ -487,13 +487,15 @@ export class UserPersonaService {
 				.join(", ");
 			lines.push(`- Big Five (0-1): ${traits}`);
 		}
-		if (psych.mbti_type && !psych.mbti_type.type.includes("X")) {
+		if (psych.mbti_type && psych.mbti_type.confidence >= 0.35 && !psych.mbti_type.type.includes("X")) {
 			lines.push(`- MBTI estimate: ${psych.mbti_type.type}`);
 		}
 		const style = psych.communication_style;
 		if (style) {
+			const verbosity =
+				style.verbosity !== undefined ? `, verbosity ${style.verbosity.toFixed(2)}` : "";
 			lines.push(
-				`- Formality ${style.formality.toFixed(2)} (0 casual, 1 formal), verbosity ${style.verbosity.toFixed(2)}, emoji richness ${style.emoji_richness.toFixed(2)}`,
+				`- Formality ${style.formality.toFixed(2)} (0 casual, 1 formal)${verbosity}, emoji richness ${style.emoji_richness.toFixed(2)}`,
 			);
 		}
 		const topEmojis = Object.keys(behavior.emoji_signature?.top_emojis ?? {});
