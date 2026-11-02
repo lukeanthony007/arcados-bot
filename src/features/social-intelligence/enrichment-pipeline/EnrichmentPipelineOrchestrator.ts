@@ -12,9 +12,14 @@
  * Context-driven approach: Only enrich when new underlying context exists.
  */
 
-import { EnrichmentQueue, EnrichmentLayer } from "./EnrichmentQueue";
+import { EnrichmentQueue, EnrichmentLayer, type EnrichmentJob } from "./EnrichmentQueue";
 import { EnrichmentRateLimiter } from "./EnrichmentRateLimiter";
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
+import type { AIEngine } from "../../../ai/core/AIEngine";
+import type { ConversationEnrichmentPipeline } from "./layers/ConversationEnrichmentPipeline";
+import type { UserProfileEnrichmentPipeline } from "./layers/UserProfileEnrichmentPipeline";
+import type { RelationshipEnrichmentPipeline } from "./layers/RelationshipEnrichmentPipeline";
+import type { ServerEnrichmentPipeline } from "./layers/ServerEnrichmentPipeline";
 
 export class EnrichmentPipelineOrchestrator {
 	private static instance: EnrichmentPipelineOrchestrator;
@@ -22,12 +27,13 @@ export class EnrichmentPipelineOrchestrator {
 	private queue: EnrichmentQueue;
 	private rateLimiter: EnrichmentRateLimiter;
 	private postgresManager: PostgreSQLManager | null = null;
+	private isProcessing = false;
 
 	// Pipeline references (will be set after pipelines are created)
-	private conversationPipeline: any = null;
-	private userPipeline: any = null;
-	private relationshipPipeline: any = null;
-	private serverPipeline: any = null;
+	private conversationPipeline: ConversationEnrichmentPipeline | null = null;
+	private userPipeline: UserProfileEnrichmentPipeline | null = null;
+	private relationshipPipeline: RelationshipEnrichmentPipeline | null = null;
+	private serverPipeline: ServerEnrichmentPipeline | null = null;
 
 	private constructor() {
 		this.queue = EnrichmentQueue.getInstance();
@@ -45,7 +51,7 @@ export class EnrichmentPipelineOrchestrator {
 	/**
 	 * Initialize with PostgreSQL manager and AI engine
 	 */
-	public async initialize(postgresManager: PostgreSQLManager, aiEngine?: any) {
+	public async initialize(postgresManager: PostgreSQLManager, aiEngine?: AIEngine) {
 		this.postgresManager = postgresManager;
 
 		// Initialize pipelines if AI engine provided
@@ -88,10 +94,10 @@ export class EnrichmentPipelineOrchestrator {
 	 * Set pipeline references (alternative to auto-initialization)
 	 */
 	public setPipelines(pipelines: {
-		conversation?: any;
-		user?: any;
-		relationship?: any;
-		server?: any;
+		conversation?: ConversationEnrichmentPipeline;
+		user?: UserProfileEnrichmentPipeline;
+		relationship?: RelationshipEnrichmentPipeline;
+		server?: ServerEnrichmentPipeline;
 	}) {
 		if (pipelines.conversation) this.conversationPipeline = pipelines.conversation;
 		if (pipelines.user) this.userPipeline = pipelines.user;
@@ -239,77 +245,72 @@ export class EnrichmentPipelineOrchestrator {
 	 * Handle user profile update
 	 * Called after user profile is enriched
 	 */
-	public async handleUserProfileUpdate(
-		userId: string,
-		guildId: string,
-		newProfileVersion: number,
-	) {
+	public async handleUserProfileUpdate(userId: string, guildId: string) {
 		if (!this.postgresManager) return;
 
-		// Find significant relationships (100+ interactions) where user is a participant
+		// Find significant relationships (100+ interactions) where user is a participant.
+		// relationship_edges rows are not stored in normalized order and a pair can exist in
+		// both orders, so sum both orientations per counterpart.
 		const result = await this.postgresManager.query(
 			`
-			SELECT
-				CASE
-					WHEN user_a = $2 THEN user_b
-					ELSE user_a
-				END as other_user,
-				total
-			FROM relationship_edges
-			WHERE guild_id = $1
-			AND (user_a = $2 OR user_b = $2)
-			AND total >= 100
-			ORDER BY total DESC
+			SELECT other_user, SUM(total)::int AS total
+			FROM (
+				SELECT
+					CASE WHEN user_a = $2 THEN user_b ELSE user_a END AS other_user,
+					total
+				FROM relationship_edges
+				WHERE guild_id = $1
+				AND (user_a = $2 OR user_b = $2)
+			) e
+			GROUP BY other_user
+			HAVING SUM(total) >= 100
+			ORDER BY SUM(total) DESC
 			LIMIT 50
 		`,
 			[guildId, userId],
 		);
 
-		if (result.success && result.data) {
-			for (const row of result.data) {
-				const otherUser = row.other_user;
+		if (!result.success) {
+			throw new Error(`failed to find relationships for ${userId}: ${result.error}`);
+		}
 
-				// Normalize user pair (ensure user_a < user_b)
-				const [userA, userB] =
-					userId < otherUser ? [userId, otherUser] : [otherUser, userId];
+		for (const row of result.data ?? []) {
+			const otherUser: string = row.other_user;
 
-				// Check if relationship profile needs update
-				const needsUpdate = await this.checkRelationshipNeedsUpdate(
+			// Normalize user pair (ensure user_a < user_b)
+			const [userA, userB] =
+				userId < otherUser ? [userId, otherUser] : [otherUser, userId];
+
+			if (await this.relationshipNeedsUpdate(guildId, userA, userB)) {
+				this.queue.enqueue({
+					layer: EnrichmentLayer.RELATIONSHIP,
+					entityId: `${userA}:${userB}`,
 					guildId,
-					userA,
-					userB,
-					newProfileVersion,
-				);
-
-				if (needsUpdate) {
-					this.queue.enqueue({
-						layer: EnrichmentLayer.RELATIONSHIP,
-						entityId: `${userA}:${userB}`,
-						guildId,
-						priority: 5, // Medium priority
-					});
-				}
+					priority: 5, // Medium priority
+				});
 			}
 		}
 	}
 
 	/**
-	 * Check if relationship needs update based on user profile versions
+	 * A relationship needs (re)enrichment when it has 3+ shared conversations that the
+	 * stored profile (if any) has not covered yet. Mirrors the gate in RelationshipEnrichmentPipeline.
 	 */
-	private async checkRelationshipNeedsUpdate(
+	private async relationshipNeedsUpdate(
 		guildId: string,
 		userA: string,
 		userB: string,
-		updatedUserVersion: number,
 	): Promise<boolean> {
 		if (!this.postgresManager) return false;
 
 		const result = await this.postgresManager.query(
 			`
 			SELECT
-				user_a_profile_version,
-				user_b_profile_version,
-				last_enriched_conversation_count,
+				COALESCE((
+					SELECT last_enriched_conversation_count
+					FROM relationship_profiles
+					WHERE guild_id = $1 AND user_a = $2 AND user_b = $3
+				), 0) AS last_enriched_conversation_count,
 				(
 					SELECT COUNT(DISTINCT cs.id)
 					FROM conversation_segments cs
@@ -318,29 +319,25 @@ export class EnrichmentPipelineOrchestrator {
 					AND $3 = ANY(cs.participants)
 					AND cs.status = 'finalized'
 					AND cs.ai_processing_status = 'completed'
-				) as current_shared_conversations
-			FROM relationship_profiles
-			WHERE guild_id = $1 AND user_a = $2 AND user_b = $3
+					AND cs.summary IS NOT NULL
+				) AS current_shared_conversations
 		`,
 			[guildId, userA, userB],
 		);
 
-		if (result.success && result.data && result.data.length > 0) {
-			const row = result.data[0];
-
-			// Check if profile versions differ AND there are 3+ new shared conversations
-			const versionsDiffer =
-				row.user_a_profile_version !== updatedUserVersion ||
-				row.user_b_profile_version !== updatedUserVersion;
-			const newSharedConversations =
-				row.current_shared_conversations -
-				(row.last_enriched_conversation_count || 0);
-
-			return versionsDiffer && newSharedConversations >= 3;
+		if (!result.success) {
+			throw new Error(
+				`failed to check relationship ${userA}:${userB}: ${result.error}`,
+			);
 		}
 
-		// If no profile exists yet, create one if there are shared conversations
-		return true;
+		const row = result.data?.[0];
+		if (!row) return false;
+		return (
+			Number(row.current_shared_conversations) -
+				Number(row.last_enriched_conversation_count) >=
+			3
+		);
 	}
 
 	// ============================================================================
@@ -354,42 +351,47 @@ export class EnrichmentPipelineOrchestrator {
 	public async handleRelationshipUpdate(guildId: string) {
 		if (!this.postgresManager) return;
 
-		// Check if guild needs summary update based on relationship count
+		// Check if guild needs summary update based on relationship count.
+		// LEFT JOIN so a guild without a guild_metadata row is still evaluated.
 		const result = await this.postgresManager.query(
 			`
 			SELECT
-				last_enriched_relationship_count,
+				COALESCE(gm.last_enriched_relationship_count, 0) AS last_enriched_relationship_count,
 				(
 					SELECT COUNT(*)
 					FROM relationship_profiles
 					WHERE guild_id = $1
 					AND last_enriched_at IS NOT NULL
-				) as current_relationship_count
-			FROM guild_metadata
-			WHERE guild_id = $1
+				) AS current_relationship_count
+			FROM (SELECT $1::text AS guild_id) g
+			LEFT JOIN guild_metadata gm ON gm.guild_id = g.guild_id
 		`,
 			[guildId],
 		);
 
-		if (result.success && result.data && result.data.length > 0) {
-			const { last_enriched_relationship_count, current_relationship_count } =
-				result.data[0];
+		if (!result.success) {
+			throw new Error(`failed to check guild ${guildId}: ${result.error}`);
+		}
 
-			// Trigger if 10+ new relationship enrichments
-			if (
-				current_relationship_count - (last_enriched_relationship_count || 0) >= 10
-			) {
-				this.queue.enqueue({
-					layer: EnrichmentLayer.SERVER,
-					entityId: guildId,
-					guildId,
-					priority: 3, // Lower priority
-				});
+		const row = result.data?.[0];
+		if (!row) return;
 
-				console.log(
-					`🔔 Guild ${guildId} has ${current_relationship_count - last_enriched_relationship_count} new relationship updates, queued for enrichment`,
-				);
-			}
+		const newRelationships =
+			Number(row.current_relationship_count) -
+			Number(row.last_enriched_relationship_count);
+
+		// Trigger if 10+ new relationship enrichments
+		if (newRelationships >= 10) {
+			this.queue.enqueue({
+				layer: EnrichmentLayer.SERVER,
+				entityId: guildId,
+				guildId,
+				priority: 3, // Lower priority
+			});
+
+			console.log(
+				`🔔 Guild ${guildId} has ${newRelationships} new relationship updates, queued for enrichment`,
+			);
 		}
 	}
 
@@ -407,67 +409,86 @@ export class EnrichmentPipelineOrchestrator {
 			return; // Nothing to process
 		}
 
-		console.log(`\n🔄 Processing enrichment queue: ${JSON.stringify(depths)}\n`);
-
-		// Check remaining budget
-		const budget = this.rateLimiter.getRemainingBudget();
-		if (budget.daily <= 0) {
-			console.warn("⚠️  Daily budget exhausted, skipping enrichment");
+		// A slow batch must not overlap with the next scheduled drain
+		if (this.isProcessing) {
 			return;
 		}
+		this.isProcessing = true;
 
-		console.log(
-			`💰 Budget remaining: $${budget.daily.toFixed(4)} daily, $${budget.monthly.toFixed(2)} monthly`,
-		);
+		try {
+			console.log(`\n🔄 Processing enrichment queue: ${JSON.stringify(depths)}\n`);
 
-		// Dequeue batch of jobs in priority order
-		const jobs = this.queue.dequeueBatch(maxBatch);
-
-		for (const job of jobs) {
-			try {
-				// Check budget before each enrichment
-				const canAfford = await this.rateLimiter.canAffordEnrichment(
-					job.estimatedCost || 0.01,
-				);
-
-				if (!canAfford.canAfford) {
-					console.warn(
-						`⚠️  Stopping enrichment: ${canAfford.reason}`,
-					);
-					this.queue.fail(job.id, canAfford.reason || "Budget exceeded");
-					break; // Stop processing batch
-				}
-
-				// Process job based on layer
-				await this.processJob(job);
-
-				this.queue.complete(job.id);
-			} catch (error) {
-				console.error(
-					`❌ Error processing enrichment job ${job.id}:`,
-					error,
-				);
-				this.queue.fail(
-					job.id,
-					error instanceof Error ? error.message : String(error),
-				);
+			// Check remaining budget
+			const budget = this.rateLimiter.getRemainingBudget();
+			if (budget.daily <= 0) {
+				console.warn("⚠️  Daily budget exhausted, skipping enrichment");
+				return;
 			}
-		}
 
-		console.log("\n🔹 Enrichment batch processing complete\n");
+			console.log(
+				`💰 Budget remaining: $${budget.daily.toFixed(4)} daily, $${budget.monthly.toFixed(2)} monthly`,
+			);
+
+			// Dequeue batch of jobs in priority order
+			const jobs = this.queue.dequeueBatch(maxBatch);
+
+			for (const [index, job] of jobs.entries()) {
+				try {
+					// Check budget before each enrichment
+					const canAfford = await this.rateLimiter.canAffordEnrichment(
+						job.estimatedCost || 0.01,
+					);
+
+					if (!canAfford.canAfford) {
+						console.warn(`⚠️  Stopping enrichment: ${canAfford.reason}`);
+						// Not a job failure: return every unprocessed job to the queue untouched
+						for (const unprocessed of jobs.slice(index)) {
+							this.queue.requeue(unprocessed);
+						}
+						break; // Stop processing batch
+					}
+
+					// Process job based on layer
+					await this.processJob(job);
+
+					this.queue.complete(job.id);
+				} catch (error) {
+					console.error(`❌ Error processing enrichment job ${job.id}:`, error);
+					this.queue.fail(
+						job.id,
+						error instanceof Error ? error.message : String(error),
+					);
+				}
+			}
+
+			console.log("\n🔹 Enrichment batch processing complete\n");
+		} finally {
+			this.isProcessing = false;
+		}
 	}
 
 	/**
-	 * Process individual enrichment job
+	 * Process individual enrichment job. Throws on failure so the queue retries it.
 	 */
-	private async processJob(job: any) {
+	private async processJob(job: EnrichmentJob) {
 		switch (job.layer) {
 			case EnrichmentLayer.CONVERSATION:
 				if (this.conversationPipeline) {
-					await this.conversationPipeline.enrichConversation(
+					const result = await this.conversationPipeline.enrichConversation(
 						job.entityId,
 						job.guildId,
 					);
+					if (!result.success) {
+						if (result.skipped) {
+							console.log(
+								`   ℹ️  Conversation ${job.entityId} skipped: ${result.error}`,
+							);
+							break;
+						}
+						throw new Error(
+							`Conversation enrichment failed for ${job.entityId}: ${result.error}`,
+						);
+					}
 					// Trigger cascade: check participants for user enrichment
 					await this.cascadeConversationEnrichment(job.entityId, job.guildId);
 				}
@@ -481,11 +502,7 @@ export class EnrichmentPipelineOrchestrator {
 					);
 					// Trigger cascade: update relationships
 					if (profileVersion) {
-						await this.handleUserProfileUpdate(
-							job.entityId,
-							job.guildId,
-							profileVersion,
-						);
+						await this.handleUserProfileUpdate(job.entityId, job.guildId);
 					}
 				}
 				break;
@@ -493,13 +510,18 @@ export class EnrichmentPipelineOrchestrator {
 			case EnrichmentLayer.RELATIONSHIP:
 				if (this.relationshipPipeline) {
 					const [userA, userB] = job.entityId.split(":");
-					await this.relationshipPipeline.enrichRelationship(
+					if (!userA || !userB) {
+						throw new Error(`Invalid relationship job entity: ${job.entityId}`);
+					}
+					const enriched = await this.relationshipPipeline.enrichRelationship(
 						userA,
 						userB,
 						job.guildId,
 					);
 					// Trigger cascade: check if guild summary needs update
-					await this.handleRelationshipUpdate(job.guildId);
+					if (enriched) {
+						await this.handleRelationshipUpdate(job.guildId);
+					}
 				}
 				break;
 

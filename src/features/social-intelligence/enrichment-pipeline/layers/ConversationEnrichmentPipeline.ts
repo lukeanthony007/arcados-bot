@@ -32,6 +32,8 @@ export interface EnrichmentResult {
 	significance: number;
 	confidence: number;
 	error?: string;
+	/** True when there is nothing to enrich (segment gone, messages deleted); retrying cannot help */
+	skipped?: boolean;
 }
 
 export class ConversationEnrichmentPipeline {
@@ -74,12 +76,16 @@ export class ConversationEnrichmentPipeline {
 				[conversationId, guildId],
 			);
 
-			if (!segmentResult.success || !segmentResult.data || segmentResult.data.length === 0) {
+			if (!segmentResult.success) {
+				throw new Error(`failed to read segment: ${segmentResult.error}`);
+			}
+			if (!segmentResult.data || segmentResult.data.length === 0) {
 				return {
 					success: false,
 					significance: 0,
 					confidence: 0,
 					error: "Conversation segment not found",
+					skipped: true,
 				};
 			}
 
@@ -96,12 +102,17 @@ export class ConversationEnrichmentPipeline {
 				[segment.message_ids],
 			);
 
-			if (!messagesResult.success || !messagesResult.data || messagesResult.data.length === 0) {
+			if (!messagesResult.success) {
+				throw new Error(`failed to read messages: ${messagesResult.error}`);
+			}
+			if (!messagesResult.data || messagesResult.data.length === 0) {
+				await this.markSkipped(conversationId, "no messages found for segment");
 				return {
 					success: false,
 					significance: 0,
 					confidence: 0,
 					error: "No messages found for conversation",
+					skipped: true,
 				};
 			}
 
@@ -129,6 +140,8 @@ export class ConversationEnrichmentPipeline {
 					significance,
 					confidence: 0,
 					error: canAfford.reason || "Budget exceeded",
+					// Not a failure: the segment stays 'pending' and the backlog sweep re-queues it later
+					skipped: true,
 				};
 			}
 
@@ -176,8 +189,9 @@ export class ConversationEnrichmentPipeline {
 			// Update database with enrichment metadata
 			const enrichmentVersion = (segment.enrichment_version || 0) + 1;
 
+			let updateResult;
 			if (embedding) {
-				await this.db.query(
+				updateResult = await this.db.query(
 					`
 					UPDATE conversation_segments
 					SET summary = $2,
@@ -188,11 +202,12 @@ export class ConversationEnrichmentPipeline {
 						ai_processing_status = 'completed',
 						ai_processed_at = NOW()
 					WHERE id = $1
+					RETURNING id
 					`,
 					[conversationId, summary, pgvector.toSql(embedding), enrichmentVersion, confidence],
 				);
 			} else {
-				await this.db.query(
+				updateResult = await this.db.query(
 					`
 					UPDATE conversation_segments
 					SET summary = $2,
@@ -202,9 +217,24 @@ export class ConversationEnrichmentPipeline {
 						ai_processing_status = 'completed',
 						ai_processed_at = NOW()
 					WHERE id = $1
+					RETURNING id
 					`,
 					[conversationId, summary, enrichmentVersion, confidence],
 				);
+			}
+
+			if (!updateResult.success) {
+				throw new Error(`failed to save conversation: ${updateResult.error}`);
+			}
+			if (!updateResult.data?.length) {
+				// Segment was merged/deleted while the LLM call was in flight
+				return {
+					success: false,
+					significance,
+					confidence: 0,
+					error: "Conversation segment disappeared before save",
+					skipped: true,
+				};
 			}
 
 			// Track actual cost (approximate)
@@ -228,6 +258,27 @@ export class ConversationEnrichmentPipeline {
 				confidence: 0,
 				error: error instanceof Error ? error.message : String(error),
 			};
+		}
+	}
+
+	/**
+	 * Mark a segment as permanently not enrichable so it is not re-queued forever
+	 */
+	private async markSkipped(conversationId: string, reason: string): Promise<void> {
+		const result = await this.db.query(
+			`
+			UPDATE conversation_segments
+			SET ai_processing_status = 'skipped',
+				ai_metadata = COALESCE(ai_metadata, '{}'::jsonb) || jsonb_build_object(
+					'skip_reason', $2::text,
+					'skipped_at', NOW()
+				)
+			WHERE id = $1
+			`,
+			[conversationId, reason],
+		);
+		if (!result.success) {
+			throw new Error(`failed to mark conversation skipped: ${result.error}`);
 		}
 	}
 
@@ -433,9 +484,12 @@ Summary:`;
 					.user("system-summarizer")
 					.guild(guildId)
 					.build();
+				// Structured mode: the chat preset caps output at 60 tokens, truncating summaries.
+				// The prompt asks for 1-2 sentences; 300 tokens is headroom, not a target.
 				const result = await builder
-					.chat()
 					.blocking()
+					.mode("structured")
+					.maxTokens(300)
 					.withContext(ctx)
 					.provider(provider as "grok" | "ollama")
 					.persona("casual")

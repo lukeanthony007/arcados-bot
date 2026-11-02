@@ -237,9 +237,9 @@ export class LiveEventSync {
 			this.stats.messagesProcessed++;
 
 			// Track message count for enrichment trigger (every 50 messages)
-			if (this.postgresManager && !isBot) {
+			if (!isBot) {
 				try {
-					const countResult = await this.postgresManager.query(
+					const countResult = await this.db.query(
 						`SELECT COUNT(*) as count FROM messages WHERE author_id = $1 AND guild_id = $2`,
 						[authorId, guildId],
 					);

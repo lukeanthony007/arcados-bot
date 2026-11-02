@@ -466,8 +466,11 @@ Summary:`;
                 .guild(guildId)
                 .build();
               const result = await builder
-                .chat()
+                // Structured mode: the chat preset caps output at 60 tokens, truncating summaries.
+                // The prompt asks for 1-2 sentences; 300 tokens is headroom, not a target.
                 .blocking()
+                .mode("structured")
+                .maxTokens(300)
                 .withContext(ctx)
                 .provider(provider as "grok" | "ollama")
                 .persona("casual")

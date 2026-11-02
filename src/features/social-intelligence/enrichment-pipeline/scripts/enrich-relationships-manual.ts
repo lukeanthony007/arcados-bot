@@ -17,12 +17,8 @@ const db = new PostgreSQLManager();
 
 async function main() {
 	const args = process.argv.slice(2);
-	const hoursBack = args.includes("--significant")
-		? null
-		: args[0]
-			? parseInt(args[0], 10)
-			: 24;
 	const significantOnly = args.includes("--significant");
+	const hoursBack = args[0] && !significantOnly ? parseInt(args[0], 10) : 24;
 
 	console.log("🤖 Manual Relationship Enrichment");
 	console.log("=".repeat(80));
@@ -59,13 +55,14 @@ async function main() {
 
 	if (significantOnly) {
 		query = `
-			SELECT DISTINCT
+			SELECT
 				LEAST(user_a, user_b) as user_a,
 				GREATEST(user_a, user_b) as user_b
 			FROM relationship_edges
 			WHERE guild_id = $1
-			AND total >= 100
-			ORDER BY total DESC
+			GROUP BY LEAST(user_a, user_b), GREATEST(user_a, user_b)
+			HAVING SUM(total) >= 100
+			ORDER BY SUM(total) DESC
 		`;
 		params = [guildId];
 	} else {

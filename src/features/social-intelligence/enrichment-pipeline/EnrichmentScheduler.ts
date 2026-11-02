@@ -1,20 +1,26 @@
 /**
  * EnrichmentScheduler
  *
- * Schedules periodic enrichment jobs using node-cron.
- * Runs enrichment pipeline at regular intervals:
- * - Conversations: daily
- * - User profiles: weekly
- * - Guild summaries: monthly
+ * Drains the in-memory enrichment queue on a short interval using node-cron.
+ *
+ * The queue is process-local and is lost on restart, so jobs must not sit in it for
+ * hours waiting for a once-a-day tick (the previous 02:00 / Monday 03:00 / 1st-of-month
+ * schedule only enriched what happened to survive in memory until then). Work is bounded
+ * by EnrichmentRateLimiter ($1/day, $40/month), not by the schedule, so draining
+ * frequently in small batches is cost-safe. ReconciliationSync repopulates the queue
+ * from the database (pending conversations, unenriched users/relationships/guild).
  */
 
-import cron from "node-cron";
+import cron, { type ScheduledTask } from "node-cron";
 import { EnrichmentPipelineOrchestrator } from "./EnrichmentPipelineOrchestrator";
+
+/** Jobs processed per tick */
+const BATCH_SIZE = 5;
 
 export class EnrichmentScheduler {
 	private static instance: EnrichmentScheduler;
 	private orchestrator: EnrichmentPipelineOrchestrator;
-	private jobs: cron.ScheduledTask[] = [];
+	private jobs: ScheduledTask[] = [];
 
 	private constructor() {
 		this.orchestrator = EnrichmentPipelineOrchestrator.getInstance();
@@ -31,38 +37,15 @@ export class EnrichmentScheduler {
 	 * Start the enrichment scheduler
 	 */
 	public async start() {
-		// Daily at 2 AM: Process conversation enrichments
-		this.jobs.push(
-			cron.schedule("0 2 * * *", async () => {
-				console.log("⏰ Running scheduled conversation enrichments");
-				try {
-					await this.orchestrator.processPendingEnrichments(10);
-				} catch (error) {
-					console.error("❌ Error in scheduled conversation enrichment:", error);
-				}
-			}),
-		);
+		if (this.jobs.length > 0) return;
 
-		// Every Monday at 3 AM: Process user profile enrichments (weekly)
+		// Every 5 minutes: drain a small batch of queued enrichments
 		this.jobs.push(
-			cron.schedule("0 3 * * 1", async () => {
-				console.log("⏰ Running scheduled user profile enrichments");
+			cron.schedule("*/5 * * * *", async () => {
 				try {
-					await this.orchestrator.processPendingEnrichments(10);
+					await this.orchestrator.processPendingEnrichments(BATCH_SIZE);
 				} catch (error) {
-					console.error("❌ Error in scheduled user profile enrichment:", error);
-				}
-			}),
-		);
-
-		// First day of each month at 4 AM: Process guild summaries
-		this.jobs.push(
-			cron.schedule("0 4 1 * *", async () => {
-				console.log("⏰ Running scheduled guild summary enrichments");
-				try {
-					await this.orchestrator.processPendingEnrichments(5);
-				} catch (error) {
-					console.error("❌ Error in scheduled guild enrichment:", error);
+					console.error("❌ Error in scheduled enrichment drain:", error);
 				}
 			}),
 		);
@@ -79,4 +62,3 @@ export class EnrichmentScheduler {
 		console.log("⏸️  Enrichment scheduler stopped");
 	}
 }
-

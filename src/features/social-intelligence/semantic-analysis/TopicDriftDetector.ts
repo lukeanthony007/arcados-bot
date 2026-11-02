@@ -190,8 +190,9 @@ Respond with ONLY the topic label, nothing else. Examples: "planning dinner", "g
         this.recordAIUsage();
         const builder = new AIRequestBuilder(this.aiEngine!);
         const result = await builder
-          .chat()
           .blocking()
+          .mode("structured")
+          .maxTokens(150)
           .provider("ollama")
           .persona("casual")
           .withoutTools()
@@ -624,8 +625,9 @@ Response format: Either "continue" OR "split: [2-5 word topic label]"`;
         this.recordAIUsage();
         const builder = new AIRequestBuilder(this.aiEngine!);
         const result = await builder
-          .chat()
           .blocking()
+          .mode("structured")
+          .maxTokens(200)
           .provider("ollama")
           .persona("casual")
           .withoutTools()
@@ -731,9 +733,11 @@ Be balanced - group related subtopics together, but split clearly different disc
       try {
         this.recordAIUsage();
         const builder = new AIRequestBuilder(this.aiEngine!);
+        // Structured mode: the chat preset caps output at 60 tokens
         const result = await builder
-          .chat()
           .blocking()
+          .mode("structured")
+          .maxTokens(150)
           .provider("ollama")
           .persona("casual")
           .withoutTools()

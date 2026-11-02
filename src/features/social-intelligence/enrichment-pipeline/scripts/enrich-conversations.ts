@@ -624,8 +624,10 @@ Only return the JSON, nothing else.`;
 
 		const builder = new AIRequestBuilder(aiEngine);
 		const result = await builder
-			.chat()
+			// Structured mode: the chat preset caps output at 60 tokens, which truncates the JSON reply
 			.blocking()
+			.mode("structured")
+			.maxTokens(800)
 			.provider(provider as "grok" | "ollama")
 			.persona("casual")
 			.withoutTools() // Don't need database tools for this analysis

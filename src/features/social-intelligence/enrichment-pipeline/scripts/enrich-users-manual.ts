@@ -18,12 +18,8 @@ const db = new PostgreSQLManager();
 
 async function main() {
 	const args = process.argv.slice(2);
-	const hoursBack = args.includes("--stale")
-		? null
-		: args[0]
-			? parseInt(args[0], 10)
-			: 24;
 	const staleOnly = args.includes("--stale");
+	const hoursBack = args[0] && !staleOnly ? parseInt(args[0], 10) : 24;
 
 	console.log("🤖 Manual User Profile Enrichment");
 	console.log("=".repeat(80));
@@ -58,36 +54,35 @@ async function main() {
 	let query: string;
 	let params: any[];
 
+	// Start from members so users without a profile row yet are included; bots never are
 	if (staleOnly) {
 		query = `
-			SELECT DISTINCT up.user_id
-			FROM user_profiles up
-			WHERE up.guild_id = $1
+			SELECT m.user_id
+			FROM members m
+			LEFT JOIN user_profiles up ON up.guild_id = m.guild_id AND up.user_id = m.user_id
+			WHERE m.guild_id = $1 AND m.bot = false
 			AND (
-				up.last_enriched_conversation_count IS NULL
-				OR (
-					SELECT COUNT(DISTINCT cs.id)
-					FROM conversation_segments cs
-					WHERE cs.guild_id = $1
-					AND up.user_id = ANY(cs.participants)
-					AND cs.status = 'finalized'
-					AND cs.ai_processing_status = 'completed'
-				) - COALESCE(up.last_enriched_conversation_count, 0) >= 5
-			)
+				SELECT COUNT(DISTINCT cs.id)
+				FROM conversation_segments cs
+				WHERE cs.guild_id = $1
+				AND m.user_id = ANY(cs.participants)
+				AND cs.status = 'finalized'
+				AND cs.ai_processing_status = 'completed'
+			) - COALESCE(up.last_enriched_conversation_count, 0) >= 5
 		`;
 		params = [guildId];
 	} else {
 		const since = new Date(Date.now() - hoursBack * 60 * 60 * 1000);
 		query = `
-			SELECT DISTINCT up.user_id
-			FROM user_profiles up
+			SELECT DISTINCT m.user_id
+			FROM members m
 			INNER JOIN conversation_segments cs ON (
 				cs.guild_id = $1
-				AND up.user_id = ANY(cs.participants)
+				AND m.user_id = ANY(cs.participants)
 				AND cs.status = 'finalized'
 				AND cs.start_time >= $2
 			)
-			WHERE up.guild_id = $1
+			WHERE m.guild_id = $1 AND m.bot = false
 		`;
 		params = [guildId, since];
 	}

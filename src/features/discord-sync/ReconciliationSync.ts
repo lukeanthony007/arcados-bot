@@ -163,6 +163,7 @@ export class ReconciliationSync {
     // 3. Reconcile conversation data
     await this.reconcileConversationKeywords(guild);
     await this.reconcileConversationEmbeddings(guild);
+    await this.reconcileConversationEnrichment(guild);
 
     // 4. Reconcile enrichment layers (dependency chain)
     await this.reconcileUserProfiles(guild);
@@ -698,12 +699,12 @@ export class ReconciliationSync {
 
       // Fetch messages after the watermark
       for (let i = 0; i < maxBatches; i++) {
-        const options: any = { limit: batchSize };
+        const options: { limit: number; after?: string } = { limit: batchSize };
         if (lastId) {
           options.after = lastId; // Fetch messages after this ID
         }
 
-        const messages = await (channel as any).messages.fetch(options);
+        const messages = await channel.messages.fetch(options);
         if (!messages || messages.size === 0) break;
 
         // Check which messages already exist in DB
@@ -788,9 +789,10 @@ export class ReconciliationSync {
         }
 
         // Get the newest message ID from this batch for next iteration
-        const sortedMessages = Array.from(messages.values()).sort(
-          (a, b) => BigInt(b.id) - BigInt(a.id)
-        );
+        const sortedMessages = Array.from(messages.values()).sort((a, b) => {
+          const diff = BigInt(b.id) - BigInt(a.id);
+          return diff > 0n ? 1 : diff < 0n ? -1 : 0;
+        });
         lastId = sortedMessages[0]?.id || null;
         if (!lastId) break;
       }
@@ -1423,6 +1425,144 @@ export class ReconciliationSync {
   }
 
   /**
+   * Reconcile the conversation enrichment backlog.
+   *
+   * The enrichment queue is in-memory and ConversationDetector only enqueues at
+   * finalization time, so every finalized conversation that was not drained before a
+   * restart (or that failed) stayed `ai_processing_status = 'pending'` forever, and
+   * conversations below the significance threshold were never enqueued at all.
+   * The database is the source of truth, so this sweep:
+   *  1. marks insignificant pending conversations 'skipped' with a reason (and
+   *     re-opens skipped ones that later became significant, e.g. after a merge),
+   *  2. re-enqueues the newest significant pending conversations, a bounded number per
+   *     sweep. The queue dedups by id, and the rate limiter ($1/day) bounds spend.
+   *
+   * Significance mirrors EnrichmentPipelineOrchestrator.isConversationSignificant:
+   * 3+ participants OR 10+ messages.
+   */
+  private async reconcileConversationEnrichment(
+    guild: Guild,
+    options: { dryRun?: boolean; maxQueue?: number } = {}
+  ): Promise<{ queued: number; skipped: number; reopened: number }> {
+    const maxQueue = options.maxQueue ?? 20;
+    const dryRun = options.dryRun || false;
+
+    try {
+      let skipped = 0;
+      let reopened = 0;
+
+      if (!dryRun) {
+        const skipResult = await this.db.query(
+          `
+          UPDATE conversation_segments
+          SET ai_processing_status = 'skipped',
+              ai_metadata = COALESCE(ai_metadata, '{}'::jsonb) || jsonb_build_object(
+                'skip_reason', 'below significance threshold (<3 participants and <10 messages)',
+                'skipped_at', NOW()
+              )
+          WHERE guild_id = $1
+            AND status = 'finalized'
+            AND ai_processing_status = 'pending'
+            AND COALESCE(array_length(participants, 1), 0) < 3
+            AND message_count < 10
+          RETURNING id
+          `,
+          [guild.id]
+        );
+        skipped = skipResult.success ? (skipResult.data?.length ?? 0) : 0;
+
+        const reopenResult = await this.db.query(
+          `
+          UPDATE conversation_segments
+          SET ai_processing_status = 'pending',
+              ai_metadata = ai_metadata - 'skip_reason' - 'skipped_at'
+          WHERE guild_id = $1
+            AND status = 'finalized'
+            AND ai_processing_status = 'skipped'
+            AND ai_metadata ->> 'skip_reason' LIKE 'below significance threshold%'
+            AND (COALESCE(array_length(participants, 1), 0) >= 3 OR message_count >= 10)
+          RETURNING id
+          `,
+          [guild.id]
+        );
+        reopened = reopenResult.success ? (reopenResult.data?.length ?? 0) : 0;
+      }
+
+      const pendingResult = await this.db.query(
+        `
+        SELECT id, guild_id, COALESCE(array_length(participants, 1), 0) AS participant_count
+        FROM conversation_segments
+        WHERE guild_id = $1
+          AND status = 'finalized'
+          AND ai_processing_status = 'pending'
+          AND (COALESCE(array_length(participants, 1), 0) >= 3 OR message_count >= 10)
+        ORDER BY end_time DESC
+        LIMIT $2
+        `,
+        [guild.id, maxQueue + 20]
+      );
+
+      if (!pendingResult.success || !pendingResult.data) {
+        return { queued: 0, skipped, reopened };
+      }
+
+      const orchestrator = EnrichmentPipelineOrchestrator.getInstance();
+      // Jobs that exhausted their retries stay out until restart or an explicit retryFailed()
+      const exhausted = new Set(
+        orchestrator
+          .getFailedJobs()
+          .filter((job) => job.layer === EnrichmentLayer.CONVERSATION && job.attempts >= 3)
+          .map((job) => job.entityId)
+      );
+
+      let queued = 0;
+      for (const row of pendingResult.data) {
+        if (queued >= maxQueue) break;
+        if (exhausted.has(row.id)) continue;
+        if (!dryRun) {
+          const participantCount = Number(row.participant_count);
+          await orchestrator.enqueueConversation(
+            row.id,
+            row.guild_id,
+            participantCount >= 5 ? "high" : participantCount >= 3 ? "medium" : "low"
+          );
+        }
+        queued++;
+      }
+
+      if (this.verbose || dryRun || skipped > 0 || reopened > 0) {
+        console.log(
+          `   🔹 ReconciliationSync: ${dryRun ? "[DRY RUN] " : ""}Conversation backlog for ${guild.name}: ${queued} queued, ${skipped} marked skipped, ${reopened} reopened`
+        );
+      }
+
+      return { queued, skipped, reopened };
+    } catch (error) {
+      console.error(
+        `🔸 ReconciliationSync: Error reconciling conversation enrichment backlog:`,
+        error
+      );
+      return { queued: 0, skipped: 0, reopened: 0 };
+    }
+  }
+
+  /**
+   * Run the conversation backlog sweep for every guild this bot reconciles
+   */
+  private async reconcileConversationEnrichmentBacklog(): Promise<void> {
+    if (config.guildId) {
+      const targetGuild = this.client.guilds.cache.get(config.guildId);
+      if (targetGuild) {
+        await this.reconcileConversationEnrichment(targetGuild);
+      }
+      return;
+    }
+    for (const [, guild] of this.client.guilds.cache) {
+      await this.reconcileConversationEnrichment(guild);
+    }
+  }
+
+  /**
    * Reconcile user profiles (NEW)
    * Queues unenriched users for AI enrichment via enrichment pipeline
    */
@@ -1541,12 +1681,25 @@ export class ReconciliationSync {
            INNER JOIN user_profiles up_b ON up_b.guild_id = re.guild_id AND up_b.user_id = re.user_b AND up_b.summary IS NOT NULL`
         : "";
 
-      // Find significant relationships without profiles
+      // Find significant relationships without profiles.
+      // relationship_edges rows are not stored in normalized order (and a pair can exist in
+      // both orders), while relationship_profiles requires user_a < user_b, so aggregate
+      // both orientations into one normalized pair before joining.
       const relationshipsResult = await this.db.query(
         `
+        WITH pairs AS (
+          SELECT guild_id,
+                 LEAST(user_a, user_b) AS user_a,
+                 GREATEST(user_a, user_b) AS user_b,
+                 SUM(total)::int AS total
+          FROM relationship_edges
+          WHERE guild_id = $1 AND user_a <> user_b
+          GROUP BY guild_id, LEAST(user_a, user_b), GREATEST(user_a, user_b)
+          HAVING SUM(total) >= $2
+        )
         SELECT re.guild_id, re.user_a, re.user_b, re.total,
                COUNT(DISTINCT cs.id) as shared_conversations
-        FROM relationship_edges re
+        FROM pairs re
         ${profileCheckJoin}
         LEFT JOIN relationship_profiles rp
           ON rp.guild_id = re.guild_id AND rp.user_a = re.user_a AND rp.user_b = re.user_b
@@ -1555,8 +1708,9 @@ export class ReconciliationSync {
           AND re.user_a = ANY(cs.participants)
           AND re.user_b = ANY(cs.participants)
           AND cs.status = 'finalized'
-        WHERE re.guild_id = $1 AND re.total >= $2
-          AND rp.guild_id IS NULL
+          AND cs.ai_processing_status = 'completed'
+          AND cs.summary IS NOT NULL
+        WHERE rp.guild_id IS NULL
         GROUP BY re.guild_id, re.user_a, re.user_b, re.total
         HAVING COUNT(DISTINCT cs.id) >= 3
         ORDER BY re.total DESC
@@ -1738,6 +1892,7 @@ export class ReconciliationSync {
     await this.compactSegments();
     await this.updateRollingWindows();
     await this.consolidateOverlappingSegments();
+    await this.reconcileConversationEnrichmentBacklog();
   }
 
   /**

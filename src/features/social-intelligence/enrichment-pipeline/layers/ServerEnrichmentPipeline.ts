@@ -7,7 +7,8 @@
  * - Enriched relationship profiles
  * - Community structure analysis (optional, Phase 5)
  *
- * New implementation.
+ * Throws on real failures so the enrichment queue records and retries them; returns false
+ * for legitimate skips (no recent conversations, nothing new, over budget).
  */
 
 import type { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
@@ -21,6 +22,33 @@ import {
 	type EnrichmentHistory,
 } from "../utils/IncrementalEnrichment";
 
+interface TopConversationRow {
+	id: string;
+	summary: string;
+	participants: string[];
+	message_count: number;
+	start_time: Date;
+	keywords: { terms?: Array<{ word?: string } | string> } | string[] | null;
+}
+
+interface RelationshipSummaryRow {
+	user_a: string;
+	user_b: string;
+	summary: string | null;
+	relationship_type: string | null;
+}
+
+interface TopicEntry {
+	topic: string;
+	frequency: number;
+	trend: "up" | "stable" | "down";
+}
+
+/** Re-enrich an already summarized guild at least this often, even without new relationships */
+const REFRESH_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+/** New enriched relationships needed to refresh sooner than REFRESH_INTERVAL_MS */
+const MIN_NEW_RELATIONSHIPS = 10;
+
 export class ServerEnrichmentPipeline {
 	private db: PostgreSQLManager;
 	private aiEngine: AIEngine;
@@ -33,9 +61,11 @@ export class ServerEnrichmentPipeline {
 	}
 
 	/**
-	 * Enrich guild summary
+	 * Enrich guild summary.
+	 * Returns true when guild_metadata was written, false when skipped (no recent
+	 * conversations, nothing new, over budget). Throws on failure so the queue retries.
 	 */
-	async enrichGuild(guildId: string): Promise<void> {
+	async enrichGuild(guildId: string): Promise<boolean> {
 		try {
 			// Aggregate top conversations (last 7 days)
 			const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
@@ -63,29 +93,28 @@ export class ServerEnrichmentPipeline {
 				`,
 				[guildId, sevenDaysAgo],
 			);
-
-			if (
-				!topConversationsResult.success ||
-				!topConversationsResult.data ||
-				topConversationsResult.data.length === 0
-			) {
-				console.log(`   ℹ️  No recent conversations found for guild ${guildId}`);
-				return;
+			if (!topConversationsResult.success) {
+				throw new Error(`failed to read conversations: ${topConversationsResult.error}`);
 			}
 
-			const topConversations = topConversationsResult.data;
+			const topConversations: TopConversationRow[] = topConversationsResult.data ?? [];
+			if (topConversations.length === 0) {
+				console.log(`   ℹ️  No recent conversations found for guild ${guildId}`);
+				return false;
+			}
 
 			// Extract top topics from conversation keywords (weighted by recency)
 			const topTopics = this.extractTopTopics(topConversations);
 
-			// Query enriched relationship profiles
+			// Enriched relationship profiles: newest 15 for context, true count for gating
 			const relationshipsResult = await this.db.query(
 				`
 				SELECT 
 					user_a,
 					user_b,
-					relationship_summary,
-					relationship_type
+					summary,
+					relationship_type,
+					COUNT(*) OVER () AS total_count
 				FROM relationship_profiles
 				WHERE guild_id = $1
 				AND last_enriched_at IS NOT NULL
@@ -94,76 +123,63 @@ export class ServerEnrichmentPipeline {
 				`,
 				[guildId],
 			);
-
-			const topRelationships =
-				relationshipsResult.success && relationshipsResult.data
-					? relationshipsResult.data
-					: [];
-
-			// Estimate cost and check budget
-			const costEstimate = this.rateLimiter.estimateGuildCost(
-				topConversations.length,
-			);
-			const canAfford = await this.rateLimiter.canAffordEnrichment(
-				costEstimate.estimatedCost,
-			);
-
-			if (!canAfford.canAfford) {
-				console.warn(
-					`⚠️  Cannot afford guild enrichment: ${canAfford.reason}`,
-				);
-				return;
+			if (!relationshipsResult.success) {
+				throw new Error(`failed to read relationships: ${relationshipsResult.error}`);
 			}
+			const topRelationships: RelationshipSummaryRow[] = relationshipsResult.data ?? [];
+			const currentRelationshipCount = Number(relationshipsResult.data?.[0]?.total_count ?? 0);
 
-			// Get existing guild summary
-			const existingSummaryResult = await this.db.query(
+			// Existing guild summary
+			const existingResult = await this.db.query(
 				`
-				SELECT 
-					guild_summary,
-					enrichment_history,
-					last_enriched_relationship_count
+				SELECT summary, enrichment_history, last_enriched_relationship_count, last_enriched_at
 				FROM guild_metadata
 				WHERE guild_id = $1
 				`,
 				[guildId],
 			);
+			if (!existingResult.success) {
+				throw new Error(`failed to read guild metadata: ${existingResult.error}`);
+			}
+			const existing = existingResult.data?.[0] ?? null;
+			const hasExistingSummary = Boolean(existing?.summary?.trim());
 
-			const existingSummary =
-				existingSummaryResult.success &&
-				existingSummaryResult.data &&
-				existingSummaryResult.data.length > 0
-					? existingSummaryResult.data[0]
-					: null;
+			if (hasExistingSummary) {
+				const newRelationships =
+					currentRelationshipCount - (existing?.last_enriched_relationship_count ?? 0);
+				const lastEnrichedAt = existing?.last_enriched_at
+					? new Date(existing.last_enriched_at).getTime()
+					: 0;
+				const stale = Date.now() - lastEnrichedAt >= REFRESH_INTERVAL_MS;
+				if (newRelationships < MIN_NEW_RELATIONSHIPS && !stale) {
+					console.log(
+						`   ℹ️  Guild ${guildId} summary is fresh (${Math.max(0, newRelationships)} new relationships), skipping`,
+					);
+					return false;
+				}
+			}
 
-			// Check if we need delta or initial summary
-			const currentRelationshipCount = topRelationships.length;
-			const lastEnrichedRelationshipCount =
-				existingSummary?.last_enriched_relationship_count || 0;
-			const needsDelta =
-				existingSummary &&
-				currentRelationshipCount - lastEnrichedRelationshipCount >= 10;
+			// Estimate cost and check budget
+			const costEstimate = this.rateLimiter.estimateGuildCost(topConversations.length);
+			const canAfford = await this.rateLimiter.canAffordEnrichment(
+				costEstimate.estimatedCost,
+			);
+			if (!canAfford.canAfford) {
+				console.warn(`⚠️  Cannot afford guild enrichment: ${canAfford.reason}`);
+				return false;
+			}
 
-			let guildSummary: string;
-			let enrichmentHistory: EnrichmentHistory | null = null;
+			let enrichmentHistory: EnrichmentHistory;
 
-			if (existingSummary && needsDelta) {
-				// Generate delta using IncrementalEnrichment
-				const existingHistoryJson = existingSummary.enrichment_history;
-				const existingHistory = existingHistoryJson
-					? IncrementalEnrichment.parseHistory(existingHistoryJson)
-					: null;
-
+			if (hasExistingSummary) {
+				const existingHistory = IncrementalEnrichment.parseHistory(existing?.enrichment_history);
+				// Fall back to the stored summary as base when no usable history exists
 				const baseSummary = existingHistory
 					? IncrementalEnrichment.getCompositeSummary(existingHistory)
-					: existingSummary.guild_summary || "No previous guild summary.";
+					: (existing?.summary ?? "");
 
 				const contextRange = IncrementalEnrichment.timeContextRange(7);
-
-				const newContext = this.buildGuildContext(
-					topTopics,
-					topRelationships,
-					[],
-				);
+				const newContext = this.buildGuildContext(topTopics, topRelationships, []);
 
 				const deltaPrompt = IncrementalEnrichment.createDeltaPrompt(
 					"guild",
@@ -171,84 +187,89 @@ export class ServerEnrichmentPipeline {
 					newContext,
 					contextRange,
 				);
+				const delta = await this.generate(deltaPrompt, guildId, 400);
 
-				const delta = await this.generateDelta(deltaPrompt, guildId);
-				if (!delta) {
-					console.warn(`⚠️  Failed to generate guild delta`);
-					return;
-				}
-
-				const confidence = 0.85;
-				if (existingHistory) {
-					enrichmentHistory = IncrementalEnrichment.appendDelta(
-						existingHistory,
-						contextRange,
-						delta,
-						confidence,
-					);
-				} else {
-					const initialHistory = IncrementalEnrichment.createHistory(baseSummary);
-					enrichmentHistory = IncrementalEnrichment.appendDelta(
-						initialHistory,
-						contextRange,
-						delta,
-						confidence,
-					);
-				}
-
-				guildSummary = IncrementalEnrichment.getCompositeSummary(
-					enrichmentHistory,
+				enrichmentHistory = IncrementalEnrichment.appendDelta(
+					existingHistory ?? IncrementalEnrichment.createHistory(baseSummary),
+					contextRange,
+					delta,
+					0.85,
 				);
 			} else {
-				// Generate initial guild summary
-				guildSummary = await this.generateInitialSummary(
+				const initialSummary = await this.generateInitialSummary(
 					topTopics,
 					topRelationships,
 					[],
 					guildId,
 				);
-
-				if (!guildSummary) {
-					console.warn(`⚠️  Failed to generate initial guild summary`);
-					return;
-				}
-
-				enrichmentHistory = IncrementalEnrichment.createHistory(guildSummary);
+				enrichmentHistory = IncrementalEnrichment.createHistory(initialSummary);
 			}
 
-			// Update guild_metadata
-			await this.db.query(
-				`
-				UPDATE guild_metadata
-				SET 
-					guild_summary = $2,
-					enrichment_history = $3::jsonb,
-					last_enriched_relationship_count = $4,
-					last_enriched_at = NOW()
-				WHERE guild_id = $1
-				`,
-				[guildId, guildSummary, JSON.stringify(enrichmentHistory), currentRelationshipCount],
-			);
+			// Consolidate accumulated deltas into a fresh base summary when needed
+			if (IncrementalEnrichment.needsConsolidation(enrichmentHistory)) {
+				const consolidationPrompt = IncrementalEnrichment.createConsolidationPrompt(
+					"guild",
+					enrichmentHistory,
+				);
+				const consolidated = await this.generate(consolidationPrompt, guildId, 500);
+				enrichmentHistory = IncrementalEnrichment.consolidate(consolidated);
+			}
 
-			// Track cost
+			const guildSummary = IncrementalEnrichment.getCompositeSummary(enrichmentHistory);
+
+			// Upsert so a missing guild_metadata row cannot silently swallow the result
+			const saveResult = await this.db.query(
+				`
+				INSERT INTO guild_metadata (
+					guild_id, summary, enrichment_history, top_topics,
+					last_enriched_relationship_count, last_enriched_at, enrichment_error
+				)
+				VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, NOW(), NULL)
+				ON CONFLICT (guild_id)
+				DO UPDATE SET
+					summary = EXCLUDED.summary,
+					enrichment_history = EXCLUDED.enrichment_history,
+					top_topics = EXCLUDED.top_topics,
+					last_enriched_relationship_count = EXCLUDED.last_enriched_relationship_count,
+					last_enriched_at = NOW(),
+					enrichment_error = NULL,
+					enrichment_version = guild_metadata.enrichment_version + 1,
+					updated_at = NOW()
+				RETURNING enrichment_version
+				`,
+				[
+					guildId,
+					guildSummary,
+					JSON.stringify(enrichmentHistory),
+					JSON.stringify(topTopics),
+					currentRelationshipCount,
+				],
+			);
+			if (!saveResult.success) {
+				throw new Error(`failed to save guild metadata: ${saveResult.error}`);
+			}
+			if (!saveResult.data?.length) {
+				throw new Error("guild metadata upsert returned no row");
+			}
+
 			await this.rateLimiter.trackCost(costEstimate.estimatedCost, "guild");
 
 			console.log(
-				`🔹 Enriched guild ${guildId} (${topConversations.length} conversations, ${topRelationships.length} relationships)`,
+				`🔹 Enriched guild ${guildId} (${topConversations.length} conversations, ${currentRelationshipCount} relationships)`,
 			);
+			return true;
 		} catch (error) {
-			console.error(`❌ Error enriching guild ${guildId}:`, error);
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Guild enrichment failed for ${guildId}: ${message}`, {
+				cause: error,
+			});
 		}
 	}
 
 	/**
 	 * Extract top topics from conversations (weighted by recency)
 	 */
-	private extractTopTopics(conversations: any[]): Array<{
-		topic: string;
-		frequency: number;
-		trend: "up" | "stable" | "down";
-	}> {
+	private extractTopTopics(conversations: TopConversationRow[]): TopicEntry[] {
 		const topicCounts = new Map<string, number>();
 		const now = Date.now();
 
@@ -260,11 +281,9 @@ export class ServerEnrichmentPipeline {
 			const age = now - new Date(conv.start_time).getTime();
 			const recencyWeight = Math.max(0.5, 1 - age / (7 * 24 * 60 * 60 * 1000));
 
-			const keywordArray = Array.isArray(keywords)
+			const keywordArray: Array<string | undefined> = Array.isArray(keywords)
 				? keywords
-				: keywords.terms
-					? keywords.terms.map((t: any) => t.word || t)
-					: [];
+				: (keywords.terms ?? []).map((t) => (typeof t === "string" ? t : t.word));
 
 			for (const keyword of keywordArray) {
 				if (typeof keyword === "string" && keyword.length >= 3) {
@@ -292,9 +311,9 @@ export class ServerEnrichmentPipeline {
 	 * Build guild context string for prompts
 	 */
 	private buildGuildContext(
-		topTopics: Array<{ topic: string; frequency: number; trend: string }>,
-		topRelationships: any[],
-		clusters: any[],
+		topTopics: TopicEntry[],
+		topRelationships: RelationshipSummaryRow[],
+		clusters: Array<{ id: string; members: string[]; description?: string }>,
 	): string {
 		let context = "";
 
@@ -311,7 +330,7 @@ export class ServerEnrichmentPipeline {
 			context += topRelationships
 				.map(
 					(r) =>
-						`- ${r.user_a.slice(0, 8)} & ${r.user_b.slice(0, 8)}: ${r.relationship_summary || "No summary"}`,
+						`- ${r.user_a.slice(0, 8)} & ${r.user_b.slice(0, 8)}: ${r.summary || "No summary"}`,
 				)
 				.join("\n");
 			context += "\n\n";
@@ -334,11 +353,11 @@ export class ServerEnrichmentPipeline {
 	 * Generate initial guild summary using LLM
 	 */
 	private async generateInitialSummary(
-		topTopics: Array<{ topic: string; frequency: number; trend: string }>,
-		topRelationships: any[],
-		clusters: any[],
+		topTopics: TopicEntry[],
+		topRelationships: RelationshipSummaryRow[],
+		clusters: Array<{ id: string; members: string[]; description?: string }>,
 		guildId: string,
-	): Promise<string | null> {
+	): Promise<string> {
 		const context = this.buildGuildContext(topTopics, topRelationships, clusters);
 
 		const prompt = `Summarize this Discord server based on recent activity and community structure.
@@ -349,13 +368,13 @@ ${context}
 
 **Guild Summary**:`;
 
-		return await this.generateDelta(prompt, guildId);
+		return await this.generate(prompt, guildId, 400);
 	}
 
 	/**
-	 * Generate delta using LLM
+	 * Generate text with the LLM. Throws if generation fails or returns nothing.
 	 */
-	private async generateDelta(prompt: string, guildId: string): Promise<string | null> {
+	private async generate(prompt: string, guildId: string, maxTokens: number): Promise<string> {
 		let provider = "grok";
 		if (!process.env.GROK_API_KEY) {
 			if (process.env.OLLAMA_URL) {
@@ -363,30 +382,26 @@ ${context}
 			}
 		}
 
-		try {
-			const builder = new AIRequestBuilder(this.aiEngine);
-			const ctx = new AIContextBuilder()
-				.user("system-enricher")
-				.guild(guildId)
-				.build();
-			const result = await builder
-				.chat()
-				.blocking()
-				.withContext(ctx)
-				.provider(provider as "grok" | "ollama")
-				.persona("casual")
-				.withoutTools()
-				.generate(prompt);
+		const builder = new AIRequestBuilder(this.aiEngine);
+		const ctx = new AIContextBuilder()
+			.user("system-enricher")
+			.guild(guildId)
+			.build();
+		// Structured mode: the chat preset caps output at 60 tokens, truncating summaries
+		const result = await builder
+			.blocking()
+			.mode("structured")
+			.maxTokens(maxTokens)
+			.withContext(ctx)
+			.provider(provider as "grok" | "ollama")
+			.persona("casual")
+			.withoutTools()
+			.generate(prompt);
 
-			const response = result as AIResponse;
-			if (response.success && response.content) {
-				return response.content.trim();
-			}
-		} catch (error) {
-			console.error(`❌ Failed to generate guild summary: ${error}`);
+		const response = result as AIResponse;
+		if (!response.success || !response.content?.trim()) {
+			throw new Error(`LLM generation failed: ${response.error ?? "empty response"}`);
 		}
-
-		return null;
+		return response.content.trim();
 	}
 }
-

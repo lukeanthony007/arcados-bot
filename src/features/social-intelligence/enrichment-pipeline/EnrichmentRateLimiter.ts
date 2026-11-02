@@ -10,7 +10,11 @@
  * when budgets are exceeded.
  */
 
-import type { AIProvider } from "../../../ai/providers/base/BaseAIProvider";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+
+/** Budget state survives restarts so a crash-looping bot cannot spend the daily cap repeatedly */
+const STATS_FILE = resolve(process.cwd(), ".cache", "enrichment-budget.json");
 
 interface RateLimitConfig {
 	dailyCap: number; // USD
@@ -24,7 +28,7 @@ interface CostEstimate {
 	estimatedCost: number;
 }
 
-interface UsageStats {
+export interface UsageStats {
 	dailyCost: number;
 	monthlyCost: number;
 	dailyResetTime: Date;
@@ -282,13 +286,10 @@ export class EnrichmentRateLimiter {
 	}
 
 	/**
-	 * Load stats from persistent storage (could use Redis, file, or DB)
-	 * For now, using in-memory with file persistence
+	 * Load stats from the JSON file, or start fresh when absent/corrupt/expired
 	 */
 	private loadStats(): UsageStats {
-		// TODO: Load from file or database
-		// For now, initialize fresh
-		return {
+		const fresh: UsageStats = {
 			dailyCost: 0,
 			monthlyCost: 0,
 			dailyResetTime: this.getNextMidnight(),
@@ -296,21 +297,64 @@ export class EnrichmentRateLimiter {
 			enrichmentsToday: 0,
 			enrichmentsMonth: 0,
 		};
+
+		try {
+			if (!existsSync(STATS_FILE)) return fresh;
+			const raw: unknown = JSON.parse(readFileSync(STATS_FILE, "utf8"));
+			if (typeof raw !== "object" || raw === null) return fresh;
+			const data = raw as Record<string, unknown>;
+			const dailyResetTime = new Date(String(data.dailyResetTime));
+			const monthlyResetTime = new Date(String(data.monthlyResetTime));
+			if (
+				typeof data.dailyCost !== "number" ||
+				typeof data.monthlyCost !== "number" ||
+				typeof data.enrichmentsToday !== "number" ||
+				typeof data.enrichmentsMonth !== "number" ||
+				Number.isNaN(dailyResetTime.getTime()) ||
+				Number.isNaN(monthlyResetTime.getTime())
+			) {
+				return fresh;
+			}
+			// resetIfNeeded() zeroes any period that has already elapsed
+			return {
+				dailyCost: data.dailyCost,
+				monthlyCost: data.monthlyCost,
+				dailyResetTime,
+				monthlyResetTime,
+				enrichmentsToday: data.enrichmentsToday,
+				enrichmentsMonth: data.enrichmentsMonth,
+			};
+		} catch (error) {
+			console.warn(`⚠️  Could not load enrichment budget state, starting fresh: ${error}`);
+			return fresh;
+		}
 	}
 
 	/**
-	 * Save stats to persistent storage
+	 * Persist stats to the JSON file
 	 */
 	private saveStats() {
-		// TODO: Persist to file or database
-		// For now, stats are in-memory only
+		try {
+			mkdirSync(dirname(STATS_FILE), { recursive: true });
+			writeFileSync(STATS_FILE, JSON.stringify(this.stats));
+		} catch (error) {
+			console.warn(`⚠️  Could not persist enrichment budget state: ${error}`);
+		}
 	}
 
 	/**
 	 * Force reset all counters (for testing)
 	 */
 	public resetAll() {
-		this.stats = this.loadStats();
+		this.stats = {
+			dailyCost: 0,
+			monthlyCost: 0,
+			dailyResetTime: this.getNextMidnight(),
+			monthlyResetTime: this.getNextMonthStart(),
+			enrichmentsToday: 0,
+			enrichmentsMonth: 0,
+		};
+		this.saveStats();
 		console.log("🔄 All enrichment budgets forcefully reset");
 	}
 }

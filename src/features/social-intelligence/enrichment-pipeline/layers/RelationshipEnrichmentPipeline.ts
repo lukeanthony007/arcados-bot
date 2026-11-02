@@ -6,7 +6,8 @@
  * - User profile updates (cascade trigger)
  * - Interaction metrics
  *
- * New implementation (no existing code to refactor).
+ * Throws on real failures so the enrichment queue records and retries them; returns false
+ * for legitimate skips (not enough shared conversations, nothing new, over budget).
  */
 
 import type { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
@@ -20,6 +21,28 @@ import {
 	type EnrichmentHistory,
 } from "../utils/IncrementalEnrichment";
 
+interface SharedConversationRow {
+	id: string;
+	summary: string;
+	keywords: { terms?: Array<{ word?: string; score?: number }> } | null;
+}
+
+interface InteractionMetrics {
+	total: number;
+	msg_a_to_b: number;
+	msg_b_to_a: number;
+	mentions: number;
+	replies: number;
+}
+
+interface UserProfileRow {
+	summary: string | null;
+	profile_version: number | null;
+}
+
+/** Minimum shared conversations before a relationship profile is created or updated */
+const MIN_SHARED_CONVERSATIONS = 3;
+
 export class RelationshipEnrichmentPipeline {
 	private db: PostgreSQLManager;
 	private aiEngine: AIEngine;
@@ -32,28 +55,80 @@ export class RelationshipEnrichmentPipeline {
 	}
 
 	/**
-	 * Normalize user pair (ensure userA < userB lexicographically)
+	 * Normalize user pair (ensure userA < userB; matches the check_user_order constraint)
 	 */
 	private normalizeUserPair(userA: string, userB: string): [string, string] {
 		return userA < userB ? [userA, userB] : [userB, userA];
 	}
 
 	/**
-	 * Enrich relationship between two users
+	 * Enrich relationship between two users.
+	 * Returns true when the profile was written, false when skipped (not enough shared
+	 * conversations, nothing new since the last run, over budget).
+	 * Throws on failure so the enrichment queue records and retries it.
 	 */
 	async enrichRelationship(
 		userA: string,
 		userB: string,
 		guildId: string,
-	): Promise<void> {
+	): Promise<boolean> {
 		try {
-			// Normalize user pair
 			const [normalizedA, normalizedB] = this.normalizeUserPair(userA, userB);
 
-			// Query shared conversations
-			const sharedConversationsResult = await this.db.query(
+			// Shared finalized + summarized conversations: true count, plus the 20 newest for context
+			const countResult = await this.db.query(
 				`
-				SELECT cs.id, cs.summary, cs.participants, cs.message_count, cs.start_time, cs.end_time
+				SELECT COUNT(DISTINCT cs.id) AS count
+				FROM conversation_segments cs
+				WHERE cs.guild_id = $1
+				AND $2 = ANY(cs.participants)
+				AND $3 = ANY(cs.participants)
+				AND cs.status = 'finalized'
+				AND cs.ai_processing_status = 'completed'
+				AND cs.summary IS NOT NULL
+				`,
+				[guildId, normalizedA, normalizedB],
+			);
+			if (!countResult.success) {
+				throw new Error(`failed to count shared conversations: ${countResult.error}`);
+			}
+			const currentSharedCount = Number(countResult.data?.[0]?.count ?? 0);
+
+			if (currentSharedCount < MIN_SHARED_CONVERSATIONS) {
+				console.log(
+					`   ℹ️  Only ${currentSharedCount} shared conversations (need ${MIN_SHARED_CONVERSATIONS}+) for ${normalizedA.slice(0, 8)} & ${normalizedB.slice(0, 8)}`,
+				);
+				return false;
+			}
+
+			// Existing relationship profile (if any)
+			const existingProfileResult = await this.db.query(
+				`
+				SELECT summary, enrichment_history, last_enriched_conversation_count
+				FROM relationship_profiles
+				WHERE guild_id = $1 AND user_a = $2 AND user_b = $3
+				`,
+				[guildId, normalizedA, normalizedB],
+			);
+			if (!existingProfileResult.success) {
+				throw new Error(`failed to read relationship profile: ${existingProfileResult.error}`);
+			}
+			const existingProfile = existingProfileResult.data?.[0] ?? null;
+			const lastEnrichedCount: number = existingProfile?.last_enriched_conversation_count ?? 0;
+			const hasExistingSummary = Boolean(existingProfile?.summary?.trim());
+			const newSharedCount = currentSharedCount - lastEnrichedCount;
+
+			// Already enriched: only continue when enough new shared conversations exist
+			if (hasExistingSummary && newSharedCount < MIN_SHARED_CONVERSATIONS) {
+				console.log(
+					`   ℹ️  Only ${Math.max(0, newSharedCount)} new shared conversations (need ${MIN_SHARED_CONVERSATIONS}+) for ${normalizedA.slice(0, 8)} & ${normalizedB.slice(0, 8)}`,
+				);
+				return false;
+			}
+
+			const sharedResult = await this.db.query(
+				`
+				SELECT cs.id, cs.summary, cs.features->'keywords' AS keywords
 				FROM conversation_segments cs
 				WHERE cs.guild_id = $1
 				AND $2 = ANY(cs.participants)
@@ -66,79 +141,28 @@ export class RelationshipEnrichmentPipeline {
 				`,
 				[guildId, normalizedA, normalizedB],
 			);
-
-			if (
-				!sharedConversationsResult.success ||
-				!sharedConversationsResult.data ||
-				sharedConversationsResult.data.length === 0
-			) {
-				console.log(
-					`   ℹ️  No shared conversations found for ${normalizedA.slice(0, 8)} & ${normalizedB.slice(0, 8)}`,
-				);
-				return;
+			if (!sharedResult.success || !sharedResult.data) {
+				throw new Error(`failed to read shared conversations: ${sharedResult.error}`);
 			}
+			const sharedConversations: SharedConversationRow[] = sharedResult.data;
 
-			const sharedConversations = sharedConversationsResult.data;
-			const currentSharedCount = sharedConversations.length;
-
-			// Get user profiles
-			const userAProfileResult = await this.db.getUserProfile(normalizedA, guildId);
-			const userBProfileResult = await this.db.getUserProfile(normalizedB, guildId);
-
-			if (!userAProfileResult.success || !userBProfileResult.success) {
-				console.warn(
-					`⚠️  Failed to get user profiles for relationship enrichment`,
-				);
-				return;
+			// User profiles (summary + version)
+			const profileResult = await this.db.query(
+				`
+				SELECT user_id, summary, profile_version
+				FROM user_profiles
+				WHERE guild_id = $1 AND user_id = ANY($2::text[])
+				`,
+				[guildId, [normalizedA, normalizedB]],
+			);
+			if (!profileResult.success) {
+				throw new Error(`failed to read user profiles: ${profileResult.error}`);
 			}
+			const profileRows: Array<UserProfileRow & { user_id: string }> = profileResult.data ?? [];
+			const userAProfile = profileRows.find((r) => r.user_id === normalizedA) ?? null;
+			const userBProfile = profileRows.find((r) => r.user_id === normalizedB) ?? null;
 
-			const userAProfile = userAProfileResult.data;
-			const userBProfile = userBProfileResult.data;
-
-			// Query interaction metrics from relationship_edges
-			const edgesResult = await this.db.query(
-				`
-				SELECT total, msg_a_to_b, msg_b_to_a, mentions, replies
-				FROM relationship_edges
-				WHERE guild_id = $1
-				AND user_a = $2
-				AND user_b = $3
-				`,
-				[guildId, normalizedA, normalizedB],
-			);
-
-			const edges =
-				edgesResult.success && edgesResult.data && edgesResult.data.length > 0
-					? edgesResult.data[0]
-					: {
-							total: 0,
-							msg_a_to_b: 0,
-							msg_b_to_a: 0,
-							mentions: 0,
-							replies: 0,
-						};
-
-			// Check if relationship profile exists
-			const existingProfileResult = await this.db.query(
-				`
-				SELECT 
-					relationship_summary,
-					enrichment_history,
-					user_a_profile_version,
-					user_b_profile_version,
-					last_enriched_conversation_count
-				FROM relationship_profiles
-				WHERE guild_id = $1 AND user_a = $2 AND user_b = $3
-				`,
-				[guildId, normalizedA, normalizedB],
-			);
-
-			const existingProfile =
-				existingProfileResult.success &&
-				existingProfileResult.data &&
-				existingProfileResult.data.length > 0
-					? existingProfileResult.data[0]
-					: null;
+			const edges = await this.getInteractionMetrics(guildId, normalizedA, normalizedB);
 
 			// Estimate cost and check budget
 			const costEstimate = this.rateLimiter.estimateRelationshipCost(
@@ -147,45 +171,30 @@ export class RelationshipEnrichmentPipeline {
 			const canAfford = await this.rateLimiter.canAffordEnrichment(
 				costEstimate.estimatedCost,
 			);
-
 			if (!canAfford.canAfford) {
-				console.warn(
-					`⚠️  Cannot afford relationship enrichment: ${canAfford.reason}`,
-				);
-				return;
+				console.warn(`⚠️  Cannot afford relationship enrichment: ${canAfford.reason}`);
+				return false;
 			}
 
-			// Check if we need to generate delta or initial summary
-			const needsDelta =
-				existingProfile &&
-				existingProfile.last_enriched_conversation_count &&
-				currentSharedCount - existingProfile.last_enriched_conversation_count >= 3;
+			let enrichmentHistory: EnrichmentHistory;
 
-			let relationshipSummary: string;
-			let enrichmentHistory: EnrichmentHistory | null = null;
-
-			if (existingProfile && needsDelta) {
-				// Generate delta using IncrementalEnrichment
-				const existingHistoryJson = existingProfile.enrichment_history;
-				const existingHistory = existingHistoryJson
-					? IncrementalEnrichment.parseHistory(existingHistoryJson)
-					: null;
-
+			if (hasExistingSummary) {
+				const existingHistory = IncrementalEnrichment.parseHistory(
+					existingProfile?.enrichment_history,
+				);
+				// Fall back to the stored summary as base when no usable history exists
 				const baseSummary = existingHistory
 					? IncrementalEnrichment.getCompositeSummary(existingHistory)
-					: existingProfile.relationship_summary || "No previous relationship data.";
+					: (existingProfile?.summary ?? "");
 
-				const newConversations = sharedConversations.slice(
-					0,
-					currentSharedCount - existingProfile.last_enriched_conversation_count,
-				);
+				const newConversations = sharedConversations.slice(0, newSharedCount);
 				const conversationSummaries = newConversations
-					.map((c: any) => c.summary)
+					.map((c) => c.summary)
 					.filter(Boolean)
 					.join("\n\n");
 
 				const contextRange = IncrementalEnrichment.relationshipContextRange(
-					existingProfile.last_enriched_conversation_count,
+					lastEnrichedCount,
 					currentSharedCount,
 				);
 
@@ -195,90 +204,76 @@ export class RelationshipEnrichmentPipeline {
 					conversationSummaries,
 					contextRange,
 				);
+				const delta = await this.generate(deltaPrompt, guildId, 400);
 
-				const delta = await this.generateDelta(deltaPrompt, guildId);
-				if (!delta) {
-					console.warn(`⚠️  Failed to generate relationship delta`);
-					return;
-				}
-
-				const confidence = 0.8;
-				if (existingHistory) {
-					enrichmentHistory = IncrementalEnrichment.appendDelta(
-						existingHistory,
-						contextRange,
-						delta,
-						confidence,
-					);
-				} else {
-					const initialHistory = IncrementalEnrichment.createHistory(baseSummary);
-					enrichmentHistory = IncrementalEnrichment.appendDelta(
-						initialHistory,
-						contextRange,
-						delta,
-						confidence,
-					);
-				}
-
-				relationshipSummary = IncrementalEnrichment.getCompositeSummary(
-					enrichmentHistory,
+				enrichmentHistory = IncrementalEnrichment.appendDelta(
+					existingHistory ?? IncrementalEnrichment.createHistory(baseSummary),
+					contextRange,
+					delta,
+					0.8,
 				);
 			} else {
-				// Generate initial relationship summary
-				relationshipSummary = await this.generateInitialSummary(
-					userAProfile,
-					userBProfile,
+				const initialSummary = await this.generateInitialSummary(
+					userAProfile?.summary ?? null,
+					userBProfile?.summary ?? null,
 					sharedConversations,
+					currentSharedCount,
 					edges,
 					guildId,
 				);
-
-				if (!relationshipSummary) {
-					console.warn(`⚠️  Failed to generate initial relationship summary`);
-					return;
-				}
-
-				enrichmentHistory = IncrementalEnrichment.createHistory(relationshipSummary);
+				enrichmentHistory = IncrementalEnrichment.createHistory(initialSummary);
 			}
 
-			// Extract shared keywords (simplified - from conversation summaries)
-			const sharedKeywords = this.extractSharedKeywords(sharedConversations);
+			// Consolidate accumulated deltas into a fresh base summary when needed
+			if (IncrementalEnrichment.needsConsolidation(enrichmentHistory)) {
+				const consolidationPrompt = IncrementalEnrichment.createConsolidationPrompt(
+					"relationship",
+					enrichmentHistory,
+				);
+				const consolidated = await this.generate(consolidationPrompt, guildId, 500);
+				enrichmentHistory = IncrementalEnrichment.consolidate(consolidated);
+			}
 
-			// Classify relationship type (optional - can be enhanced with LLM)
-			const relationshipType = this.classifyRelationshipType(
-				edges,
-				sharedConversations.length,
-			);
+			const relationshipSummary = IncrementalEnrichment.getCompositeSummary(enrichmentHistory);
+			const keywords = this.extractSharedKeywords(sharedConversations);
+			const relationshipType = this.classifyRelationshipType(edges, currentSharedCount);
+			const confidence = IncrementalEnrichment.getAverageConfidence(enrichmentHistory);
 
-			// Get current user profile versions
-			const userAProfileVersion = userAProfile?.profile_version || 0;
-			const userBProfileVersion = userBProfile?.profile_version || 0;
-
-			// Upsert relationship profile
-			await this.db.query(
+			// Upsert relationship profile (columns match the live relationship_profiles table)
+			const upsertResult = await this.db.query(
 				`
 				INSERT INTO relationship_profiles (
 					guild_id, user_a, user_b,
-					relationship_summary,
+					summary,
 					enrichment_history,
 					relationship_type,
-					shared_keywords,
+					keywords,
+					shared_conversations,
+					recent_conversation_ids,
 					user_a_profile_version,
 					user_b_profile_version,
 					last_enriched_conversation_count,
+					enrichment_confidence,
+					enrichment_error,
 					last_enriched_at
 				)
-				VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, NOW())
+				VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $8, $12, NULL, NOW())
 				ON CONFLICT (guild_id, user_a, user_b)
 				DO UPDATE SET
-					relationship_summary = $4,
-					enrichment_history = $5::jsonb,
-					relationship_type = $6,
-					shared_keywords = $7,
-					user_a_profile_version = $8,
-					user_b_profile_version = $9,
-					last_enriched_conversation_count = $10,
+					summary = EXCLUDED.summary,
+					enrichment_history = EXCLUDED.enrichment_history,
+					relationship_type = EXCLUDED.relationship_type,
+					keywords = EXCLUDED.keywords,
+					shared_conversations = EXCLUDED.shared_conversations,
+					recent_conversation_ids = EXCLUDED.recent_conversation_ids,
+					user_a_profile_version = EXCLUDED.user_a_profile_version,
+					user_b_profile_version = EXCLUDED.user_b_profile_version,
+					last_enriched_conversation_count = EXCLUDED.last_enriched_conversation_count,
+					enrichment_confidence = EXCLUDED.enrichment_confidence,
+					enrichment_error = NULL,
+					enrichment_version = relationship_profiles.enrichment_version + 1,
 					last_enriched_at = NOW()
+				RETURNING enrichment_version
 				`,
 				[
 					guildId,
@@ -287,54 +282,97 @@ export class RelationshipEnrichmentPipeline {
 					relationshipSummary,
 					JSON.stringify(enrichmentHistory),
 					relationshipType,
-					sharedKeywords,
-					userAProfileVersion,
-					userBProfileVersion,
+					keywords,
 					currentSharedCount,
+					sharedConversations.map((c) => c.id),
+					userAProfile?.profile_version ?? 0,
+					userBProfile?.profile_version ?? 0,
+					confidence,
 				],
 			);
+			if (!upsertResult.success) {
+				throw new Error(`failed to save relationship profile: ${upsertResult.error}`);
+			}
+			if (!upsertResult.data?.length) {
+				throw new Error("relationship profile upsert returned no row");
+			}
 
-			// Track cost
 			await this.rateLimiter.trackCost(costEstimate.estimatedCost, "relationship");
 
 			console.log(
 				`🔹 Enriched relationship ${normalizedA.slice(0, 8)} & ${normalizedB.slice(0, 8)} (${currentSharedCount} shared conversations)`,
 			);
+			return true;
 		} catch (error) {
-			console.error(
-				`❌ Error enriching relationship ${userA.slice(0, 8)} & ${userB.slice(0, 8)}:`,
-				error,
-			);
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Relationship enrichment failed for ${userA}:${userB}: ${message}`, {
+				cause: error,
+			});
 		}
+	}
+
+	/**
+	 * Interaction metrics for a pair, oriented A->B. relationship_edges rows are not
+	 * guaranteed to be stored in normalized order (and a pair can exist in both orders),
+	 * so aggregate both orientations.
+	 */
+	private async getInteractionMetrics(
+		guildId: string,
+		userA: string,
+		userB: string,
+	): Promise<InteractionMetrics> {
+		const result = await this.db.query(
+			`
+			SELECT
+				COALESCE(SUM(total), 0)::int AS total,
+				COALESCE(SUM(CASE WHEN user_a = $2 THEN msg_a_to_b ELSE msg_b_to_a END), 0)::int AS msg_a_to_b,
+				COALESCE(SUM(CASE WHEN user_a = $2 THEN msg_b_to_a ELSE msg_a_to_b END), 0)::int AS msg_b_to_a,
+				COALESCE(SUM(mentions), 0)::int AS mentions,
+				COALESCE(SUM(replies), 0)::int AS replies
+			FROM relationship_edges
+			WHERE guild_id = $1
+			AND ((user_a = $2 AND user_b = $3) OR (user_a = $3 AND user_b = $2))
+			`,
+			[guildId, userA, userB],
+		);
+		if (!result.success) {
+			throw new Error(`failed to read interaction metrics: ${result.error}`);
+		}
+		const row = result.data?.[0];
+		return {
+			total: row?.total ?? 0,
+			msg_a_to_b: row?.msg_a_to_b ?? 0,
+			msg_b_to_a: row?.msg_b_to_a ?? 0,
+			mentions: row?.mentions ?? 0,
+			replies: row?.replies ?? 0,
+		};
 	}
 
 	/**
 	 * Generate initial relationship summary using LLM
 	 */
 	private async generateInitialSummary(
-		userAProfile: any,
-		userBProfile: any,
-		sharedConversations: any[],
-		edges: any,
+		userASummary: string | null,
+		userBSummary: string | null,
+		sharedConversations: SharedConversationRow[],
+		sharedCount: number,
+		edges: InteractionMetrics,
 		guildId: string,
-	): Promise<string | null> {
-		const userASummary = userAProfile?.summary || "No profile data available.";
-		const userBSummary = userBProfile?.summary || "No profile data available.";
-
+	): Promise<string> {
 		const conversationSummaries = sharedConversations
-			.map((c: any) => c.summary)
+			.map((c) => c.summary)
 			.filter(Boolean)
 			.join("\n\n");
 
 		const prompt = `Analyze the relationship between these two Discord users based on their shared conversations and interaction patterns.
 
 **User A Profile**:
-${userASummary}
+${userASummary || "No profile data available."}
 
 **User B Profile**:
-${userBSummary}
+${userBSummary || "No profile data available."}
 
-**Shared Conversations (${sharedConversations.length} total)**:
+**Shared Conversations (${sharedCount} total, newest ${sharedConversations.length} shown)**:
 ${conversationSummaries}
 
 **Interaction Metrics**:
@@ -348,39 +386,33 @@ ${conversationSummaries}
 
 **Relationship Summary**:`;
 
-		return await this.generateDelta(prompt, guildId);
+		return await this.generate(prompt, guildId, 400);
 	}
 
 	/**
-	 * Extract shared keywords from conversations
+	 * Top shared keywords: sum the extractor's term scores stored on each shared conversation
 	 */
-	private extractSharedKeywords(conversations: any[]): string[] {
-		// Simplified: extract from conversation summaries
-		// In a full implementation, this could analyze conversation keywords
-		const keywords = new Set<string>();
+	private extractSharedKeywords(conversations: SharedConversationRow[]): string[] {
+		const counts = new Map<string, number>();
 
 		for (const conv of conversations) {
-			if (conv.summary) {
-				// Extract potential keywords (words that appear frequently)
-				const words = conv.summary
-					.toLowerCase()
-					.replace(/[^\w\s]/g, " ")
-					.split(/\s+/)
-					.filter((w) => w.length >= 4);
-
-				for (const word of words) {
-					keywords.add(word);
-				}
+			for (const term of conv.keywords?.terms ?? []) {
+				const word = term.word?.toLowerCase();
+				if (!word || word.length < 4) continue;
+				counts.set(word, (counts.get(word) ?? 0) + (term.score ?? 0));
 			}
 		}
 
-		return Array.from(keywords).slice(0, 10);
+		return Array.from(counts.entries())
+			.sort((a, b) => b[1] - a[1])
+			.slice(0, 10)
+			.map(([word]) => word);
 	}
 
 	/**
 	 * Classify relationship type based on interaction patterns
 	 */
-	private classifyRelationshipType(edges: any, sharedCount: number): string {
+	private classifyRelationshipType(edges: InteractionMetrics, sharedCount: number): string {
 		// Simplified classification - could be enhanced with LLM
 		if (edges.mentions > 20 || edges.replies > 30) {
 			return "close_friends";
@@ -395,9 +427,9 @@ ${conversationSummaries}
 	}
 
 	/**
-	 * Generate delta using LLM
+	 * Generate text with the LLM. Throws if generation fails or returns nothing.
 	 */
-	private async generateDelta(prompt: string, guildId: string): Promise<string | null> {
+	private async generate(prompt: string, guildId: string, maxTokens: number): Promise<string> {
 		let provider = "grok";
 		if (!process.env.GROK_API_KEY) {
 			if (process.env.OLLAMA_URL) {
@@ -405,30 +437,26 @@ ${conversationSummaries}
 			}
 		}
 
-		try {
-			const builder = new AIRequestBuilder(this.aiEngine);
-			const ctx = new AIContextBuilder()
-				.user("system-enricher")
-				.guild(guildId)
-				.build();
-			const result = await builder
-				.chat()
-				.blocking()
-				.withContext(ctx)
-				.provider(provider as "grok" | "ollama")
-				.persona("casual")
-				.withoutTools()
-				.generate(prompt);
+		const builder = new AIRequestBuilder(this.aiEngine);
+		const ctx = new AIContextBuilder()
+			.user("system-enricher")
+			.guild(guildId)
+			.build();
+		// Structured mode: the chat preset caps output at 60 tokens, truncating summaries
+		const result = await builder
+			.blocking()
+			.mode("structured")
+			.maxTokens(maxTokens)
+			.withContext(ctx)
+			.provider(provider as "grok" | "ollama")
+			.persona("casual")
+			.withoutTools()
+			.generate(prompt);
 
-			const response = result as AIResponse;
-			if (response.success && response.content) {
-				return response.content.trim();
-			}
-		} catch (error) {
-			console.error(`❌ Failed to generate relationship summary: ${error}`);
+		const response = result as AIResponse;
+		if (!response.success || !response.content?.trim()) {
+			throw new Error(`LLM generation failed: ${response.error ?? "empty response"}`);
 		}
-
-		return null;
+		return response.content.trim();
 	}
 }
-

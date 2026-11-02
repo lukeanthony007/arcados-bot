@@ -138,6 +138,14 @@ export class EnrichmentQueue {
 	}
 
 	/**
+	 * Return a dequeued-but-unprocessed job to its queue untouched (no attempt consumed)
+	 */
+	public requeue(job: EnrichmentJob) {
+		this.processing.delete(job.id);
+		this.queues.get(job.layer)?.unshift(job);
+	}
+
+	/**
 	 * Mark job as completed
 	 */
 	public complete(jobId: string) {
@@ -258,10 +266,13 @@ export class EnrichmentQueue {
 		if (parts.length < 3) {
 			return [null, "", ""];
 		}
-		const layer = Number.parseInt(parts[0]) as EnrichmentLayer;
+		const layer = Number.parseInt(parts[0] ?? "", 10);
 		const guildId = parts[parts.length - 1];
+		if (Number.isNaN(layer) || guildId === undefined) {
+			return [null, "", ""];
+		}
 		const entityId = parts.slice(1, -1).join(":");
-		return [layer, entityId, guildId];
+		return [layer as EnrichmentLayer, entityId, guildId];
 	}
 
 	/**
