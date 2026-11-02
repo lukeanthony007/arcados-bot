@@ -4,54 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Common Development Commands
 
+The runtime is Bun (`bun.lock`). There is no build step; TypeScript runs directly.
+
 ### Running the bot
-- **Development mode with auto-restart:** `npm run dev`
-- **Production start:** `npm start`
-- **Production with environment variable:** `NODE_ENV=production npm start`
-- **Debug mode with inspector:** `npm run start:debug`
+- **Start:** `npm start` (`bun run src/main.ts`)
+- **Start under Node:** `npm run start:node` (`tsx src/main.ts`)
 
 ### Code quality
-- **Lint code:** `npm run lint`
-- **Fix linting issues:** `npm run lint:fix`
-- **Format code:** `npm run format`
+- **Type-check:** `npx tsc --noEmit -p .`
+- **Lint/format:** `npx biome check <paths>` (config in package.json). Many existing files are not formatter-clean; format only files you own rather than whole directories.
+- There is no test framework; `test:*` scripts are manual smoke scripts.
 
-### Building
-- **Compile TypeScript:** `npm run build`
-- **Production build (compile + clean cache):** `npm run build:prod`
-- **Clean build artifacts:** `npm run clean`
+### Social intelligence
+- **Enrich conversations:** `npm run enrich:conversations:24h` / `:7d` / `:force`
+- **Enrich user profiles:** `npm run enrich:users:24h` / `:7d` / `:stale`
+- **Enrich relationships:** `npm run enrich:relationships:24h` / `:significant`
+- **Enrich guild summary:** `npm run enrich:guild:summary` / `enrich:guild:full`
+- **Psychological profiling:** `npm run profile:users`, `profile:users:stale`, `profile:view-user`
+- **Keywords:** `npm run keywords:build-vocabulary`, `keywords:extract-all`, `diagnose-keywords`
+- **Conversations:** `npm run view-conversations`, `regenerate:conversations`, `analyze:grouping`, `analyze:sorting`, `tune:parameters`, `generate:summaries`
 
-### Database & Synchronization
-- **Sync guild data to PostgreSQL:** `npm run sync:guild`
-- **Drop guild data from PostgreSQL:** `npm run drop:guild`
-- **Recreate PostgreSQL schema:** `npm run recreate:schema`
-- **Clean all PostgreSQL data:** `npm run drop:all`
-- **Heal database inconsistencies:** Database healer runs automatically on bot startup (DatabaseHealer class)
-- **Sync a single channel:** `npm run sync:channel`
-- **Regenerate relationship network:** `npm run regenerate:relationships`
-- **Regenerate conversations:** `npm run regenerate:conversations`
-- **Generate embeddings:** `npm run generate:embeddings` (uses Bun)
-
-### Testing & Debugging
-- **Test minimal bot functionality:** `npm run test:minimal`
-- **Test action creation:** `npm run test:actions`
-- **Test voice channel features:** `npm run test:voice`
-- **Test PostgreSQL connection:** `npm run test:postgres`
-- **Test AI assistant:** `npm run test:ai`
-- **Watch database changes:** `npm run watch-db`
-- **Watch user changes:** `npm run watch-users`
-- **Check recent activity:** `npm run view:recent`
-- **Inspect active conversations (24h):** `npm run inspect:conversations`
-- **Analyze conversation grouping accuracy:** `npm run analyze:conversation-accuracy` (uses Gemini AI to compare programmatic vs semantic conversation detection)
+### Database & debugging
+- **Inspect a message:** `npm run check-message`
+- **Repair sync gaps:** `npm run repair-sync`
+- **API costs:** `npm run view-costs`
+- **Voice-state migration:** `npm run migrate:voice-state`
+- **AI smoke tests:** `npm run test:ai`, `test:conversation`, `test:discord-stream`
 
 ## Architecture Overview
 
 ### Core Components
 
 **Bot.ts** - The main orchestrator. On initialization:
-1. Connects to PostgreSQL (optional but enables all advanced features)
-2. Sets up Discord event handlers (slash commands, bot mentions, message replies)
-3. Deploys commands (guild-specific or globally)
-4. Initializes relationship/conversation tracking, database healing, and live sync watching
+1. Connects to PostgreSQL (optional but enables all advanced features); `PostgreSQLManager.connect()` runs `initializeSchema()`
+2. Sets up Discord event handlers (slash commands, messages, voice state, buttons)
+3. Deploys commands (guild-specific when `GUILD_ID` is set, otherwise global) via `CommandDeployer`
+4. Initializes conversation workflow, message handler, member personas, voice assistant, voice-state coordinator, media player, state sync, and the enrichment orchestrator/scheduler
 
 ### Feature Layers
 
@@ -64,72 +52,71 @@ Syncs Discord data to PostgreSQL with real-time updates:
 
 #### Social Intelligence (`src/features/social-intelligence/`)
 Transforms raw Discord interactions into structured relationship and conversation insights:
-- **Relationship Mapping**: Tracks user interactions, calculates affinity scores, maintains relationship graphs
-- **Conversation Detection**: Groups messages into multi-participant conversation segments using multi-strategy grouping
-- **Semantic Analysis**: Extracts keywords (TF-IDF + semantic), generates embeddings, labels topics with AI
+- **Relationship Mapping** (`relationship-mapping/`): Tracks user interactions, calculates affinity scores, maintains relationship graphs (`user_profiles.relationship_network`)
+- **Conversation Detection** (`conversation-detection/`): Groups messages into multi-participant conversation segments using multi-strategy grouping
+- **Semantic Analysis** (`semantic-analysis/`): Extracts keywords (TF-IDF + semantic), generates embeddings, labels topics with AI
+- **Psychological Profiling** (`psychological-profiling/`): Statistical analyzers plus Big Five/MBTI estimators → `user_profiles.psych_profile`, `behavior_patterns`, `temporal_profile`
+- **Enrichment Pipeline** (`enrichment-pipeline/`): Four cascading layers run through `EnrichmentPipelineOrchestrator` and `EnrichmentQueue` (in-memory, retries failed jobs up to 3 times): conversation summaries → user profiles → relationship profiles → guild summary
 - **Types** (`types.ts`): Defines `ConversationEntry`, `AffinityScoreResult`, `UserInteractionSummary`, `StreamingConversation`
 
-#### Database (`src/features/database/`)
-- **PostgreSQLManager**: Single connection pool; provides query methods for CRUD operations on guilds, channels, members, messages, relationship edges, conversation segments, and embeddings
+#### Member Personas (`src/features/user-personas/`)
+`/persona init|change|clear` lets the bot speak as a server member (see Common Tasks).
+
+#### Database (`src/database/`)
+- **PostgreSQLManager**: Single connection pool; CRUD for guilds, channels, members, messages, user profiles, relationship edges, conversation segments, personas, and embeddings
+- Schema is created and migrated in `initializeSchema()` on every connect (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`); `src/database/migrations/*.sql` are historical and not applied automatically
 - Handles graceful degradation if PostgreSQL is unavailable
 - Returns `DatabaseResult<T>` with `success` flag, `data`, and optional `error` field
 
 #### AI Module (`src/ai/`)
 Centralized AI infrastructure with multi-provider support:
 - **Core** (`core/`):
-  - **NEW ARCHITECTURE** (preferred):
-    - AIEngine: Core execution interface for AI requests
-    - AIFactory: Creates engine and context instances
-    - AIRequestBuilder: Fluent API for building AI requests (`.chat().blocking().provider().generate()`)
-    - AIContext: Request context (persona, tools, guild)
-  - **LEGACY** (deprecated, see migration guide in AIManager JSDoc):
-    - AIManager: Singleton orchestrator (use AIEngine + AIRequestBuilder instead)
-    - ChatSessionManager: Multi-turn conversation state
-- **Providers** (`providers/`):
-  - GrokProvider: Uses Vercel AI SDK with Grok 4.1 Fast (non-reasoning) for AI assistant
-  - GeminiProvider: Native SDK with Gemini 2.0 Flash for social intelligence
-  - OpenAIProvider, OllamaProvider: Additional provider options
-- **Tools** (`tools/`): DatabaseTools registry with user, relationship, conversation, message, server, context, and analysis tools
-- **Personas** (`personas/`): "sophia" (philosophical) and "casual" (friendly) persona definitions
+  - AIEngine: Core execution interface; builds the system prompt (persona → yin/yang mode → conversational base → method prompt) and runs the tool loop
+  - AIFactory: Creates the engine, providers and tool registry
+  - AIRequestBuilder: Fluent API for building AI requests (`.chat().blocking().provider().generate()`)
+  - AIContext: Request context (guild, user, channel, history, communication mode)
+  - ChatSessionManager: Multi-turn chat session state keyed by bot reply message IDs
+- **Providers** (`providers/`): GrokProvider (primary, Vercel AI SDK), OpenAIProvider, OllamaProvider; GeminiProvider exists but is disabled in AIFactory
+- **Tools** (`tools/`): DatabaseTools registry with user, relationship, conversation, message, server, context, analysis, media and voice tools
+- **Personas** (`personas/`): "sophia" (philosophical) and "casual" (friendly) persona definitions; yin/yang communication modes
 - **Utils** (`utils/`): MentionResolver and ResponseLengthPolicy utilities
 
-#### Discord Handlers (`src/features/discord-handlers/`)
-Discord-specific message and voice handling:
+**Response length policy**: `.chat()` sets mode "chat", which caps output at 60 tokens via ResponseLengthPolicy unless `.maxTokens()` is set. Background jobs (summaries, profiling, JSON output) must use `.blocking().mode("structured").maxTokens(n)` instead of `.chat()`.
+
+#### Discord Handlers (`src/handlers/`)
 - **Chat** (`chat/`):
-  - MessageHandler: Handles bot mentions and replies
+  - MessageHandler: Bot mentions and replies; resolves the guild's active member persona
   - ChatAIManager: Domain adapter for chat interactions (wraps AIEngine)
 - **Voice** (`voice/`):
   - VoiceAssistantManager: Voice channel orchestration
   - VoiceAIManager: Domain adapter for voice interactions (wraps AIEngine)
-  - TTS services: Text-to-speech integrations (Cartesia, Google)
-  - Commands: Join/leave voice commands
+  - TTS services (`tts/`): Cartesia, Google, Whisper transcription
+  - `/join` and `/leave` slash commands live in `src/commands/`
 
-Note: `src/features/chat-assistant/` and `src/features/voice-assistant/` now re-export from discord-handlers for backward compatibility.
-
-#### Message Handling in Bot.ts
-**Bot mentions** (lines 169-315):
-1. Detects @botname mentions (not replies, uses regex patterns)
-2. Extracts user content, maps self-referential queries (e.g., "who am I") to explicit mentions for tool resolution
-3. Generates AI response via AIManager
-4. Sends response in Discord-safe chunks (max 1900 chars) with sanitized @everyone mentions
+#### Message Handling (`src/handlers/chat/MessageHandler.ts`)
+**Bot mentions** (`handleBotMention`):
+1. Detects @bot mentions that are not replies
+2. Handles voice join/leave phrases, strips yin/yang keywords, maps self-referential queries (e.g., "who am I") to explicit mentions for tool resolution
+3. Generates the response via ChatAIManager (with the active member persona, if any)
+4. Sends response in Discord-safe chunks with sanitized @everyone mentions
 5. Starts a new chat session
 
-**Bot replies** (lines 318-400):
-1. Tracks message replies to bot messages using session IDs (stored in ChatSessionManager)
-2. Continues conversation context by passing session history to AI
-3. Applies same chunking and sanitization logic
+**Bot replies** (`handleSessionContinuation`):
+1. Finds the session by the replied-to bot message ID (ChatSessionManager)
+2. Continues the conversation with session history
+3. Applies the same chunking and sanitization logic
 
 ### Supporting Systems
 
-**AIManager tools** integrate with database:
-- Tools implicitly use guild context (set via `runWithGuildContext`) to infer guildId
+**AI tools** integrate with the database:
+- Tools receive guild/user context from AIContext
 - User tools retrieve member profiles, summaries, keywords, emojis, notes
 - Relationship tools calculate affinity, list top connections
 - Conversation tools fetch segments, participants, embeddings
 - Analysis tools provide metadata and trends
 
 **LiveEventSync events**:
-- messageCreate → increments relationship edges, buffers message for conversation detection, creates streaming conversations
+- messageCreate → increments relationship edges, buffers message for conversation detection, creates streaming conversations, queues user enrichment every 50 messages
 - reactionAdd/reactionRemove → increments edge counters
 - guildMemberAdd/Update → updates member profiles
 - channelCreate/Update/Delete → updates channel records
@@ -156,14 +143,14 @@ Bot gracefully degrades if PostgreSQL is unavailable; all Discord features work 
 
 ## Adding Commands
 
-Commands are in `src/commands/` and dynamically loaded via `loadCommands()` in Bot.ts:63-66.
+`src/utils/loadCommands.ts` loads every `.ts` file directly inside `src/commands/` and `src/features/*/commands/` (no recursion). Any exported object with `data` and `execute` is registered; default or named exports both work.
 
 **Command Structure**:
 ```typescript
 import { SlashCommandBuilder } from "discord.js";
 import type { Command } from "../types";
 
-const myCommand: Command = {
+export const myCommand: Command = {
   data: new SlashCommandBuilder()
     .setName("mycmd")
     .setDescription("Description")
@@ -174,11 +161,9 @@ const myCommand: Command = {
     await interaction.reply(`Response: ${arg}`);
   },
 };
-
-export default myCommand;
 ```
 
-Commands automatically receive guild context and can access AI tools, database methods, and user/relationship data.
+Commands only receive the interaction. Shared services are attached to the Discord client in `Bot.initializeFeatures` (e.g. `voiceStateCoordinator`, `userPersonas`) and read back with a small typed interface over `interaction.client`.
 
 ## Code Style
 
@@ -186,14 +171,14 @@ Commands automatically receive guild context and can access AI tools, database m
 - **Language**: TypeScript with strict mode
 - **Imports**: ES module syntax (`import ... from "..."`)
 - **Format**: Tabs (width 2), line width 100, double quotes, semicolons, trailing commas (ES5)
-- **Patterns**: Class-based managers, static singletons for global state (e.g., AIManager), error handling via try/catch with logging via console.error
+- **Patterns**: Class-based managers, static singletons for global state (e.g., VoiceAssistantManager, EnrichmentPipelineOrchestrator), error handling via try/catch with logging via console.error
 - **Sanitization**: All bot output sanitized for @everyone/@here mentions via `sanitizeEveryone()` function
 
 ## Key Files to Know
 
 ### Core System
 - [Bot.ts](src/Bot.ts) - Main event orchestrator and command dispatcher
-- [PostgreSQLManager.ts](src/database/PostgreSQLManager.ts) - Database interface
+- [PostgreSQLManager.ts](src/database/PostgreSQLManager.ts) - Database interface and schema
 
 ### Discord Sync
 - [StateSyncService.ts](src/features/discord-sync/StateSyncService.ts) - Discord sync coordinator
@@ -203,24 +188,22 @@ Commands automatically receive guild context and can access AI tools, database m
 ### Social Intelligence
 - [RelationshipMapper.ts](src/features/social-intelligence/relationship-mapping/RelationshipMapper.ts) - Affinity/relationship logic
 - [ConversationDetector.ts](src/features/social-intelligence/conversation-detection/ConversationDetector.ts) - Conversation detection and grouping
-- [EnhancementOrchestrator.ts](src/features/social-intelligence/enrichment-pipeline/EnhancementOrchestrator.ts) - AI-powered conversation enrichment
+- [EnrichmentPipelineOrchestrator.ts](src/features/social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator.ts) - Enrichment layers, cascades and queue processing
+- [UserProfileEnrichmentPipeline.ts](src/features/social-intelligence/enrichment-pipeline/layers/UserProfileEnrichmentPipeline.ts) - Incremental user profile summaries
+- [PsychologicalProfiler.ts](src/features/social-intelligence/psychological-profiling/PsychologicalProfiler.ts) - Behavioral and personality profiling
 
-### AI Infrastructure (NEW)
+### AI Infrastructure
 - [AIEngine.ts](src/ai/core/AIEngine.ts) - Core AI execution interface
-- [AIFactory.ts](src/ai/core/AIFactory.ts) - Engine and context factory
+- [AIFactory.ts](src/ai/core/AIFactory.ts) - Engine and provider factory
 - [AIRequestBuilder.ts](src/ai/core/AIRequestBuilder.ts) - Fluent API for AI requests
-- [GrokProvider.ts](src/ai/providers/GrokProvider.ts) - Grok 4.1 Fast provider using Vercel AI SDK
-- [GeminiProvider.ts](src/ai/providers/GeminiProvider.ts) - Gemini Flash provider for social intelligence
+- [GrokProvider.ts](src/ai/providers/GrokProvider.ts) - Primary provider using Vercel AI SDK
 - [DatabaseTools.ts](src/ai/tools/registry/DatabaseTools.ts) - Tool registry for AI
 
-### AI Infrastructure (LEGACY - deprecated)
-- [AIManager.ts](src/ai/core/AIManager.ts) - Legacy singleton orchestrator (use AIEngine instead)
-
 ### Discord Handlers
-- [MessageHandler.ts](src/features/discord-handlers/chat/MessageHandler.ts) - Chat message handling
-- [ChatAIManager.ts](src/features/discord-handlers/chat/ChatAIManager.ts) - Chat AI adapter
-- [VoiceAssistantManager.ts](src/features/discord-handlers/voice/VoiceAssistantManager.ts) - Voice orchestration
-- [VoiceAIManager.ts](src/features/discord-handlers/voice/VoiceAIManager.ts) - Voice AI adapter
+- [MessageHandler.ts](src/handlers/chat/MessageHandler.ts) - Chat message handling
+- [ChatAIManager.ts](src/handlers/chat/ChatAIManager.ts) - Chat AI adapter
+- [VoiceAssistantManager.ts](src/handlers/voice/VoiceAssistantManager.ts) - Voice orchestration
+- [VoiceAIManager.ts](src/handlers/voice/VoiceAIManager.ts) - Voice AI adapter
 
 ## Common Tasks
 
@@ -236,7 +219,9 @@ Commands automatically receive guild context and can access AI tools, database m
 - `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes `buildPersonaPrompt(...)` to ChatAIManager (voice is unaffected)
 - The service is attached to the Discord client as `client.userPersonas`
 
-**Add a database schema**: PostgreSQLManager has schema creation methods; update via migration pattern in `recreate:schema` script.
+**Add a database table or column**: add `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` to `PostgreSQLManager.initializeSchema()`; it runs on every startup.
+
+**Add an enrichment step**: background LLM calls must throw on failure (so `EnrichmentQueue` records and retries them) and return `null` only for legitimate skips; avoid `.chat()` (60-token cap).
 
 **Track new interaction types**: ConversationDetector uses multi-strategy grouping; add new strategies in `conversation-detection/strategies/` directory.
 
@@ -249,4 +234,4 @@ Commands automatically receive guild context and can access AI tools, database m
 
 **Debug conversation detection**: ConversationDetector buffers messages per channel with 10-min inactivity timeouts; check `streaming_conversations` table or add logging.
 
-**Extend bot mention handling**: Message handling logic in Bot.ts; modify sanitization, context resolution, or chunking as needed.
+**Extend bot mention handling**: Message handling logic lives in `src/handlers/chat/MessageHandler.ts`; modify sanitization, context resolution, or chunking there.
