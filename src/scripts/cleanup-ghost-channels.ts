@@ -13,7 +13,7 @@
  * - Channels from voice_channels table that don't exist in Discord
  */
 
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits } from "discord.js";
 import { PostgreSQLManager } from "../database/PostgreSQLManager";
 import { config } from "../config";
 import dotenv from "dotenv";
@@ -46,7 +46,7 @@ async function cleanupGhostChannels() {
 
 		// Wait for client to be ready
 		await new Promise((resolve) => {
-			client.once("ready", resolve);
+			client.once(Events.ClientReady, resolve);
 		});
 
 		// Get all user channels from database

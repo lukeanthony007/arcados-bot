@@ -68,7 +68,7 @@ export class YouTubeProvider extends BaseProvider {
 					let thumbnailUrl: string | undefined;
 					const thumbnailElement = element.querySelector("img") as HTMLImageElement;
 					if (thumbnailElement) {
-						thumbnailUrl = thumbnailElement.getAttribute("src") || thumbnailElement.getAttribute("data-src");
+						thumbnailUrl = thumbnailElement.getAttribute("src") || thumbnailElement.getAttribute("data-src") || undefined;
 					}
 
 					// Extract channel name

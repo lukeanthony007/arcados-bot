@@ -4,12 +4,7 @@ export { AIRequestBuilder } from "./core/AIRequestBuilder";
 export { AIContext, AIContextBuilder, type AIContext as AIContextType } from "./core/AIContext";
 export { AIFactory } from "./core/AIFactory";
 
-// Core exports - LEGACY (for backward compatibility)
-/**
- * @deprecated Use AIEngine + AIRequestBuilder instead.
- * See AIManager class documentation for migration guide.
- */
-export { AIManager } from "./core/AIManager";
+// Core exports - session management
 export * from "./core/ChatSessionManager";
 
 // Provider exports

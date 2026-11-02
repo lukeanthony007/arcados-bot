@@ -30,7 +30,8 @@ export class ProviderRouter {
 		for (const pattern of explicitPatterns) {
 			const match = normalizedQuery.match(pattern);
 			if (match) {
-				const provider = match[1].toLowerCase();
+				const provider = match[1]?.toLowerCase();
+				if (!provider) continue;
 				// Remove provider syntax from query
 				const cleanQuery = normalizedQuery
 					.replace(pattern, "")

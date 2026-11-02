@@ -292,7 +292,7 @@ export class VoiceSessionService {
 		});
 
 		// Get human-readable names for logging
-		const guild = this.client.guilds.cache.get(guildId);
+		const guild = this.client?.guilds.cache.get(guildId);
 		if (guild) {
 			const member = guild.members.cache.get(userId);
 			const fromChannel = guild.channels.cache.get(fromChannelId);

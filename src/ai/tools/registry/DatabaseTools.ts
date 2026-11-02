@@ -1,9 +1,12 @@
 import {
   PostgreSQLManager,
   type MemberData,
-  type RelationshipEntry,
+  type UserProfileData,
 } from "../../../database/PostgreSQLManager";
-import type { ConversationEntry } from "../../../features/social-intelligence/types";
+import type {
+  ConversationEntry,
+  RelationshipEntry,
+} from "../../../features/social-intelligence/types";
 import type { AIEngine } from "../../core/AIEngine";
 
 /**
@@ -235,9 +238,14 @@ export class DatabaseTools {
 }
 
 /**
- * Format user information for AI consumption
+ * Format user information for AI consumption.
+ * AI-generated profile fields (summary/keywords/emojis) live in user_profiles,
+ * not on the members row, so they are passed in separately.
  */
-export function formatUserInfo(member: MemberData): string {
+export function formatUserInfo(
+  member: MemberData,
+  profile?: Pick<UserProfileData, "summary" | "keywords" | "emojis"> | null
+): string {
   const parts: string[] = [];
   parts.push(`User: ${member.display_name} (@${member.username})`);
 
@@ -245,16 +253,16 @@ export function formatUserInfo(member: MemberData): string {
     parts.push(`Global name: ${member.global_name}`);
   }
 
-  if (member.summary) {
-    parts.push(`Summary: ${member.summary}`);
+  if (profile?.summary) {
+    parts.push(`Summary: ${profile.summary}`);
   }
 
-  if (member.keywords && member.keywords.length > 0) {
-    parts.push(`Keywords: ${member.keywords.join(", ")}`);
+  if (profile?.keywords && profile.keywords.length > 0) {
+    parts.push(`Keywords: ${profile.keywords.join(", ")}`);
   }
 
-  if (member.emojis && member.emojis.length > 0) {
-    parts.push(`Emojis: ${member.emojis.join(" ")}`);
+  if (profile?.emojis && profile.emojis.length > 0) {
+    parts.push(`Emojis: ${profile.emojis.join(" ")}`);
   }
 
   parts.push(`Joined: ${new Date(member.joined_at).toLocaleDateString()}`);

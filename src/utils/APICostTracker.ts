@@ -125,7 +125,7 @@ export class APICostTracker {
 		const record: APIRequestRecord = {
 			timestamp: new Date().toISOString(),
 			provider,
-			environment: this.environment,
+			environment: this.environment ?? "test",
 			endpoint: metadata.endpoint,
 			success: metadata.success,
 			error: metadata.error,
@@ -356,8 +356,8 @@ export class APICostTracker {
 		const periods: TimeframeType[] = ["hour", "day", "week", "month"];
 		for (const period of periods) {
 			const stats = this.getStats(period, provider);
-			if (stats.length > 0) {
-				const stat = stats[0];
+			const stat = stats[0];
+			if (stat) {
 				existing.current[period] = {
 					cost: stat.totalCost,
 					requests: stat.totalRequests,
@@ -411,10 +411,10 @@ export class APICostTracker {
 				}>;
 			};
 			current: {
-				hour: CostSummary | null;
-				day: CostSummary | null;
-				week: CostSummary | null;
-				month: CostSummary | null;
+				hour: { cost: number; requests: number } | null;
+				day: { cost: number; requests: number } | null;
+				week: { cost: number; requests: number } | null;
+				month: { cost: number; requests: number } | null;
 			};
 			lastUpdated: string;
 		};
@@ -505,6 +505,13 @@ export class APICostTracker {
 				);
 			});
 		}, this.trackingConfig.flushInterval);
+		// Don't keep short-lived scripts alive; flush once when the event loop drains instead
+		this.flushTimer.unref();
+		process.once("beforeExit", () => {
+			this.shutdown().catch((err) => {
+				console.error("[APICostTracker] Error in exit flush:", err);
+			});
+		});
 	}
 
 	/**

@@ -427,6 +427,7 @@ export const getHolisticUserContextTool: DatabaseTool = {
             display_name: nameMap.get(e.other_user) || e.other_user,
             affinity_percentage: e.rolling_7d || 0,
             interaction_count: e.total || 0,
+            last_interaction: e.last_interaction,
           }));
           relationshipsFormatted = relationships
             .map(

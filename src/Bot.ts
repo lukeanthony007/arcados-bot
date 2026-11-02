@@ -6,7 +6,7 @@
  */
 
 import { PostgreSQLManager } from "./database/PostgreSQLManager";
-import { Client, Collection, GatewayIntentBits } from "discord.js";
+import { Client, Collection, Events, GatewayIntentBits } from "discord.js";
 import type { Interaction, VoiceState, VoiceChannel } from "discord.js";
 import { config } from "./config";
 import type { Command } from "./types";
@@ -110,7 +110,7 @@ export class Bot {
     }
 
     // Ready event - initialize all features
-    this.client.once("ready", async () => {
+    this.client.once(Events.ClientReady, async () => {
       await this.initializeFeatures();
     });
 

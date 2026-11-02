@@ -66,8 +66,7 @@ export class AudioQueue {
 
 		if (this.shuffleOrder.length > 0) {
 			// Use shuffle order
-			this.currentIndex = this.shuffleOrder[0];
-			this.shuffleOrder.shift();
+			this.currentIndex = this.shuffleOrder.shift() ?? this.currentIndex;
 
 			// If shuffle order is exhausted and loop ALL is enabled, regenerate
 			if (this.shuffleOrder.length === 0 && this.loopMode === LoopMode.ALL) {
@@ -108,7 +107,7 @@ export class AudioQueue {
 		if (this.currentIndex === -1 || this.currentIndex >= this.queue.length) {
 			return null;
 		}
-		return this.queue[this.currentIndex];
+		return this.queue[this.currentIndex] ?? null;
 	}
 
 	/**
@@ -154,7 +153,9 @@ export class AudioQueue {
 		// Fisher-Yates shuffle
 		for (let i = indices.length - 1; i > 0; i--) {
 			const j = Math.floor(Math.random() * (i + 1));
-			[indices[i], indices[j]] = [indices[j], indices[i]];
+			const tmp = indices[i] as number;
+			indices[i] = indices[j] as number;
+			indices[j] = tmp;
 		}
 
 		this.shuffleOrder = indices;

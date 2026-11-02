@@ -25,14 +25,14 @@ export function parseTimeString(timeString: string): number | null {
 	if (colonMatch) {
 		if (colonMatch[3] !== undefined && colonMatch[3] !== "") {
 			// HH:MM:SS format
-			const hours = parseInt(colonMatch[1], 10);
-			const minutes = parseInt(colonMatch[2], 10);
-			const seconds = parseInt(colonMatch[3], 10);
+			const hours = parseInt(colonMatch[1] ?? "0", 10);
+			const minutes = parseInt(colonMatch[2] ?? "0", 10);
+			const seconds = parseInt(colonMatch[3] ?? "0", 10);
 			return hours * 3600 + minutes * 60 + seconds;
 		} else {
 			// MM:SS format
-			const minutes = parseInt(colonMatch[1], 10);
-			const seconds = parseInt(colonMatch[2], 10);
+			const minutes = parseInt(colonMatch[1] ?? "0", 10);
+			const seconds = parseInt(colonMatch[2] ?? "0", 10);
 			return minutes * 60 + seconds;
 		}
 	}
@@ -55,7 +55,7 @@ export function parseTimeString(timeString: string): number | null {
 	// Try format: "90s" or "90" (just seconds)
 	const secondsMatch = trimmed.match(/^(\d+)s?$/);
 	if (secondsMatch) {
-		return parseInt(secondsMatch[1], 10);
+		return parseInt(secondsMatch[1] ?? "0", 10);
 	}
 
 	return null;

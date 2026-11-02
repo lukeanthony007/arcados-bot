@@ -4,7 +4,7 @@
  */
 
 import { PostgreSQLManager } from "../PostgreSQLManager";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits } from "discord.js";
 import { config } from "../../config";
 import { EmbeddingService } from "../../features/social-intelligence/semantic-analysis/EmbeddingService";
 
@@ -49,7 +49,7 @@ async function main() {
 
   // Wait for ready event
   await new Promise<void>((resolve) => {
-    client.once("ready", () => {
+    client.once(Events.ClientReady, () => {
       console.log(`🔹 Logged in as ${client.user?.tag}`);
       resolve();
     });

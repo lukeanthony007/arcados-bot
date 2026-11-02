@@ -4,7 +4,7 @@ import {
   type DatabaseToolResult,
   formatRelationship,
 } from "../registry/DatabaseTools";
-import type { RelationshipEntry } from "../../../database/PostgreSQLManager";
+import type { RelationshipEntry } from "../../../features/social-intelligence/types";
 
 /**
  * Get user's relationship network
@@ -507,9 +507,9 @@ export const analyzeRelationshipTool: DatabaseTool = {
         };
       }
 
-      const relationship = networkResult.data.find(
-        (r) => r.user_id === user2Id
-      );
+      // relationship_network JSONB entries carry optional keywords (not in PostgreSQLManager's narrower type)
+      const network: RelationshipEntry[] = networkResult.data;
+      const relationship = network.find((r) => r.user_id === user2Id);
 
       if (!relationship) {
         return {

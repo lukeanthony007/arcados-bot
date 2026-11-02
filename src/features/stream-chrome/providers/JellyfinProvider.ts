@@ -398,7 +398,7 @@ export class JellyfinProvider extends BaseProvider {
 
 				// Monitor for network errors in fetch/XHR
 				const originalFetch = window.fetch;
-				window.fetch = function (...args: any[]) {
+				window.fetch = function (this: typeof globalThis, ...args: Parameters<typeof fetch>) {
 					return originalFetch.apply(this, args).catch((error) => {
 						const url = args[0]?.toString() || "";
 						if (url.includes("/videos/") && (url.includes("/hls") || url.includes("/stream"))) {
@@ -606,7 +606,7 @@ export class JellyfinProvider extends BaseProvider {
 	/**
 	 * Override pause to handle Jellyfin's video/audio elements
 	 */
-	protected async executePause(
+	protected override async executePause(
 		page: Page
 	): Promise<import("../types/playback.js").PlaybackResult> {
 		try {
@@ -660,7 +660,7 @@ export class JellyfinProvider extends BaseProvider {
 	/**
 	 * Override resume to handle Jellyfin's video/audio elements
 	 */
-	protected async executeResume(
+	protected override async executeResume(
 		page: Page
 	): Promise<import("../types/playback.js").PlaybackResult> {
 		try {
@@ -714,7 +714,7 @@ export class JellyfinProvider extends BaseProvider {
 	/**
 	 * Override seek to handle Jellyfin's video/audio elements
 	 */
-	protected async executeSeek(
+	protected override async executeSeek(
 		page: Page,
 		position: number
 	): Promise<import("../types/playback.js").PlaybackResult> {
@@ -772,7 +772,7 @@ export class JellyfinProvider extends BaseProvider {
 	/**
 	 * Override skip forward to handle Jellyfin's video/audio elements
 	 */
-	protected async executeSkipForward(
+	protected override async executeSkipForward(
 		page: Page,
 		seconds: number
 	): Promise<import("../types/playback.js").PlaybackResult> {
@@ -835,7 +835,7 @@ export class JellyfinProvider extends BaseProvider {
 	/**
 	 * Override skip backward to handle Jellyfin's video/audio elements
 	 */
-	protected async executeSkipBackward(
+	protected override async executeSkipBackward(
 		page: Page,
 		seconds: number
 	): Promise<import("../types/playback.js").PlaybackResult> {
@@ -892,7 +892,7 @@ export class JellyfinProvider extends BaseProvider {
 	/**
 	 * Override restart to handle Jellyfin's video/audio elements
 	 */
-	protected async executeRestart(
+	protected override async executeRestart(
 		page: Page
 	): Promise<import("../types/playback.js").PlaybackResult> {
 		return await this.executeSeek(page, 0);
@@ -902,7 +902,7 @@ export class JellyfinProvider extends BaseProvider {
 	 * Execute next episode action
 	 * Navigate to next episode in Jellyfin series
 	 */
-	protected async executeNextEpisode(
+	protected override async executeNextEpisode(
 		page: Page
 	): Promise<import("../types/playback.js").PlaybackResult> {
 		try {

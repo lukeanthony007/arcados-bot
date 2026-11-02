@@ -67,7 +67,7 @@ export class MoviesProvider extends BaseProvider {
 
 					// Extract year if available (might be in title or separate element)
 					const yearMatch = title.match(/\((\d{4})\)/);
-					const year = yearMatch ? parseInt(yearMatch[1], 10) : undefined;
+					const year = yearMatch ? parseInt(yearMatch[1] ?? "0", 10) : undefined;
 
 					// Determine type (movie or tv)
 					const type = href.includes("/tv/") || href.includes("/tv-series/") || href.includes("/show/") ? "tv" : "movie";

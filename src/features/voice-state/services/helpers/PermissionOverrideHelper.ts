@@ -232,7 +232,11 @@ export class PermissionOverrideHelper {
 				result.failed++;
 				result.errors.push({ id: channel.id, error });
 				// Only log errors for non-BLOCK contexts or non-common errors
-				if (logContext !== "BLOCK" || (error?.code !== 10013 && error?.code !== 50035 && error?.code !== "InvalidType")) {
+				const errorCode =
+					typeof error === "object" && error !== null && "code" in error
+						? error.code
+						: undefined;
+				if (logContext !== "BLOCK" || (errorCode !== 10013 && errorCode !== 50035 && errorCode !== "InvalidType")) {
 					const channelName = channel.name || channel.id;
 					VoiceLogger.error(logContext, `Failed to remove permissions from channel ${channelName}`, error);
 				}
@@ -280,7 +284,11 @@ export class PermissionOverrideHelper {
 				result.failed++;
 				result.errors.push({ id: userId, error });
 				// Only log errors for non-BLOCK contexts or non-common errors
-				if (logContext !== "BLOCK" || (error?.code !== 10013 && error?.code !== 50035 && error?.code !== "InvalidType")) {
+				const errorCode =
+					typeof error === "object" && error !== null && "code" in error
+						? error.code
+						: undefined;
+				if (logContext !== "BLOCK" || (errorCode !== 10013 && errorCode !== 50035 && errorCode !== "InvalidType")) {
 					VoiceLogger.error(logContext, `Failed to remove permissions for user ${userId}`, error);
 				}
 			}

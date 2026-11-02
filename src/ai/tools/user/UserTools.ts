@@ -138,7 +138,10 @@ export const getUserInfoTool: DatabaseTool = {
           // Get profile data for inactive member
           const profileResult = await context.db.getUserProfile(targetUserId, context.guildId);
           const summary = profileResult.success && profileResult.data ? profileResult.data.summary : undefined;
-          const formatted = formatUserInfo(member);
+          const formatted = formatUserInfo(
+            member,
+            profileResult.success ? profileResult.data : null
+          );
           return {
             success: true,
             summary: `${member.display_name} - ${
@@ -515,7 +518,7 @@ export const getUserInfoTool: DatabaseTool = {
 
       // Combine member keywords with conversation topics
       // Member keywords are already aggregated from conversations, so prioritize them
-      const memberKeywords = member.keywords || [];
+      const memberKeywords = profile?.keywords || [];
       const combinedTopics = new Set<string>();
       
       // Add member keywords first (they're already aggregated/curated)
@@ -538,8 +541,8 @@ export const getUserInfoTool: DatabaseTool = {
       const interestParts: string[] = [];
       
       // Add member summary if available (this is the AI-generated summary)
-      if (member.summary && member.summary.trim().length > 10) {
-        interestParts.push(member.summary.trim());
+      if (profile?.summary && profile.summary.trim().length > 10) {
+        interestParts.push(profile.summary.trim());
       }
 
       // Add topics/interests - prioritize member keywords (already aggregated)
@@ -602,8 +605,8 @@ export const getUserInfoTool: DatabaseTool = {
       
       // ALWAYS include member keywords if available (even if we have other data)
       // Member keywords are the most reliable source as they're aggregated from all conversations
-      if (member.keywords && member.keywords.length > 0 && interestParts.length === 0) {
-        const filteredKeywords = member.keywords
+      if (memberKeywords.length > 0 && interestParts.length === 0) {
+        const filteredKeywords = memberKeywords
           .filter(kw => kw && typeof kw === 'string' && kw.trim().length > 2)
           .filter(kw => {
             const commonWords = ['the', 'and', 'or', 'but', 'for', 'with', 'about', 'this', 'that', 'has', 'have', 'was', 'were', 'are', 'is', 'been'];

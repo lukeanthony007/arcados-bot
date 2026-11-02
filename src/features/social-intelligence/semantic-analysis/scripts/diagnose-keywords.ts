@@ -7,7 +7,6 @@
 
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
 import { KeywordExtractor } from "../KeywordExtractor";
-import { EmbeddingService } from "../EmbeddingService";
 import { config } from "../../../../config";
 
 interface ConversationSegment {
@@ -25,6 +24,7 @@ interface Message {
   author_id: string;
   embedding: any;
   created_at: Date;
+  content_length: number;
 }
 
 function parseEmbedding(embeddingData: unknown): number[] | undefined {
@@ -95,8 +95,7 @@ async function main() {
   const segments: ConversationSegment[] = segmentsResult.data;
   console.log(`\n📊 Found ${segments.length} segments without keywords\n`);
 
-  const embeddingService = EmbeddingService.getInstance();
-  const keywordExtractor = new KeywordExtractor(embeddingService, db);
+  const keywordExtractor = new KeywordExtractor(db);
 
   for (const segment of segments) {
     console.log("─".repeat(80));
@@ -164,6 +163,7 @@ async function main() {
     console.log(`\n   📋 Sample messages (first 3):`);
     for (let i = 0; i < Math.min(3, messagesWithContent.length); i++) {
       const msg = messagesWithContent[i];
+      if (!msg) continue;
       const preview = msg.content.substring(0, 80).replace(/\n/g, " ");
       console.log(`      ${i + 1}. [${msg.content_length} chars] ${preview}${msg.content.length > 80 ? "..." : ""}`);
       console.log(`         Has embedding: ${msg.embedding ? "🔹" : "❌"}`);

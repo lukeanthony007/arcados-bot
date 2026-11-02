@@ -431,7 +431,10 @@ export class CartesiaTTSService {
                   event instanceof Uint8Array ||
                   event instanceof ArrayBuffer)
               ) {
-                const audioData = Buffer.from(event);
+                const audioData =
+                  event instanceof ArrayBuffer
+                    ? Buffer.from(event)
+                    : Buffer.from(event.buffer, event.byteOffset, event.byteLength);
                 if (audioData.length > 0) {
                   chunks.push(audioData);
                 }

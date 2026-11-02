@@ -69,11 +69,11 @@ function generateMusicHaiku(query: string): string {
 	let artistPart = "";
 
 	if (byMatch) {
-		songPart = byMatch[1].trim();
-		artistPart = byMatch[2].trim();
+		songPart = byMatch[1]?.trim() ?? songPart;
+		artistPart = byMatch[2]?.trim() ?? artistPart;
 	} else if (dashMatch) {
-		artistPart = dashMatch[1].trim();
-		songPart = dashMatch[2].trim();
+		artistPart = dashMatch[1]?.trim() ?? artistPart;
+		songPart = dashMatch[2]?.trim() ?? songPart;
 	}
 
 	// Simple haiku templates focused on the experience
@@ -86,7 +86,7 @@ function generateMusicHaiku(query: string): string {
 	];
 
 	// Return a random haiku
-	return haikus[Math.floor(Math.random() * haikus.length)];
+	return haikus[Math.floor(Math.random() * haikus.length)] ?? haikus[0]!;
 }
 
 export const playMediaTool: DatabaseTool = {

@@ -3,6 +3,7 @@ import {
   type ToolContext,
   type DatabaseToolResult,
 } from "../registry/DatabaseTools";
+import type { RelationshipEntry } from "../../../features/social-intelligence/types";
 
 /**
  * Get server/guild statistics
@@ -394,8 +395,15 @@ export const getServerNetworkTool: DatabaseTool = {
     context: ToolContext
   ): Promise<string | DatabaseToolResult> => {
     try {
-      // Get all members with relationship networks
-      const membersResult = await context.db.getMembersByGuild(context.guildId);
+      // Relationship networks live in user_profiles (the members table copy is stale)
+      const membersResult = await context.db.query(
+        `SELECT m.user_id, up.relationship_network
+         FROM members m
+         LEFT JOIN user_profiles up
+           ON up.user_id = m.user_id AND up.guild_id = m.guild_id
+         WHERE m.guild_id = $1 AND m.active = true AND m.bot = false`,
+        [context.guildId]
+      );
 
       if (!membersResult.success || !membersResult.data) {
         return {
@@ -404,7 +412,10 @@ export const getServerNetworkTool: DatabaseTool = {
         };
       }
 
-      const members = membersResult.data.filter((m: { bot?: boolean }) => !m.bot);
+      const members: Array<{
+        user_id: string;
+        relationship_network: RelationshipEntry[] | null;
+      }> = membersResult.data;
       let totalRelationships = 0;
       let membersWithRelationships = 0;
       let membersWithoutRelationships = 0;
@@ -412,14 +423,12 @@ export const getServerNetworkTool: DatabaseTool = {
       let relationshipCount = 0;
 
       for (const member of members) {
-        if (
-          member.relationship_network &&
-          member.relationship_network.length > 0
-        ) {
+        const network = member.relationship_network;
+        if (network && network.length > 0) {
           membersWithRelationships++;
-          totalRelationships += member.relationship_network.length;
+          totalRelationships += network.length;
 
-          for (const rel of member.relationship_network) {
+          for (const rel of network) {
             totalAffinitySum += rel.affinity_percentage;
             relationshipCount++;
           }

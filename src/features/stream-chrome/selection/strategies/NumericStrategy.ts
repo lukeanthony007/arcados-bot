@@ -25,14 +25,14 @@ export class NumericStrategy implements SelectionStrategy {
 		// Direct number match: "1", "2", "3"
 		const directMatch = trimmed.match(/^(\d+)$/);
 		if (directMatch) {
-			index = parseInt(directMatch[1], 10);
+			index = parseInt(directMatch[1] ?? "0", 10);
 		}
 
 		// "option X" or "option X" format
 		if (index === null) {
 			const optionMatch = trimmed.match(/option\s+(\d+)/i);
 			if (optionMatch) {
-				index = parseInt(optionMatch[1], 10);
+				index = parseInt(optionMatch[1] ?? "0", 10);
 			}
 		}
 
@@ -63,7 +63,7 @@ export class NumericStrategy implements SelectionStrategy {
 		if (index === null) {
 			const theMatch = trimmed.match(/the\s+(\d+)(?:st|nd|rd|th)?\s+one/i);
 			if (theMatch) {
-				index = parseInt(theMatch[1], 10);
+				index = parseInt(theMatch[1] ?? "0", 10);
 			}
 		}
 
@@ -71,9 +71,10 @@ export class NumericStrategy implements SelectionStrategy {
 		if (index !== null) {
 			// Convert to 0-based index
 			const arrayIndex = index - 1;
-			if (arrayIndex >= 0 && arrayIndex < results.length) {
+			const selected = results[arrayIndex];
+			if (arrayIndex >= 0 && selected) {
 				return {
-					selected: results[arrayIndex],
+					selected,
 					confidence: 1.0, // Exact match
 					method: "numeric",
 					index: arrayIndex,

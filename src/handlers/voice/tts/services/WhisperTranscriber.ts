@@ -132,7 +132,7 @@ export class WhisperTranscriber {
 
 		// Create form data for multipart upload
 		const formData = new FormData();
-		const audioBlob = new Blob([wavBuffer], { type: "audio/wav" });
+		const audioBlob = new Blob([new Uint8Array(wavBuffer)], { type: "audio/wav" });
 		formData.append("file", audioBlob, "audio.wav");
 		formData.append("temperature", TRANSCRIPTION_CONSTANTS.WHISPER_TEMPERATURE.toString());
 		formData.append(
@@ -190,7 +190,7 @@ export class WhisperTranscriber {
 
 		// Create form data for multipart upload
 		const formData = new FormData();
-		const audioBlob = new Blob([wavBuffer], { type: "audio/wav" });
+		const audioBlob = new Blob([new Uint8Array(wavBuffer)], { type: "audio/wav" });
 		formData.append("file", audioBlob, "audio.wav");
 		formData.append("model", "whisper-1");
 		formData.append("language", "en");
