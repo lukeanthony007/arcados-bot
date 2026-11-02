@@ -3,6 +3,8 @@ import { AIRequestBuilder } from "../../ai/core/AIRequestBuilder";
 import type { AIContext } from "../../ai/core/AIContext";
 import type { AIResponse } from "../../ai/providers/base/AIProvider";
 
+const RAIA_RUNTIME_URL = process.env.RAIA_RUNTIME_URL?.replace(/\/+$/, "") || "";
+
 /**
  * VoiceAIManager - Domain-specific AI interface for voice interactions
  *
@@ -27,6 +29,120 @@ export class VoiceAIManager {
 		this.engine = aiEngine;
 	}
 
+	private useRaiaRuntime(): boolean {
+		return RAIA_RUNTIME_URL.length > 0;
+	}
+
+	private async callRaiaBlocking(
+		query: string,
+		context: AIContext
+	): Promise<AIResponse> {
+		const response = await fetch(`${RAIA_RUNTIME_URL}/api/cycle/stream`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				input: query,
+				sessionId: `discord-${context.userId}`,
+				history: context.history || [],
+			}),
+		});
+
+		if (!response.ok || !response.body) {
+			const text = await response.text().catch(() => "");
+			return {
+				success: false,
+				content: "",
+				error: `Runtime HTTP ${response.status}: ${text || response.statusText}`,
+			};
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let finalContent = "";
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				const event = JSON.parse(line) as Record<string, any>;
+				if (event.type === "done") {
+					finalContent = String(event.data?.response ?? "");
+				} else if (event.type === "error") {
+					return {
+						success: false,
+						content: "",
+						error: String(event.message ?? "Runtime stream failed"),
+					};
+				}
+			}
+		}
+
+		return {
+			success: true,
+			content: finalContent,
+		};
+	}
+
+	private async *callRaiaStreaming(
+		query: string,
+		context: AIContext
+	): AsyncIterable<string> {
+		const response = await fetch(`${RAIA_RUNTIME_URL}/api/cycle/stream`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				input: query,
+				sessionId: `discord-${context.userId}`,
+				history: context.history || [],
+			}),
+		});
+
+		if (!response.ok || !response.body) {
+			const text = await response.text().catch(() => "");
+			throw new Error(`Runtime HTTP ${response.status}: ${text || response.statusText}`);
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let sawText = false;
+		let finalContent = "";
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split("\n");
+			buffer = lines.pop() ?? "";
+
+			for (const line of lines) {
+				if (!line.trim()) continue;
+				const event = JSON.parse(line) as Record<string, any>;
+				if (event.type === "text") {
+					const chunk = String(event.text ?? "");
+					if (chunk) {
+						sawText = true;
+						yield chunk;
+					}
+				} else if (event.type === "done") {
+					finalContent = String(event.data?.response ?? "");
+				} else if (event.type === "error") {
+					throw new Error(String(event.message ?? "Runtime stream failed"));
+				}
+			}
+		}
+
+		if (!sawText && finalContent) {
+			yield finalContent;
+		}
+	}
+
 	/**
 	 * Generate response for command mode (blocking)
 	 *
@@ -45,6 +161,10 @@ export class VoiceAIManager {
 		query: string,
 		context: AIContext
 	): Promise<AIResponse> {
+		if (this.useRaiaRuntime()) {
+			return this.callRaiaBlocking(query, context);
+		}
+
 		const builder = new AIRequestBuilder(this.engine);
 
 		const result = await builder
@@ -85,6 +205,10 @@ export class VoiceAIManager {
 		query: string,
 		context: AIContext
 	): Promise<AsyncIterable<string>> {
+		if (this.useRaiaRuntime()) {
+			return this.callRaiaStreaming(query, context);
+		}
+
 		const builder = new AIRequestBuilder(this.engine);
 
 		const result = await builder
@@ -127,6 +251,10 @@ export class VoiceAIManager {
 		query: string,
 		context: AIContext
 	): Promise<AIResponse> {
+		if (this.useRaiaRuntime()) {
+			return this.callRaiaBlocking(query, context);
+		}
+
 		const builder = new AIRequestBuilder(this.engine);
 
 		const result = await builder
