@@ -18,7 +18,6 @@ import { OmpRuntime } from "../../ai/runtime/OmpRuntime";
 import type {
 	DatabaseResult,
 	PostgreSQLManager,
-	RelationshipEntry,
 	UserPersonaData,
 	UserProfileData,
 } from "../../database/PostgreSQLManager";
@@ -35,6 +34,7 @@ import {
 	SLUR_PATTERN,
 	buildProfileRequest,
 } from "./personaPrompt";
+import { getTopInteractions, type InteractionRow } from "./personaContext";
 
 const MIN_MESSAGES = 30;
 const MESSAGE_FETCH_LIMIT = 600;
@@ -207,6 +207,7 @@ export class UserPersonaService {
 			const profileResult = await this.db.getUserProfile(userId, guildId);
 			const profile = profileResult.success ? profileResult.data : undefined;
 			const conversations = await this.getConversations(guildId, userId);
+			const interactions = await getTopInteractions(this.db, guildId, userId, RELATIONSHIP_LIMIT);
 
 			// 3. Synthesize the character profile
 			const dossier = this.buildDossier(
@@ -215,6 +216,7 @@ export class UserPersonaService {
 				profile,
 				messages,
 				conversations,
+				interactions,
 				names.users,
 			);
 			const characterProfile = await this.writeCharacterProfile(name, dossier);
@@ -227,7 +229,7 @@ export class UserPersonaService {
 
 			// 4. Store
 			const report: PersonaPipelineReport = {
-				relationships: profile?.relationship_network?.length ?? 0,
+				relationships: interactions.length,
 				enrichedProfileVersion,
 				psychProfiled,
 				messagesAnalyzed: Math.min(messages.length, DOSSIER_MESSAGE_LIMIT),
@@ -359,6 +361,7 @@ export class UserPersonaService {
 		profile: UserProfileData | undefined,
 		messages: string[],
 		conversations: ConversationRow[],
+		interactions: InteractionRow[],
 		userNames: Map<string, string>,
 	): string {
 		const sections: string[] = [];
@@ -396,21 +399,13 @@ export class UserPersonaService {
 			);
 		}
 
-		const relationships: RelationshipEntry[] = (
-			profile?.relationship_network ?? []
-		).slice(0, RELATIONSHIP_LIMIT);
-		if (relationships.length) {
+		if (interactions.length) {
 			sections.push(
-				`TALKS TO MOST:\n${relationships
-					.map((rel) => {
-						const relName =
-							userNames.get(rel.user_id) ??
-							rel.display_name ??
-							rel.username ??
-							rel.user_id;
-						const summary = rel.summary ? `: ${rel.summary}` : "";
-						return `- ${relName} (${rel.affinity_percentage.toFixed(0)}% of interactions)${summary}`;
-					})
+				`TALKS TO MOST (replies and direct mentions over their whole history; who they're actually close to):\n${interactions
+					.map(
+						(row) =>
+							`- ${userNames.get(row.user_id) ?? row.user_id}: ${name} → them ${row.outgoing}, them → ${name} ${row.incoming}`,
+					)
 					.join("\n")}`,
 			);
 		}

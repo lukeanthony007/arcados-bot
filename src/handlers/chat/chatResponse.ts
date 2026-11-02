@@ -37,7 +37,8 @@ export interface ChatResponseRequest {
 /** How chat turns are framed, so the model knows who it is talking to */
 const CHAT_FORMAT = `Chat format:
 - Each user message starts with the speaker's name and mention, e.g. "Lucas (<@123>): hey". Reply to that speaker; they are who "you"/"me" refers to.
-- Mention someone only when addressing them, written as <@id>. Never write bare ids, and never echo a user's message back as a tag.`;
+- Mention someone only when addressing them, written as <@id>. Never write bare ids, and never echo a user's message back as a tag.
+- Your reply is just the message text: don't start it with a "Name (<@id>):" label.`;
 
 /**
  * Generate a chat reply (bot mention or reply continuation) with the full tool catalog and
@@ -67,7 +68,7 @@ export async function generateChatResponse(
 		if (preface) prompt = `${preface}\n\n${prompt}`;
 	}
 
-	return OmpRuntime.get().generate({
+	const response = await OmpRuntime.get().generate({
 		systemPrompt: buildSystemPrompt({
 			persona: "sophia",
 			personaText: req.persona ? buildPersonaPrompt(req.persona) : undefined,
@@ -88,4 +89,18 @@ export async function generateChatResponse(
 		},
 		label: hasHistory ? "chat.reply" : "chat.mention",
 	});
+	if (!response.success) return response;
+	// Models sometimes copy the turn label ("Lucas (<@123…>): …") onto the reply
+	const label = new RegExp(
+		`^${escapeRegExp(req.speakerName)}\\s*\\(<@!?${req.userId}>\\)\\s*:?\\s*`,
+	);
+	const content = response.content
+		.replace(label, "")
+		// …or write "@123…" instead of Discord's "<@123…>" mention syntax
+		.replace(/(?<![<\w])@!?(\d{17,20})\b/g, "<@$1>");
+	return { ...response, content };
+}
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

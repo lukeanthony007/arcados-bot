@@ -214,7 +214,9 @@ Commands only receive the interaction. Shared services are attached to the Disco
 **Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
 - `UserPersonaService.buildPersona` refreshes the member's profile (RelationshipMapper → UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and top relationships, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
 - `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes the persona to `generateChatResponse` (voice is unaffected)
-- Each turn, `personaContext.ts` adds the persona member's real history with the people involved (speaker, @mentions, members named in the message): interaction counts, shared conversation summaries (slurs masked), and recent messages between them (group pings, bare mentions/links and slurs filtered), so feelings about people come from what the member actually said
+- Each turn, `personaContext.ts` adds (1) who the persona member actually interacts with most (`getTopInteractions`: replies and direct mentions both ways over their whole message history, group pings and bots excluded), which overrides the profile on who they're close to, and (2) their real history with the people involved (speaker, @mentions, members named in the message): interaction counts, shared conversation summaries (slurs masked), and recent messages between them (group pings, bare mentions/links and slurs filtered)
+- The profile writer gets the same `getTopInteractions` ranking, so rebuilt profiles describe the right people
+- `generateChatResponse` strips a copied speaker label from replies and turns bare `@123…` ids into `<@123…>` mentions
 - The service is attached to the Discord client as `client.userPersonas`
 
 **Add a database table or column**: add `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` to `PostgreSQLManager.initializeSchema()`; it runs on every startup.

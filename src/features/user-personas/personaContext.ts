@@ -17,6 +17,8 @@ const MAX_OWN_MESSAGES = 10;
 const MAX_THEIR_MESSAGES = 5;
 /** Messages pinging more people than this are group VC summons, not about the person */
 const MAX_MENTIONS_PER_MESSAGE = 3;
+/** People listed in the "who you actually interact with" ranking */
+const TOP_INTERACTIONS = 8;
 
 interface MemberName {
 	user_id: string;
@@ -43,6 +45,12 @@ interface MessageRow {
 	created_at: Date;
 }
 
+export interface InteractionRow {
+	user_id: string;
+	outgoing: number;
+	incoming: number;
+}
+
 export async function buildPersonaContext(
 	db: PostgreSQLManager,
 	guildId: string,
@@ -57,14 +65,78 @@ export async function buildPersonaContext(
 		0,
 		MAX_PEOPLE,
 	);
-	if (people.length === 0) return "";
 
-	const sections = await Promise.all(
-		people.map((personId) =>
+	const sections = await Promise.all([
+		describeTopInteractions(db, guildId, persona, byId),
+		...people.map((personId) =>
 			describeHistory(db, guildId, persona, personId, byId),
 		),
-	);
+	]);
 	return sections.filter(Boolean).join("\n\n");
+}
+
+/**
+ * Who a member really talks with: replies and direct mentions in both directions over their
+ * whole history (group pings and bots excluded), most interactions first.
+ */
+export async function getTopInteractions(
+	db: PostgreSQLManager,
+	guildId: string,
+	userId: string,
+	limit = TOP_INTERACTIONS,
+): Promise<InteractionRow[]> {
+	const result = await db.query(
+		`WITH replies AS (
+			SELECT p.author_id AS other, 'out' AS dir
+			FROM messages m JOIN messages p ON p.id = m.referenced_message_id
+			WHERE m.guild_id = $1 AND m.author_id = $2 AND p.author_id <> $2
+			UNION ALL
+			SELECT m.author_id, 'in'
+			FROM messages m JOIN messages p ON p.id = m.referenced_message_id
+			WHERE m.guild_id = $1 AND p.author_id = $2 AND m.author_id <> $2
+		), mentions AS (
+			SELECT (regexp_matches(m.content, '<@!?(\\d+)>', 'g'))[1] AS other, 'out' AS dir
+			FROM messages m
+			WHERE m.guild_id = $1 AND m.author_id = $2 AND m.content LIKE '%<@%'
+			AND array_length(regexp_split_to_array(m.content, '<@'), 1) <= $3 + 1
+			UNION ALL
+			SELECT m.author_id, 'in'
+			FROM messages m
+			WHERE m.guild_id = $1 AND m.author_id <> $2 AND strpos(m.content, '<@' || $2) > 0
+			AND array_length(regexp_split_to_array(m.content, '<@'), 1) <= $3 + 1
+		)
+		SELECT x.other AS user_id,
+			COUNT(*) FILTER (WHERE x.dir = 'out')::int AS outgoing,
+			COUNT(*) FILTER (WHERE x.dir = 'in')::int AS incoming
+		FROM (SELECT * FROM replies UNION ALL SELECT * FROM mentions) x
+		JOIN members mem ON mem.guild_id = $1 AND mem.user_id = x.other AND mem.bot = false
+		WHERE x.other <> $2
+		GROUP BY x.other
+		ORDER BY COUNT(*) DESC
+		LIMIT $4`,
+		[guildId, userId, MAX_MENTIONS_PER_MESSAGE, limit],
+	);
+	return result.success && result.data ? result.data : [];
+}
+
+/** Grounds "who are your friends" answers in data instead of the profile's summary */
+async function describeTopInteractions(
+	db: PostgreSQLManager,
+	guildId: string,
+	persona: UserPersonaData,
+	byId: Map<string, MemberName>,
+): Promise<string> {
+	const rows = await getTopInteractions(db, guildId, persona.user_id);
+	if (rows.length === 0) return "";
+
+	const self = persona.display_name;
+	return [
+		`Who you (${self}) actually interact with most (replies and direct mentions over your whole history; this overrides the profile about who you're close to):`,
+		...rows.map(
+			(row) =>
+				`- ${byId.get(row.user_id)?.name ?? row.user_id} (<@${row.user_id}>): you → them ${row.outgoing}, them → you ${row.incoming}`,
+		),
+	].join("\n");
 }
 
 async function loadMemberNames(
