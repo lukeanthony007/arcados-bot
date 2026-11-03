@@ -193,3 +193,4 @@ log/
 
 # Bot-local omp SDK state (auth/model cache)
 .omp-bot/
+rnd/out/

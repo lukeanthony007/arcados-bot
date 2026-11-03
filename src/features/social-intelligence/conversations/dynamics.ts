@@ -6,15 +6,20 @@
  */
 
 export const TONES = [
+	"joking",
 	"teasing",
+	"mocking",
+	"venting",
 	"supportive",
+	"validating",
+	"advising",
 	"asking",
 	"answering",
+	"checking_in",
 	"dismissing",
 	"escalating",
-	"checking_in",
-	"flirting",
 	"arguing",
+	"flirting",
 	"neutral",
 ] as const;
 export type Tone = (typeof TONES)[number];
@@ -35,6 +40,40 @@ export interface ConversationDynamics {
 }
 
 /**
+ * Comparable form of a name: lowercase ASCII letters and digits ("toastᓚᘏᗢ", "Toast" and the
+ * model's mangled "toastᶚᶚᶞᶟ" all become "toast"); names with no ASCII keep their letters
+ */
+function normalizeName(name: string): string {
+	const lower = name.toLowerCase();
+	const ascii = lower.replace(/[^a-z0-9]+/g, "");
+	return ascii.length >= 3 ? ascii : lower.replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/**
+ * Map a name the model wrote to a participant id: exact, then normalized, then a unique
+ * prefix of at least 3 characters (the model shortens "toastᓚᘏᗢ" to "toast", capitalizes
+ * "alex", drops "Pseudoacacia").
+ */
+export function resolveName(
+	name: string,
+	idByName: Map<string, string>,
+): string | undefined {
+	const exact = idByName.get(name.trim());
+	if (exact) return exact;
+	const wanted = normalizeName(name);
+	if (wanted.length < 3) return undefined;
+	const candidates = [...idByName].map(
+		([known, id]) => [normalizeName(known), id] as const,
+	);
+	const same = candidates.filter(([known]) => known === wanted);
+	if (same.length === 1) return same[0]?.[1];
+	const prefixed = candidates.filter(
+		([known]) => known.startsWith(wanted) || wanted.startsWith(known),
+	);
+	return prefixed.length === 1 ? prefixed[0]?.[1] : undefined;
+}
+
+/**
  * Resolve the model's names to ids; unknown names and self-addressed exchanges are dropped,
  * unknown tones become "neutral".
  */
@@ -45,15 +84,15 @@ export function toStoredDynamics(
 	const resolve = (names: string[]) => [
 		...new Set(
 			names
-				.map((n) => idByName.get(n.trim()))
+				.map((n) => resolveName(n, idByName))
 				.filter((id): id is string => !!id),
 		),
 	];
 	// One row per direction: a repeated pair keeps its first tone and gathers its notes
 	const byPair = new Map<string, ConversationDynamics["exchanges"][number]>();
 	for (const x of written.exchanges ?? []) {
-		const from = idByName.get(x.from?.trim() ?? "");
-		const to = idByName.get(x.to?.trim() ?? "");
+		const from = resolveName(x.from ?? "", idByName);
+		const to = resolveName(x.to ?? "", idByName);
 		if (!from || !to || from === to) continue;
 		const tone = (TONES as readonly string[]).includes(x.tone)
 			? (x.tone as Tone)

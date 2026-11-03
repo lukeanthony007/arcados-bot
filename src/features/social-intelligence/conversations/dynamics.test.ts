@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { toStoredDynamics } from "./dynamics";
+import { resolveName, toStoredDynamics } from "./dynamics";
 
 const ids = new Map([
 	["Terra", "1"],
@@ -73,5 +73,25 @@ describe("toStoredDynamics", () => {
 			},
 			{ from: "2", to: "3", tone: "neutral", note: "asked about his day" },
 		]);
+	});
+});
+
+describe("resolveName", () => {
+	const known = new Map([
+		["toastᓚᘏᗢ", "1"],
+		["alex", "2"],
+		["Terra Pseudoacacia", "3"],
+		["Astoria", "4"],
+		["AircraftMechanic", "5"],
+	]);
+	test("matches shortened, recased and decorated names uniquely", () => {
+		expect(resolveName("toast", known)).toBe("1");
+		expect(resolveName("Alex", known)).toBe("2");
+		expect(resolveName("Terra", known)).toBe("3");
+		expect(resolveName("terra pseudoacacia", known)).toBe("3");
+	});
+	test("refuses ambiguous or tiny names", () => {
+		expect(resolveName("A", known)).toBeUndefined();
+		expect(resolveName("Nobody", known)).toBeUndefined();
 	});
 });

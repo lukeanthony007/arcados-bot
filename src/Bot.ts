@@ -75,8 +75,11 @@ export class Bot {
           "./features/social-intelligence/enrichment-pipeline/EnrichmentScheduler"
         );
         EnrichmentPipelineOrchestrator.getInstance().initialize(this.db);
-        EnrichmentScheduler.getInstance().start(this.db);
-
+        if (config.enrichmentAuto) {
+          EnrichmentScheduler.getInstance().start(this.db);
+        } else {
+          console.log("⏸️  Enrichment paused (ENRICHMENT_AUTO=false): summaries and dossiers are not written automatically");
+        }
       } catch (error) {
         console.error("🔸 Error initializing enrichment pipeline:", error);
       }

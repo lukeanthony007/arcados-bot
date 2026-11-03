@@ -37,11 +37,6 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 			type: "object",
 			description: "Who the conversation was really between and how they treated each other",
 			properties: {
-				note: {
-					type: "string",
-					description:
-						"One sentence: who it was between, who drove it, who was talking to the room unanswered",
-				},
 				roles: {
 					type: "object",
 					properties: { drivers: NAME_LIST, responders: NAME_LIST, ignored: NAME_LIST },
@@ -49,7 +44,8 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 				},
 				exchanges: {
 					type: "array",
-					description: "Directed relationships that showed in this conversation, at most 6",
+					description:
+						"One entry per direction for every pair that talked to each other, main thread first, at most 8",
 					items: {
 						type: "object",
 						properties: {
@@ -64,8 +60,13 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 						required: ["from", "to", "tone", "note"],
 					},
 				},
+				note: {
+					type: "string",
+					description:
+						"One sentence consistent with roles and exchanges: who it was between, who drove it, who was talking to the room unanswered",
+				},
 			},
-			required: ["note", "roles", "exchanges"],
+			required: ["roles", "exchanges", "note"],
 		},
 	},
 	required: ["summary", "topic_label", "dynamics"],
@@ -77,13 +78,13 @@ interface WrittenSummary {
 	dynamics: WrittenDynamics;
 }
 
-interface GeneratedSummary {
+export interface GeneratedSummary {
 	summary: string;
 	topicLabel: string;
 	dynamics: WrittenDynamics;
 }
 
-interface PreviewMessage {
+export interface PreviewMessage {
 	author_id: string;
 	content: string | null;
 	attachments: string[] | null;
@@ -113,6 +114,18 @@ export class ConversationEnrichmentPipeline {
 		this.embeddingService = EmbeddingService.getInstance();
 	}
 
+	/**
+	 * Summary, topic label and dynamics for a conversation's messages, with no storage: the
+	 * step R&D runs on sample days and `enrichConversation` runs for real.
+	 */
+	async describe(
+		messages: PreviewMessage[],
+		names: Map<string, string>,
+		participantCount: number,
+	): Promise<GeneratedSummary | null> {
+		const preview = this.buildMessagePreview(this.sampleMessages(messages), names);
+		return this.generateSummary(messages.length, participantCount, preview);
+	}
 	/**
 	 * Enrich a conversation segment
 	 */
@@ -210,13 +223,7 @@ export class ConversationEnrichmentPipeline {
 
 			// Sample messages for preview, attributed by author name
 			const names = await this.loadNames(guildId, messages, segment.participants);
-			const messagePreview = this.buildMessagePreview(this.sampleMessages(messages), names);
-
-			const generated = await this.generateSummary(
-				messages.length,
-				participantCount,
-				messagePreview,
-			);
+			const generated = await this.describe(messages, names, participantCount);
 
 			if (!generated) {
 				return {
@@ -529,10 +536,10 @@ RULES:
 9. When multiple topics appear, emphasize the ones that span the most messages or have emotional weight (arguments, complaints, requests)
 10. The topic_label names the dominant subject (a game, event, person's situation), not a generic activity like "chatting" or "banter"
 
-Then describe the DYNAMICS, which matter as much as the topics:
-- "note": one sentence on who this conversation was really between, who drove it, and who (if anyone) was talking to the room and getting no response.
-- "roles": drivers (set the subject or kept it going), responders (mostly reacted), ignored (posted and got no uptake). Names only; a person can be in one list.
-- "exchanges": the directed relationships that showed in THIS conversation, at most 6, each from one named person to another with a tone (${TONES.join(", ")}) and a short note quoting or paraphrasing what they did to or for the other person (e.g. "kept egging alex on with the alien bit", "asked if he was at work"). Skip pairs that didn't really interact.
+Then describe the DYNAMICS, which matter as much as the topics. Fill them in this order:
+- "roles": drivers (set the subject or kept it going), responders (mostly reacted), ignored (posted and got no uptake). Names exactly as shown before each line; a person goes in one list only.
+- "exchanges": one entry per direction for every pair that actually talked to each other, the MAIN thread first (e.g. "toast → lunchie venting about J", then "lunchie → toast advising her to move out"), then side exchanges; at most 8. Each has a tone (${TONES.join(", ")}) and a short note quoting or paraphrasing what the first person did to or for the second.
+- "note": one sentence consistent with the roles and exchanges: who it was really between, who drove it, who was talking to the room unanswered.
 
 Conversation (${messageCount} messages, ${participantCount} participants):
 ${messagePreview}

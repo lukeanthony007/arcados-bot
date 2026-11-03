@@ -10,6 +10,8 @@ export interface BotConfig {
 
   // Optional Discord settings
   guildId?: string;
+  /** Run the enrichment queue (summaries, dossiers) automatically; `ENRICHMENT_AUTO=false` pauses it */
+  enrichmentAuto: boolean;
   botPrefix: string;
   botOwnerId?: string;
   spawnChannelIds?: string[];
@@ -161,6 +163,7 @@ function validateConfig(): BotConfig {
 
     // Optional Discord settings
     guildId: process.env.GUILD_ID || undefined,
+    enrichmentAuto: process.env.ENRICHMENT_AUTO !== "false",
     botPrefix: process.env.BOT_PREFIX || "!",
     botOwnerId: process.env.BOT_OWNER_ID || undefined,
     spawnChannelIds: process.env.SPAWN_CHANNEL_IDS
