@@ -370,7 +370,7 @@ async function getMessageSample(
 function describeConnections(connections: Connection[]): string[] {
 	return connections.map(
 		(connection) =>
-			`- ${connection.name}: ${describeStrength(connection)}; they reach out to this member ${Math.round(connection.inbound)}, this member reaches out ${Math.round(connection.outbound)} (recency-weighted); ${connection.shared_conversations} shared conversations`,
+			`- ${connection.name}: ${describeStrength(connection)}; they reach out to this member ${Math.round(connection.inbound)}, this member reaches out ${Math.round(connection.outbound)} (all time); ${connection.shared_conversations} shared conversations`,
 	);
 }
 

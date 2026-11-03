@@ -372,7 +372,7 @@ export const getTrendingTopicsTool: DatabaseTool = {
 export const getServerNetworkTool: DatabaseTool = {
   name: "getServerNetwork",
   description:
-    "Get the shape of the server's social network from real interactions (replies, mentions, shared conversations): the biggest hubs (members who receive the most conversational attention), the strongest pairs, friend-group communities (cliques of mutual attention), and how many members have no interactions. Pair strength is a recency-weighted interaction score; reciprocity is 1 for balanced pairs and 0 for one-sided. For the full attention hierarchy, bids and periphery use getSocialStructure.",
+    "Get the shape of the server's social network from real interactions over its whole history (replies, mentions, shared conversations): the biggest hubs (members who receive the most conversational attention), the strongest pairs, friend-group communities (cliques of mutual attention), and how many members have no interactions. Pair strength is an all-time interaction score (a friendship doesn't end because people went quiet); reciprocity is 1 for balanced pairs and 0 for one-sided. For the full attention hierarchy, bids and periphery use getSocialStructure.",
   parameters: {
     type: "object",
     properties: {},
@@ -438,7 +438,7 @@ export const getServerNetworkTool: DatabaseTool = {
 export const getSocialStructureTool: DatabaseTool = {
   name: "getSocialStructure",
   description:
-    "Get the server's social hierarchy from how people attend to each other inside conversations: the ranking of who attention flows toward (standing, how many people give them attention, how often their bids for attention are answered), the cliques that form from mutual attention (with the tone inside each), and the periphery (people who keep bidding for attention and rarely get it). Use this for 'who is the most popular / central / listened to', 'who runs with whom', 'who gets ignored', or the server's overall pecking order.",
+    "Get the server's social structure over its whole history from how people attend to each other inside conversations: who people turn to from many directions, who keeps conversations going, whose attention comes mostly from one or two people, the circles that form from mutual attention (with the tone inside each), and who reaches out without much return. People who have gone quiet or left are marked, not dropped: a friendship or a central role doesn't end because someone stopped talking. Use this for 'who is the most popular / central / listened to', 'who runs with whom', 'who gets ignored', or the server's overall pecking order.",
   parameters: {
     type: "object",
     properties: {},

@@ -4,16 +4,21 @@
  *
  * Computed on demand from `episode_attention` (one row per directed pair per episode, written
  * by the segmentation pass), `conversation_segments.focus` (each episode's structures and
- * bids) and `conversation_exchanges` model rows (tone and valence). Each episode counts with a
- * 180-day half-life from its start (like closeness), bounded by a window.
+ * bids) and `conversation_exchanges` model rows (tone and valence).
  *
- * Nothing is stored: the pure math (decay, concentration, PageRank, communities, pursuit) is
- * exported and tested; the DB functions assemble it.
+ * Over the whole history by default: who someone is close to and where they sit is what they
+ * built, and going quiet doesn't undo it. Recency is reported alongside (when they were last
+ * around, whether they're still in the server), never folded into the weights. A window
+ * (`sinceDays`, `asOf`) reads a period when that's the question.
+ *
+ * Nothing is stored: the pure math (concentration, PageRank, communities, pursuit, standing)
+ * is exported and tested; the DB functions assemble it.
  */
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import type { EpisodeFocus, FocusStructure } from "../conversations/attention";
-import { HALF_LIFE_DAYS } from "./closeness";
+
+import { QUIET_AFTER_DAYS } from "./closeness";
 
 // ---------------------------------------------------------------------------------------
 // Public shapes
@@ -39,8 +44,9 @@ type StructureKey =
 export interface AttentionProfile {
 	user_id: string;
 	name: string;
-	/** End of the window: their last conversation unless asked otherwise */
-	as_of: Date;
+	/** Their last conversation in the window, and whether they're still in the server */
+	last_active: Date | null;
+	present: boolean;
 	episodes: number;
 	given: number;
 	received: number;
@@ -63,8 +69,10 @@ export interface AttentionEdge {
 	b: string;
 	a_name: string;
 	b_name: string;
-	/** End of the window: their last shared conversation unless asked otherwise */
-	as_of: Date;
+	/** Their last conversation together in the window, and whether each is still in the server */
+	last_together: Date | null;
+	a_present: boolean;
+	b_present: boolean;
 	a_to_b: number;
 	b_to_a: number;
 	reciprocity: number;
@@ -97,41 +105,51 @@ export interface AttentionEdge {
  */
 export type SocialShape = "draws" | "engine" | "balanced";
 
+/** Who a member is in the structure, and whether they're still around */
+export interface StructureMember {
+	user_id: string;
+	name: string;
+	/** Still in the server */
+	present: boolean;
+	/** Their last conversation in the window */
+	last_active: Date | null;
+}
+
 export interface SocialStructure {
-	/** Active members by standing (average percentile of draw, reach, uptake, opener pickup) */
-	ranking: Array<{
-		user_id: string;
-		name: string;
-		standing: number;
-		shape: SocialShape;
-		/** received ÷ given */
-		draw: number;
-		reach: number;
-		uptake: number;
-		/** Share of their openers to the room someone picked up */
-		pickup: number;
-		received: number;
-		given: number;
-		/** PageRank on directed attention: whose attention counts, not how much they get */
-		influence: number;
-		/** For anchored members: the one or two people most of their attention comes from */
-		anchors: string[];
-	}>;
+	/** Participants by standing (average percentile of draw, reach, uptake, opener pickup) */
+	ranking: Array<
+		StructureMember & {
+			standing: number;
+			shape: SocialShape;
+			/** received ÷ given */
+			draw: number;
+			reach: number;
+			uptake: number;
+			/** Share of their openers to the room someone picked up */
+			pickup: number;
+			received: number;
+			given: number;
+			/** PageRank on directed attention: whose attention counts, not how much they get */
+			influence: number;
+			/** For anchored members: the one or two people most of their attention comes from */
+			anchors: string[];
+		}
+	>;
 	cliques: Array<{
-		members: Array<{ user_id: string; name: string }>;
+		members: StructureMember[];
 		internal_reciprocity: number;
 		tone: Record<string, number>;
 	}>;
 	/** Reaching out without much return and without a back-and-forth partner anywhere */
-	periphery: Array<{
-		user_id: string;
-		name: string;
-		bids: number;
-		uptake: number;
-		openers: number;
-		pickup: number;
-		unattended_episodes: number;
-	}>;
+	periphery: Array<
+		StructureMember & {
+			bids: number;
+			uptake: number;
+			openers: number;
+			pickup: number;
+			unattended_episodes: number;
+		}
+	>;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -146,25 +164,15 @@ const MAX_RANKING = 25;
 const MAX_CLIQUES = 8;
 const MIN_CLIQUE_SIZE = 3;
 const MAX_PERIPHERY = 10;
-const CLIQUE_EDGE_FLOOR = 1;
+/** Attention both ways (min of the two) a tie needs to shape circles; all-time amounts are large */
+const CLIQUE_EDGE_FLOOR = 5;
+/** Circle members named in the overview (the core, by attention traded inside the circle) */
+const CIRCLE_CORE = 6;
 /** Modularity resolution: higher splits into smaller groups */
 const RESOLUTION = 1.5;
-/** Members are ranked once they've given this much decayed attention (participants, not just addressees) */
-export const ACTIVE_MIN_GIVEN = 10;
+/** Members are ranked once they've given this much attention (participants, not just addressees) */
+export const ACTIVE_MIN_GIVEN = 25;
 const MAX_NOTES = 5;
-
-/** Weight of an episode `ageDays` old: halves every `halfLifeDays` */
-export function decayWeight(
-	ageDays: number,
-	halfLifeDays = HALF_LIFE_DAYS,
-): number {
-	return 0.5 ** (Math.max(0, ageDays) / halfLifeDays);
-}
-
-/** Decay weight of something that happened at `at`, seen at `now` */
-export function decayAt(at: Date, now: Date): number {
-	return decayWeight((now.getTime() - at.getTime()) / DAY_MS);
-}
 
 /** Herfindahl index of masses: Σ share². 1 = all on one person; → 0 as it spreads out */
 export function herfindahl(masses: number[]): number {
@@ -569,6 +577,8 @@ async function select<T>(
 interface MemberInfo {
 	name: string;
 	bot: boolean;
+	/** Still in the server */
+	active: boolean;
 }
 
 async function loadMembers(
@@ -579,16 +589,21 @@ async function loadMembers(
 		user_id: string;
 		name: string | null;
 		bot: boolean | null;
+		active: boolean | null;
 	}>(
 		db,
-		`SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name, bot
+		`SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name, bot, active
 		 FROM members WHERE guild_id = $1`,
 		[guildId],
 	);
 	return new Map(
 		rows.map((r) => [
 			r.user_id,
-			{ name: r.name ?? r.user_id, bot: r.bot === true },
+			{
+				name: r.name ?? r.user_id,
+				bot: r.bot === true,
+				active: r.active === true,
+			},
 		]),
 	);
 }
@@ -597,30 +612,33 @@ const nameIn = (members: Map<string, MemberInfo>, id: string) =>
 	members.get(id)?.name ?? id;
 const isHuman = (members: Map<string, MemberInfo>, id: string) =>
 	members.get(id)?.bot !== true;
+const isPresent = (members: Map<string, MemberInfo>, id: string) =>
+	members.get(id)?.active === true;
 
+/** A period to read instead of the whole history */
 export interface WindowOptions {
+	/** Only conversations from this many days before `asOf` (default: all of them) */
 	sinceDays?: number;
-	/**
-	 * End of the window. Defaults to the subject's last conversation, so someone who has been
-	 * away is described as they were when they were around, not as an empty profile
-	 */
+	/** Read the network as it stood at this moment (default: now) */
 	asOf?: Date;
 }
 
-/** When the given members were last in a conversation together (or `now` if never) */
-async function lastTogether(
-	db: PostgreSQLManager,
-	guildId: string,
-	userIds: string[],
-): Promise<Date> {
-	const [row] = await select<{ last: Date | null }>(
-		db,
-		`SELECT MAX(start_time) AS last FROM conversation_segments
-		 WHERE guild_id = $1 AND participants @> $2::text[]`,
-		[guildId, userIds],
-	);
-	return row?.last ? new Date(row.last) : new Date();
+function windowOf({ sinceDays, asOf }: WindowOptions): {
+	since: Date;
+	until: Date;
+} {
+	const until = asOf ?? new Date();
+	const since =
+		sinceDays === undefined
+			? new Date(0)
+			: new Date(until.getTime() - sinceDays * DAY_MS);
+	return { since, until };
 }
+
+const latest = (dates: Date[]): Date | null =>
+	dates.length
+		? new Date(Math.max(...dates.map((d) => new Date(d).getTime())))
+		: null;
 
 interface AttentionRow {
 	conversation_id: string;
@@ -656,10 +674,9 @@ export async function getAttentionProfile(
 	db: PostgreSQLManager,
 	guildId: string,
 	userId: string,
-	{ sinceDays = 365, asOf }: WindowOptions = {},
+	options: WindowOptions = {},
 ): Promise<AttentionProfile | null> {
-	const now = asOf ?? (await lastTogether(db, guildId, [userId]));
-	const since = new Date(now.getTime() - sinceDays * DAY_MS);
+	const { since, until: now } = windowOf(options);
 	const [members, rows, episodes, valenceRows] = await Promise.all([
 		loadMembers(db, guildId),
 		select<AttentionRow>(
@@ -701,13 +718,12 @@ export async function getAttentionProfile(
 	for (const r of rows) {
 		const other = r.from_user === userId ? r.to_user : r.from_user;
 		if (other === userId || !isHuman(members, other)) continue;
-		const w = decayAt(new Date(r.start_time), now);
 		if (r.from_user === userId) {
-			out.set(other, (out.get(other) ?? 0) + r.mass * w);
+			out.set(other, (out.get(other) ?? 0) + r.mass);
 			bids.made += r.bids;
 			bids.answered += r.bids_answered;
 		} else {
-			inn.set(other, (inn.get(other) ?? 0) + r.mass * w);
+			inn.set(other, (inn.get(other) ?? 0) + r.mass);
 			toThem.count += r.bids;
 			toThem.answered += r.bids_answered;
 		}
@@ -729,9 +745,7 @@ export async function getAttentionProfile(
 		if (bucket) situations[bucket]++;
 		const focus = e.focus;
 		if (!focus) continue;
-		room +=
-			(focus.people?.[userId]?.room ?? 0) *
-			decayAt(new Date(e.start_time), now);
+		room += focus.people?.[userId]?.room ?? 0;
 		const counts = countStructures(focus.structures ?? [], userId);
 		for (const key of Object.keys(structures) as StructureKey[])
 			structures[key] += counts[key];
@@ -768,7 +782,8 @@ export async function getAttentionProfile(
 	return {
 		user_id: userId,
 		name: nameIn(members, userId),
-		as_of: now,
+		last_active: latest(episodes.map((e) => e.start_time)),
+		present: isPresent(members, userId),
 		episodes: episodes.length,
 		given: round(sum(out)),
 		received: round(sum(inn)),
@@ -805,10 +820,9 @@ export async function getAttentionEdge(
 	guildId: string,
 	a: string,
 	b: string,
-	{ sinceDays = 365, asOf }: WindowOptions = {},
+	options: WindowOptions = {},
 ): Promise<AttentionEdge | null> {
-	const now = asOf ?? (await lastTogether(db, guildId, [a, b]));
-	const since = new Date(now.getTime() - sinceDays * DAY_MS);
+	const { since, until: now } = windowOf(options);
 	const [members, rows, exchanges] = await Promise.all([
 		loadMembers(db, guildId),
 		select<AttentionRow & { channel_name: string | null }>(
@@ -848,18 +862,19 @@ export async function getAttentionEdge(
 	const bidsAB = { made: 0, answered: 0 };
 	const bidsBA = { made: 0, answered: 0 };
 	const episodes = new Map<string, { size: number; channel: string }>();
+	let latestTogether = 0;
 	for (const r of rows) {
-		const w = decayAt(new Date(r.start_time), now);
+		latestTogether = Math.max(latestTogether, new Date(r.start_time).getTime());
 		episodes.set(r.conversation_id, {
 			size: r.size ?? 0,
 			channel: r.channel_name ?? r.channel_id,
 		});
 		if (r.from_user === a) {
-			aToB += r.mass * w;
+			aToB += r.mass;
 			bidsAB.made += r.bids;
 			bidsAB.answered += r.bids_answered;
 		} else {
-			bToA += r.mass * w;
+			bToA += r.mass;
 			bidsBA.made += r.bids;
 			bidsBA.answered += r.bids_answered;
 		}
@@ -896,7 +911,9 @@ export async function getAttentionEdge(
 		b,
 		a_name: nameIn(members, a),
 		b_name: nameIn(members, b),
-		as_of: now,
+		last_together: latestTogether ? new Date(latestTogether) : null,
+		a_present: isPresent(members, a),
+		b_present: isPresent(members, b),
 		a_to_b: round(aToB),
 		b_to_a: round(bToA),
 		reciprocity: round(ratio(Math.min(aToB, bToA), Math.max(aToB, bToA)), 2),
@@ -933,11 +950,9 @@ export async function getAttentionEdge(
 export async function getSocialStructure(
 	db: PostgreSQLManager,
 	guildId: string,
-	sinceDays = 180,
-	/** Read the structure as it was at this moment (window and decay end here) */
-	asOf = new Date(),
+	options: WindowOptions = {},
 ): Promise<SocialStructure> {
-	const since = new Date(asOf.getTime() - sinceDays * DAY_MS);
+	const { since, until: asOf } = windowOf(options);
 	const window = "cs.start_time >= $2 AND cs.start_time <= $3";
 	const [members, rows, toneRows, unattendedRows, openerRows] =
 		await Promise.all([
@@ -983,12 +998,16 @@ export async function getSocialStructure(
 	const received = new Map<string, number>();
 	const givers = new Map<string, Set<string>>();
 	const bids = new Map<string, { made: number; answered: number }>();
+	const lastSeen = new Map<string, number>();
 	for (const r of rows) {
 		if (r.from_user === r.to_user) continue;
 		if (!isHuman(members, r.from_user) || !isHuman(members, r.to_user))
 			continue;
-		const w = decayAt(new Date(r.start_time), asOf);
-		const mass = r.mass * w;
+		const mass = r.mass;
+		const at = new Date(r.start_time).getTime();
+		for (const id of [r.from_user, r.to_user]) {
+			lastSeen.set(id, Math.max(lastSeen.get(id) ?? 0, at));
+		}
 		const key = `${r.from_user}|${r.to_user}`;
 		directed.set(key, (directed.get(key) ?? 0) + mass);
 		given.set(r.from_user, (given.get(r.from_user) ?? 0) + mass);
@@ -1009,7 +1028,15 @@ export async function getSocialStructure(
 		}
 	}
 
-	const person = (id: string) => ({ user_id: id, name: nameIn(members, id) });
+	const person = (id: string): StructureMember => {
+		const last = lastSeen.get(id);
+		return {
+			user_id: id,
+			name: nameIn(members, id),
+			present: isPresent(members, id),
+			last_active: last ? new Date(last) : null,
+		};
+	};
 
 	const reciprocal: UndirectedEdge[] = [];
 	for (const [key, ab] of directed) {
@@ -1023,12 +1050,17 @@ export async function getSocialStructure(
 		const inside = new Set(ids);
 		let lo = 0;
 		let hi = 0;
+		const tie = new Map<string, number>(ids.map((id) => [id, 0]));
 		for (let i = 0; i < ids.length; i++) {
 			for (let j = i + 1; j < ids.length; j++) {
-				const ab = directed.get(`${ids[i]}|${ids[j]}`) ?? 0;
-				const ba = directed.get(`${ids[j]}|${ids[i]}`) ?? 0;
+				const x = ids[i] as string;
+				const y = ids[j] as string;
+				const ab = directed.get(`${x}|${y}`) ?? 0;
+				const ba = directed.get(`${y}|${x}`) ?? 0;
 				lo += Math.min(ab, ba);
 				hi += Math.max(ab, ba);
+				tie.set(x, (tie.get(x) ?? 0) + Math.min(ab, ba));
+				tie.set(y, (tie.get(y) ?? 0) + Math.min(ab, ba));
 			}
 		}
 		const tone: Record<string, number> = {};
@@ -1038,7 +1070,10 @@ export async function getSocialStructure(
 			}
 		}
 		return {
-			members: ids.map(person),
+			// Core first: who trades the most attention inside the circle
+			members: [...ids]
+				.sort((x, y) => (tie.get(y) ?? 0) - (tie.get(x) ?? 0))
+				.map(person),
 			internal_reciprocity: round(ratio(lo, hi), 2),
 			tone,
 		};
@@ -1208,8 +1243,8 @@ const names = (list: string[]) =>
 		? list.join(" and ")
 		: `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 
-/** A window ending this long ago describes the past, and the text says so */
-const STALE_MS = 30 * DAY_MS;
+/** Going quiet this long is worth saying; the bond itself still counts */
+const QUIET_MS = QUIET_AFTER_DAYS * DAY_MS;
 const monthYear = (d: Date) =>
 	d.toLocaleDateString("en-US", {
 		month: "long",
@@ -1217,9 +1252,26 @@ const monthYear = (d: Date) =>
 		timeZone: "America/New_York",
 	});
 
+/** "no longer in the server (last around March 2026)", "quiet since January 2026", or "" */
+function recency(last: Date | null, present: boolean): string {
+	if (!present)
+		return last
+			? `no longer in the server, last around ${monthYear(last)}`
+			: "no longer in the server";
+	if (last && Date.now() - last.getTime() > QUIET_MS)
+		return `quiet since ${monthYear(last)}`;
+	return "";
+}
+
+const tagged = (m: StructureMember) => {
+	const r = recency(m.last_active, m.present);
+	return r ? `${m.name} (${r})` : m.name;
+};
+
 export function describeProfile(p: AttentionProfile): string[] {
+	const when = recency(p.last_active, p.present);
 	const lines: string[] = [
-		`${p.name}: ${plural(p.episodes, "conversation")} in the year up to ${p.as_of.getTime() < Date.now() - STALE_MS ? `${monthYear(p.as_of)}, when they were last active` : "now"}.`,
+		`${p.name}: ${plural(p.episodes, "conversation")} over their time here${when ? `; ${when}` : ""}.`,
 	];
 	const draw = (p.received + SMOOTHING) / (p.given + SMOOTHING);
 	if (draw >= 1.15) lines.push("Receives more attention than they give.");
@@ -1307,7 +1359,13 @@ export function describeProfile(p: AttentionProfile): string[] {
 
 export function describeEdge(e: AttentionEdge): string[] {
 	const lines: string[] = [
-		`${e.a_name} and ${e.b_name}: attention flows ${balanceBand(e.reciprocity)} between them across ${plural(e.episodes_together, "conversation")}${e.as_of.getTime() < Date.now() - STALE_MS ? `, up to ${monthYear(e.as_of)} when they last talked` : ""}.`,
+		`${e.a_name} and ${e.b_name}: attention flows ${balanceBand(e.reciprocity)} between them across ${plural(e.episodes_together, "conversation")}${e.last_together && Date.now() - e.last_together.getTime() > QUIET_MS ? `; they last talked in ${monthYear(e.last_together)}` : ""}.`,
+		...[
+			[e.a_name, e.a_present],
+			[e.b_name, e.b_present],
+		]
+			.filter(([, present]) => !present)
+			.map(([name]) => `${name} is no longer in the server.`),
 	];
 	const big = Math.max(e.a_to_b, e.b_to_a);
 	if (big >= PURSUIT_MIN_MASS && e.reciprocity < PURSUIT_RETURN_RATIO) {
@@ -1349,11 +1407,12 @@ export function describeEdge(e: AttentionEdge): string[] {
 	return lines;
 }
 
+/** The whole history by default; people who are quiet or gone are marked, not dropped */
 export function describeStructureOverview(s: SocialStructure): string[] {
 	const lines: string[] = [];
-	const top = s.ranking.slice(0, 8);
+	const top = s.ranking.slice(0, 10);
 	const byShape = (shape: SocialShape) =>
-		top.filter((r) => r.shape === shape).map((r) => r.name);
+		top.filter((r) => r.shape === shape).map(tagged);
 	const draws = byShape("draws");
 	const engines = byShape("engine");
 	if (draws.length) {
@@ -1366,7 +1425,7 @@ export function describeStructureOverview(s: SocialStructure): string[] {
 			`${names(engines)} keep${engines.length === 1 ? "s" : ""} conversations going: they give out more attention than they collect.`,
 		);
 	}
-	const others = top.filter((r) => r.shape === "balanced").map((r) => r.name);
+	const others = top.filter((r) => r.shape === "balanced").map(tagged);
 	if (others.length) lines.push(`Also well placed: ${names(others)}.`);
 	for (const r of top.filter((r) => r.anchors.length)) {
 		lines.push(`Most of ${r.name}'s attention comes from ${names(r.anchors)}.`);
@@ -1380,12 +1439,17 @@ export function describeStructureOverview(s: SocialStructure): string[] {
 					? "partly mutual"
 					: "one-sided";
 		lines.push(
-			`Circle: ${names(c.members.map((m) => m.name))} (attention ${mutual}${tone ? `; ${tone}` : ""}).`,
+			`Circle: ${names([
+				...c.members.slice(0, CIRCLE_CORE).map(tagged),
+				...(c.members.length > CIRCLE_CORE
+					? [`${c.members.length - CIRCLE_CORE} others`]
+					: []),
+			])} (attention ${mutual}${tone ? `; ${tone}` : ""}).`,
 		);
 	}
 	if (s.periphery.length) {
 		lines.push(
-			`Often reaching out without much return, and without anyone they regularly trade attention with: ${names(s.periphery.map((p) => p.name))}.`,
+			`Often reaching out without much return, and without anyone they regularly trade attention with: ${names(s.periphery.map(tagged))}.`,
 		);
 	}
 	return lines;

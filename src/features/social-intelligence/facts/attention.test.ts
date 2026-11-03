@@ -3,7 +3,6 @@ import {
 	type MemberSignals,
 	classifyShape,
 	countStructures,
-	decayWeight,
 	findCommunities,
 	herfindahl,
 	isAnchored,
@@ -16,15 +15,6 @@ import {
 	standingScores,
 	uptakeOf,
 } from "./attention";
-
-describe("decayWeight", () => {
-	test("halves every half-life", () => {
-		expect(decayWeight(0)).toBe(1);
-		expect(decayWeight(180)).toBeCloseTo(0.5);
-		expect(decayWeight(360)).toBeCloseTo(0.25);
-		expect(decayWeight(-5)).toBe(1);
-	});
-});
 
 describe("herfindahl", () => {
 	test("one target is 1, even split is 1/n", () => {

@@ -13,10 +13,11 @@
  *   conversation  a and b took part in the same conversation         1 point, both directions
  *   reaction      a reacted to b's message (recorded live from now on) 1 point, a → b
  *
- * Each interaction's weight decays with a 180-day half-life, so "closeness" means current
- * closeness; raw counts are reported alongside it. For a pair:
+ * Closeness is the whole history: a friendship is what two people have built, and going quiet
+ * doesn't undo it. How recent it is is reported separately (`last_interaction`, and whether
+ * the other person is still in the server), never folded into the strength. For a pair:
  *
- *   strength    = decayed points a→b + decayed points b→a
+ *   strength    = points a→b + points b→a
  *   reciprocity = min(a→b, b→a) / max(a→b, b→a)   (1 = balanced, 0 = one-sided)
  *   share       = strength / Σ strength over all of a's pairs   ("x% of a's interactions")
  *
@@ -25,7 +26,8 @@
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 
-export const HALF_LIFE_DAYS = 180;
+/** Not talking for this long is worth saying, even about a close pair */
+export const QUIET_AFTER_DAYS = 90;
 const MAX_MENTIONS_PER_MESSAGE = 3;
 const WEIGHTS = {
 	reply: 3,
@@ -38,15 +40,17 @@ const WEIGHTS = {
 export interface Connection {
 	user_id: string;
 	name: string;
-	/** Decayed interaction points, both directions */
+	/** Interaction points, both directions, all time */
 	strength: number;
 	/** Fraction of the subject's total strength (0-1) */
 	share: number;
 	/** 1 = balanced, 0 = entirely one-sided */
 	reciprocity: number;
-	/** Decayed points subject → other and other → subject */
+	/** Points subject → other and other → subject */
 	outbound: number;
 	inbound: number;
+	/** Whether the other person is still in the server */
+	present: boolean;
 	/** Raw counts, all time */
 	replies: number;
 	mentions: number;
@@ -86,6 +90,7 @@ interface PairRow {
 	in_mentions: string;
 	in_turns: string;
 	last_interaction: Date;
+	present: boolean | null;
 }
 
 /**
@@ -142,8 +147,7 @@ function eventsCte(subjectFilter: boolean): string {
 					WHEN 'mention' THEN ${WEIGHTS.mention}
 					WHEN 'turn' THEN ${WEIGHTS.turn}
 					WHEN 'reaction' THEN ${WEIGHTS.reaction}
-					ELSE ${WEIGHTS.conversation} END
-					* exp(-ln(2) * EXTRACT(EPOCH FROM (NOW() - ts)) / (${HALF_LIFE_DAYS} * 86400)) AS w
+					ELSE ${WEIGHTS.conversation} END AS w
 			FROM events
 		)`;
 }
@@ -165,7 +169,8 @@ const PAIR_SELECT = `
 		COUNT(*) FILTER (WHERE w.kind = 'reply' AND w.b = $2) AS in_replies,
 		COUNT(*) FILTER (WHERE w.kind = 'mention' AND w.b = $2) AS in_mentions,
 		COALESCE(SUM(w.n) FILTER (WHERE w.kind = 'turn' AND w.b = $2), 0) AS in_turns,
-		MAX(w.ts) AS last_interaction
+		MAX(w.ts) AS last_interaction,
+		COALESCE(mem.active, false) AS present
 	FROM weighted w
 	CROSS JOIN LATERAL (SELECT CASE WHEN w.a = $2 THEN w.b ELSE w.a END AS user_id) o
 	LEFT JOIN members mem ON mem.guild_id = $1 AND mem.user_id = o.user_id`;
@@ -182,6 +187,7 @@ function toConnection(row: PairRow, totalStrength: number): Connection {
 		reciprocity: reciprocity(outbound, inbound),
 		outbound,
 		inbound,
+		present: row.present === true,
 		replies: Number(row.replies),
 		mentions: Number(row.mentions),
 		inferred_attention: round1(Number(row.turns)),
@@ -205,7 +211,7 @@ export async function getConnections(
 	limit = 10,
 ): Promise<Connection[]> {
 	const result = await db.query(
-		`WITH ${eventsCte(true)}, pairs AS (${PAIR_SELECT} GROUP BY o.user_id, mem.nick, mem.display_name, mem.global_name, mem.username)
+		`WITH ${eventsCte(true)}, pairs AS (${PAIR_SELECT} GROUP BY o.user_id, mem.nick, mem.display_name, mem.global_name, mem.username, mem.active)
 		SELECT p.*, SUM(p.strength) OVER () AS total_strength
 		FROM pairs p ORDER BY p.strength DESC LIMIT $3`,
 		[guildId, userId, limit],
@@ -223,7 +229,7 @@ export async function getPairFacts(
 	userB: string,
 ): Promise<PairFacts | null> {
 	const result = await db.query(
-		`WITH ${eventsCte(true)}, pairs AS (${PAIR_SELECT} GROUP BY o.user_id, mem.nick, mem.display_name, mem.global_name, mem.username)
+		`WITH ${eventsCte(true)}, pairs AS (${PAIR_SELECT} GROUP BY o.user_id, mem.nick, mem.display_name, mem.global_name, mem.username, mem.active)
 		SELECT p.*, SUM(p.strength) OVER () AS total_strength FROM pairs p`,
 		[guildId, userA],
 	);
@@ -280,9 +286,13 @@ export async function getGuildGraph(
 	}));
 }
 
-/** Plain-English strength label for prompts and tool output */
+/**
+ * Plain-English strength label for prompts and tool output, with recency kept separate from
+ * the bond: "very close; haven't talked since January 2026", "close; no longer in the server"
+ */
 export function describeStrength(
-	connection: Pick<Connection, "share" | "reciprocity">,
+	connection: Pick<Connection, "share" | "reciprocity"> &
+		Partial<Pick<Connection, "last_interaction" | "present">>,
 ): string {
 	const level =
 		connection.share >= 0.25
@@ -293,5 +303,14 @@ export function describeStrength(
 					? "regular"
 					: "occasional";
 	const balance = connection.reciprocity < 0.34 ? ", mostly one-sided" : "";
-	return `${level}${balance}`;
+	const last = connection.last_interaction
+		? new Date(connection.last_interaction)
+		: null;
+	const recency =
+		connection.present === false
+			? "; no longer in the server"
+			: last && Date.now() - last.getTime() > QUIET_AFTER_DAYS * 86_400_000
+				? `; haven't talked since ${last.toLocaleDateString("en-US", { month: "long", year: "numeric", timeZone: "America/New_York" })}`
+				: "";
+	return `${level}${balance}${recency}`;
 }
