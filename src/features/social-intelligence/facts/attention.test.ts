@@ -1,14 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import {
+	type MemberSignals,
+	classifyShape,
 	countStructures,
 	decayWeight,
 	findCommunities,
 	herfindahl,
+	isAnchored,
 	isPeripheral,
 	isPursuit,
 	pagerank,
+	percentiles,
 	rankFlows,
 	sizeBucket,
+	standingScores,
+	uptakeOf,
 } from "./attention";
 
 describe("decayWeight", () => {
@@ -129,11 +135,106 @@ describe("situations and structures", () => {
 			room: 0,
 		});
 	});
+});
 
-	test("periphery: bids, below-baseline uptake, standing at or under the median", () => {
-		expect(isPeripheral(5, 0.1, 0.3, 0.01, 0.02)).toBe(true);
-		expect(isPeripheral(2, 0, 0.3, 0.01, 0.02)).toBe(false);
-		expect(isPeripheral(5, 0.3, 0.3, 0.01, 0.02)).toBe(false);
-		expect(isPeripheral(5, 0.1, 0.3, 0.2, 0.02)).toBe(false);
+const member = (
+	over: Partial<MemberSignals> & { id: string },
+): MemberSignals => ({
+	given: 50,
+	received: 50,
+	reach: 5,
+	bids: 20,
+	bidsAnswered: 10,
+	openers: 10,
+	openersTakenUp: 5,
+	topTwoInShare: 0.4,
+	partner: 10,
+	...over,
+});
+
+describe("social structure", () => {
+	test("standing rewards draw, reach and uptake, not volume", () => {
+		// The engine talks five times as much; the draw is answered more and reaches further
+		const engine = member({
+			id: "engine",
+			given: 500,
+			received: 400,
+			reach: 6,
+			bidsAnswered: 6,
+		});
+		const draw = member({
+			id: "draw",
+			given: 60,
+			received: 80,
+			reach: 9,
+			bidsAnswered: 14,
+		});
+		const quiet = member({
+			id: "quiet",
+			given: 20,
+			received: 15,
+			reach: 2,
+			bidsAnswered: 4,
+		});
+		const s = standingScores([engine, draw, quiet], {
+			uptake: 0.4,
+			pickup: 0.5,
+		});
+		expect(s.get("draw")).toBeGreaterThan(s.get("engine") ?? 0);
+		expect(s.get("engine")).toBeGreaterThan(s.get("quiet") ?? 0);
+	});
+
+	test("a handful of answered bids is shrunk toward the server baseline", () => {
+		const lucky = member({ id: "l", bids: 2, bidsAnswered: 2 });
+		const steady = member({ id: "s", bids: 60, bidsAnswered: 42 });
+		const base = { uptake: 0.3, pickup: 0.5 };
+		expect(uptakeOf(lucky, base)).toBeCloseTo(0.44, 2);
+		expect(uptakeOf(steady, base)).toBeGreaterThan(uptakeOf(lucky, base));
+	});
+
+	test("percentiles share ranks on ties", () => {
+		expect(percentiles([3, 1, 3, 2])).toEqual([5 / 6, 0, 5 / 6, 1 / 3]);
+	});
+
+	test("shape: draws widely, engine, balanced", () => {
+		expect(
+			classifyShape(member({ id: "b", received: 70, reach: 9 }), 8, 100),
+		).toBe("draws");
+		expect(
+			classifyShape(member({ id: "c", given: 200, received: 150 }), 8, 100),
+		).toBe("engine");
+		expect(classifyShape(member({ id: "d" }), 8, 100)).toBe("balanced");
+	});
+
+	test("anchored means clearly more concentrated than an even spread", () => {
+		expect(isAnchored(member({ id: "j", reach: 9, topTwoInShare: 0.76 }))).toBe(
+			true,
+		);
+		// Three givers: the top two hold two thirds anyway
+		expect(isAnchored(member({ id: "k", reach: 3, topTwoInShare: 0.8 }))).toBe(
+			false,
+		);
+		expect(isAnchored(member({ id: "m", reach: 9, topTwoInShare: 0.4 }))).toBe(
+			false,
+		);
+	});
+
+	test("periphery needs low return, no back-and-forth partner and low draw", () => {
+		const reaching = member({
+			id: "r",
+			given: 30,
+			received: 10,
+			bidsAnswered: 2,
+			openersTakenUp: 1,
+			partner: 1,
+		});
+		const base = { uptake: 0.5, pickup: 0.5 };
+		expect(isPeripheral(reaching, base)).toBe(true);
+		// Same pattern, but with someone they really talk to: not peripheral
+		expect(isPeripheral({ ...reaching, partner: 8 }, base)).toBe(false);
+		// Answered as often as everyone else
+		expect(
+			isPeripheral({ ...reaching, bidsAnswered: 10, openersTakenUp: 5 }, base),
+		).toBe(false);
 	});
 });

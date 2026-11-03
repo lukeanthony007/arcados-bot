@@ -83,26 +83,49 @@ export interface AttentionEdge {
 	}>;
 }
 
+/**
+ * How a member spends attention, from ratios rather than volume:
+ * - draws: receives more attention than they give, from many people
+ * - engine: gives a lot and collects less than they give; keeps conversations going
+ * - balanced: neither
+ * Where their attention comes from is separate (`anchors`: one or two people most of it
+ * comes from, when that's clearly more than an even spread).
+ */
+export type SocialShape = "draws" | "engine" | "balanced";
+
 export interface SocialStructure {
+	/** Active members by standing (average percentile of draw, reach, uptake, opener pickup) */
 	ranking: Array<{
 		user_id: string;
 		name: string;
 		standing: number;
+		shape: SocialShape;
+		/** received ÷ given */
+		draw: number;
+		reach: number;
+		uptake: number;
+		/** Share of their openers to the room someone picked up */
+		pickup: number;
 		received: number;
 		given: number;
-		uptake: number;
-		reach: number;
+		/** PageRank on directed attention: whose attention counts, not how much they get */
+		influence: number;
+		/** For anchored members: the one or two people most of their attention comes from */
+		anchors: string[];
 	}>;
 	cliques: Array<{
 		members: Array<{ user_id: string; name: string }>;
 		internal_reciprocity: number;
 		tone: Record<string, number>;
 	}>;
+	/** Reaching out without much return and without a back-and-forth partner anywhere */
 	periphery: Array<{
 		user_id: string;
 		name: string;
 		bids: number;
 		uptake: number;
+		openers: number;
+		pickup: number;
 		unattended_episodes: number;
 	}>;
 }
@@ -122,8 +145,8 @@ const MAX_PERIPHERY = 10;
 const CLIQUE_EDGE_FLOOR = 1;
 /** Modularity resolution: higher splits into smaller groups */
 const RESOLUTION = 1.5;
-const PERIPHERY_MIN_BIDS = 3;
-const PERIPHERY_UPTAKE_RATIO = 0.75;
+/** Members are ranked once they've given this much decayed attention (participants, not just addressees) */
+export const ACTIVE_MIN_GIVEN = 10;
 const MAX_NOTES = 5;
 
 /** Weight of an episode `ageDays` old: halves every `halfLifeDays` */
@@ -373,23 +396,152 @@ export function countStructures(
 	return out;
 }
 
+/** What the structure is computed from, per active member (decayed masses, raw bid counts) */
+export interface MemberSignals {
+	id: string;
+	given: number;
+	received: number;
+	/** Distinct people who gave them ≥ 1 attention */
+	reach: number;
+	bids: number;
+	bidsAnswered: number;
+	openers: number;
+	openersTakenUp: number;
+	/** Share of the attention they receive that comes from their top two givers */
+	topTwoInShare: number;
+	/** Their strongest back-and-forth: max over others of min(a→b, b→a) */
+	partner: number;
+}
+
+/** Percentile (0-1) of each value among all of them; ties share their average rank */
+export function percentiles(values: number[]): number[] {
+	if (values.length <= 1) return values.map(() => 0.5);
+	const order = values.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+	const out = new Array<number>(values.length);
+	for (let start = 0; start < order.length; ) {
+		let end = start;
+		while (end + 1 < order.length && order[end + 1]?.v === order[start]?.v)
+			end++;
+		const rank = (start + end) / 2 / (values.length - 1);
+		for (const entry of order.slice(start, end + 1)) out[entry.i] = rank;
+		start = end + 1;
+	}
+	return out;
+}
+
+/** Server-wide rates that small samples are shrunk toward */
+export interface Baselines {
+	uptake: number;
+	pickup: number;
+}
+
 /**
- * Whether a member sits at the edge: bids often, gets answered clearly less than the server
- * does overall (below 75% of `baselineUptake`), and attention does not flow toward them
- * (standing at or under the median).
+ * Pseudo-observations at the server baseline added to every member's rates, so a handful of
+ * bids can't make someone look like they're always (or never) answered
  */
-export function isPeripheral(
-	bids: number,
-	uptake: number,
-	baselineUptake: number,
-	standing: number,
-	medianStanding: number,
-): boolean {
-	return (
-		bids >= PERIPHERY_MIN_BIDS &&
-		uptake < PERIPHERY_UPTAKE_RATIO * baselineUptake &&
-		standing <= medianStanding
+export const SMOOTHING = 8;
+
+export function baselinesOf(members: MemberSignals[]): Baselines {
+	const sum = (f: (m: MemberSignals) => number) =>
+		members.reduce((s, m) => s + f(m), 0);
+	return {
+		uptake: ratio(
+			sum((m) => m.bidsAnswered),
+			sum((m) => m.bids),
+		),
+		pickup: ratio(
+			sum((m) => m.openersTakenUp),
+			sum((m) => m.openers),
+		),
+	};
+}
+
+/** Attention received per attention given, shrunk toward even */
+export const drawOf = (m: MemberSignals) =>
+	(m.received + SMOOTHING) / (m.given + SMOOTHING);
+export const uptakeOf = (m: MemberSignals, b: Baselines) =>
+	(m.bidsAnswered + SMOOTHING * b.uptake) / (m.bids + SMOOTHING);
+export const pickupOf = (m: MemberSignals, b: Baselines) =>
+	(m.openersTakenUp + SMOOTHING * b.pickup) / (m.openers + SMOOTHING);
+
+/**
+ * Standing: the average percentile of four signals that volume alone can't buy: draw (attention
+ * received per attention given), reach, how often their bids land, and how often their openers
+ * to the room are picked up. Rates are shrunk toward the server baseline.
+ */
+export function standingScores(
+	members: MemberSignals[],
+	baselines: Baselines,
+): Map<string, number> {
+	const signals = [
+		percentiles(members.map(drawOf)),
+		percentiles(members.map((m) => m.reach)),
+		percentiles(members.map((m) => uptakeOf(m, baselines))),
+		percentiles(members.map((m) => pickupOf(m, baselines))),
+	];
+	return new Map(
+		members.map((m, i) => [
+			m.id,
+			signals.reduce((s, p) => s + (p[i] ?? 0), 0) / signals.length,
+		]),
 	);
+}
+
+export const ANCHORED_TOP_TWO_SHARE = 0.6;
+
+/**
+ * Most of the attention they receive comes from one or two people, clearly more than an even
+ * spread over the people who attend to them would give (with three givers, two of them always
+ * hold two thirds, so that alone says nothing)
+ */
+export function isAnchored(m: MemberSignals): boolean {
+	if (m.reach === 0) return false;
+	const even = Math.min(1, 2 / m.reach);
+	return (
+		m.topTwoInShare >= ANCHORED_TOP_TWO_SHARE && m.topTwoInShare >= 1.5 * even
+	);
+}
+
+/** How they spend attention; anchoring (where theirs comes from) is reported separately */
+export function classifyShape(
+	m: MemberSignals,
+	reachP75: number,
+	givenP75: number,
+): SocialShape {
+	const draw = drawOf(m);
+	if (draw >= 1 && m.reach >= reachP75) return "draws";
+	if (m.given >= givenP75 && draw < 0.95) return "engine";
+	return "balanced";
+}
+
+/**
+ * A back-and-forth partner is someone they trade at least this share of their own attention
+ * with (min of both directions); relative, because in a busy stretch a single decent chat
+ * would clear any absolute floor
+ */
+export const PARTNER_SHARE = 0.25;
+/** …and never less than this much attention, so near-silent members aren't judged on noise */
+export const PARTNER_FLOOR = 3;
+const PERIPHERY_MIN_ATTEMPTS = 3;
+const PERIPHERY_RETURN_RATIO = 0.75;
+
+/**
+ * Reaching out without much return: their bids or openers land clearly less often than the
+ * server's (rates shrunk toward the baseline), and nobody trades a real share of attention
+ * with them. Someone whose bids often fail but who has a close partner is not peripheral;
+ * they just talk past the room sometimes. (Attention received isn't used: the conversations
+ * that do happen are mostly one-on-one, where attention is symmetric.)
+ */
+export function isPeripheral(m: MemberSignals, b: Baselines): boolean {
+	const lowBids =
+		m.bids >= PERIPHERY_MIN_ATTEMPTS &&
+		uptakeOf(m, b) < PERIPHERY_RETURN_RATIO * b.uptake;
+	const lowOpeners =
+		m.openers >= PERIPHERY_MIN_ATTEMPTS &&
+		pickupOf(m, b) < PERIPHERY_RETURN_RATIO * b.pickup;
+	const hasPartner =
+		m.partner >= PARTNER_SHARE * Math.max(m.given, PARTNER_FLOOR);
+	return (lowBids || lowOpeners) && !hasPartner;
 }
 
 const ratio = (part: number, whole: number) => (whole > 0 ? part / whole : 0);
@@ -756,35 +908,49 @@ export async function getSocialStructure(
 	db: PostgreSQLManager,
 	guildId: string,
 	sinceDays = 180,
+	/** Read the structure as it was at this moment (window and decay end here) */
+	asOf = new Date(),
 ): Promise<SocialStructure> {
-	const since = windowStart(sinceDays);
-	const now = new Date();
-	const [members, rows, toneRows, unattendedRows] = await Promise.all([
-		loadMembers(db, guildId),
-		select<AttentionRow>(
-			db,
-			`${ATTENTION_SELECT} WHERE cs.guild_id = $1 AND cs.start_time >= $2`,
-			[guildId, since],
-		),
-		select<{ from_user: string; to_user: string; tone: string; n: number }>(
-			db,
-			`SELECT x.from_user, x.to_user, x.tone, COUNT(*)::int AS n
+	const since = new Date(asOf.getTime() - sinceDays * DAY_MS);
+	const window = "cs.start_time >= $2 AND cs.start_time <= $3";
+	const [members, rows, toneRows, unattendedRows, openerRows] =
+		await Promise.all([
+			loadMembers(db, guildId),
+			select<AttentionRow>(
+				db,
+				`${ATTENTION_SELECT} WHERE cs.guild_id = $1 AND ${window}`,
+				[guildId, since, asOf],
+			),
+			select<{ from_user: string; to_user: string; tone: string; n: number }>(
+				db,
+				`SELECT x.from_user, x.to_user, x.tone, COUNT(*)::int AS n
 			 FROM conversation_exchanges x
 			 JOIN conversation_segments cs ON cs.id = x.conversation_id
-			 WHERE cs.guild_id = $1 AND x.source = 'model' AND cs.start_time >= $2 AND x.tone IS NOT NULL
+			 WHERE cs.guild_id = $1 AND x.source = 'model' AND ${window} AND x.tone IS NOT NULL
 			 GROUP BY 1, 2, 3`,
-			[guildId, since],
-		),
-		select<{ user_id: string; n: number }>(
-			db,
-			`SELECT s->>'user' AS user_id, COUNT(*)::int AS n
+				[guildId, since, asOf],
+			),
+			select<{ user_id: string; n: number }>(
+				db,
+				`SELECT s->>'user' AS user_id, COUNT(*)::int AS n
 			 FROM conversation_segments cs, jsonb_array_elements(cs.focus->'structures') s
-			 WHERE cs.guild_id = $1 AND cs.start_time >= $2 AND cs.focus IS NOT NULL
+			 WHERE cs.guild_id = $1 AND ${window} AND cs.focus IS NOT NULL
 				AND s->>'kind' = 'unattended'
 			 GROUP BY 1`,
-			[guildId, since],
-		),
-	]);
+				[guildId, since, asOf],
+			),
+			// Openers to the room (bids with no person target) and whether anyone picked them up
+			select<{ user_id: string; made: number; taken: number }>(
+				db,
+				`SELECT b->>'from' AS user_id, COUNT(*)::int AS made,
+				COUNT(*) FILTER (WHERE b->>'answered_by' IS NOT NULL)::int AS taken
+			 FROM conversation_segments cs, jsonb_array_elements(cs.focus->'bids') b
+			 WHERE cs.guild_id = $1 AND ${window} AND cs.focus IS NOT NULL
+				AND b->>'to' IS NULL
+			 GROUP BY 1`,
+				[guildId, since, asOf],
+			),
+		]);
 
 	const directed = new Map<string, number>();
 	const given = new Map<string, number>();
@@ -795,7 +961,7 @@ export async function getSocialStructure(
 		if (r.from_user === r.to_user) continue;
 		if (!isHuman(members, r.from_user) || !isHuman(members, r.to_user))
 			continue;
-		const w = decayAt(new Date(r.start_time), now);
+		const w = decayAt(new Date(r.start_time), asOf);
 		const mass = r.mass * w;
 		const key = `${r.from_user}|${r.to_user}`;
 		directed.set(key, (directed.get(key) ?? 0) + mass);
@@ -817,22 +983,7 @@ export async function getSocialStructure(
 		}
 	}
 
-	const standing = pagerank(edges);
 	const person = (id: string) => ({ user_id: id, name: nameIn(members, id) });
-	const ranking = [...standing.entries()]
-		.sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : 1))
-		.slice(0, MAX_RANKING)
-		.map(([id, s]) => {
-			const b = bids.get(id) ?? { made: 0, answered: 0 };
-			return {
-				...person(id),
-				standing: round(s, 3),
-				received: round(received.get(id) ?? 0),
-				given: round(given.get(id) ?? 0),
-				uptake: round(ratio(b.answered, b.made), 2),
-				reach: givers.get(id)?.size ?? 0,
-			};
-		});
 
 	const reciprocal: UndirectedEdge[] = [];
 	for (const [key, ab] of directed) {
@@ -870,25 +1021,88 @@ export async function getSocialStructure(
 	const unattended = new Map(
 		unattendedRows.map((r) => [r.user_id, Number(r.n)]),
 	);
-	let allMade = 0;
-	let allAnswered = 0;
-	for (const b of bids.values()) {
-		allMade += b.made;
-		allAnswered += b.answered;
+	const openers = new Map(
+		openerRows.map((r) => [
+			r.user_id,
+			{ made: Number(r.made), taken: Number(r.taken) },
+		]),
+	);
+
+	const signals: MemberSignals[] = [];
+	// Every member with attention in the window; the ranking keeps the active ones, the
+	// periphery looks at everyone (people reaching out without return are often low-volume)
+	for (const id of new Set([...given.keys(), ...received.keys()])) {
+		const g = given.get(id) ?? 0;
+		const r = received.get(id) ?? 0;
+		const inFlows: number[] = [];
+		let partner = 0;
+		for (const [key, mass] of directed) {
+			const [from, to] = key.split("|");
+			if (to === id && from) inFlows.push(mass);
+			if (from === id && to)
+				partner = Math.max(
+					partner,
+					Math.min(mass, directed.get(`${to}|${id}`) ?? 0),
+				);
+		}
+		inFlows.sort((x, y) => y - x);
+		const b = bids.get(id) ?? { made: 0, answered: 0 };
+		const o = openers.get(id) ?? { made: 0, taken: 0 };
+		signals.push({
+			id,
+			given: g,
+			received: r,
+			reach: givers.get(id)?.size ?? 0,
+			bids: b.made,
+			bidsAnswered: b.answered,
+			openers: o.made,
+			openersTakenUp: o.taken,
+			topTwoInShare: ratio((inFlows[0] ?? 0) + (inFlows[1] ?? 0), r),
+			partner,
+		});
 	}
-	const baseline = ratio(allAnswered, allMade);
-	const sortedStanding = [...standing.values()].sort((x, y) => x - y);
-	const median = sortedStanding[Math.floor(sortedStanding.length / 2)] ?? 0;
-	const periphery = [...bids.entries()]
-		.map(([id, b]) => ({ id, made: b.made, uptake: ratio(b.answered, b.made) }))
-		.filter((p) =>
-			isPeripheral(p.made, p.uptake, baseline, standing.get(p.id) ?? 0, median),
-		)
-		.map((p) => ({
-			...person(p.id),
-			bids: p.made,
-			uptake: round(p.uptake, 2),
-			unattended_episodes: unattended.get(p.id) ?? 0,
+
+	const baselines = baselinesOf(signals);
+	const active = signals.filter((m) => m.given >= ACTIVE_MIN_GIVEN);
+	const standing = standingScores(active, baselines);
+	const influence = pagerank(edges);
+	const quartile = (values: number[]) =>
+		[...values].sort((x, y) => x - y)[Math.floor(values.length * 0.75)] ?? 0;
+	const reachP75 = quartile(active.map((m) => m.reach));
+	const givenP75 = quartile(active.map((m) => m.given));
+	const topGivers = (id: string) =>
+		[...directed.entries()]
+			.filter(([key]) => key.endsWith(`|${id}`))
+			.sort((x, y) => y[1] - x[1])
+			.slice(0, 2)
+			.map(([key]) => nameIn(members, key.split("|")[0] ?? ""));
+
+	const ranking = active
+		.map((m) => ({
+			...person(m.id),
+			standing: round(standing.get(m.id) ?? 0, 3),
+			shape: classifyShape(m, reachP75, givenP75),
+			draw: round(drawOf(m), 2),
+			reach: m.reach,
+			uptake: round(uptakeOf(m, baselines), 2),
+			pickup: round(pickupOf(m, baselines), 2),
+			received: round(m.received),
+			given: round(m.given),
+			influence: round(influence.get(m.id) ?? 0, 3),
+			anchors: isAnchored(m) ? topGivers(m.id) : [],
+		}))
+		.sort((x, y) => y.standing - x.standing || (x.user_id < y.user_id ? -1 : 1))
+		.slice(0, MAX_RANKING);
+
+	const periphery = signals
+		.filter((m) => isPeripheral(m, baselines))
+		.map((m) => ({
+			...person(m.id),
+			bids: m.bids,
+			uptake: round(uptakeOf(m, baselines), 2),
+			openers: m.openers,
+			pickup: round(pickupOf(m, baselines), 2),
+			unattended_episodes: unattended.get(m.id) ?? 0,
 		}))
 		.sort(
 			(x, y) =>
@@ -905,168 +1119,231 @@ export async function getSocialStructure(
 // Plain language
 // ---------------------------------------------------------------------------------------
 
-const pct = (n: number) => `${Math.round(n * 100)}%`;
+// Rates and shares are rendered as bands: implicit attention is inferred, so exact percentages
+// would claim more precision than the measurement has. Exact figures stay in the data objects.
+
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-function flowList(
-	flows: PersonFlow[],
-	limit: number,
-	showReturned: boolean,
-): string {
-	return flows
-		.slice(0, limit)
-		.map((f) =>
-			showReturned
-				? `${f.name} (${pct(f.share)}, returned ${pct(f.mass > 0 ? f.returned / f.mass : 0)})`
-				: `${f.name} (${pct(f.share)})`,
-		)
+/** How much of someone's attention a share is */
+export function shareBand(share: number): string {
+	if (share >= 0.5) return "most";
+	if (share >= 0.25) return "a large share";
+	if (share >= 0.1) return "some";
+	return "a little";
+}
+
+/** How much of the attention given comes back */
+export function returnBand(returned: number, given: number): string {
+	const r = given > 0 ? returned / given : 0;
+	if (r >= 0.8) return "returned in kind";
+	if (r >= 0.4) return "partly returned";
+	return "little returned";
+}
+
+/** How often something happens */
+export function rateBand(rate: number): string {
+	if (rate >= 0.7) return "usually";
+	if (rate >= 0.45) return "often";
+	if (rate >= 0.25) return "sometimes";
+	return "rarely";
+}
+
+function balanceBand(reciprocity: number): string {
+	if (reciprocity >= 0.85) return "evenly";
+	if (reciprocity >= 0.6) return "fairly evenly";
+	return "unevenly";
+}
+
+function warmthText(v: Record<Valence, number>): string {
+	const total = v.warm + v.neutral + v.cold;
+	if (total === 0) return "";
+	if (v.cold / total >= 0.3)
+		return v.warm / total >= 0.3 ? "mixed, warm and cold" : "often cold";
+	if (v.warm / total >= 0.5) return "mostly warm";
+	return "mostly neutral";
+}
+
+function tonesText(tones: Record<string, number>): string {
+	return Object.entries(tones)
+		.filter(([t]) => t !== "neutral")
+		.sort((x, y) => y[1] - x[1])
+		.slice(0, 3)
+		.map(([t]) => t)
 		.join(", ");
 }
 
+const names = (list: string[]) =>
+	list.length <= 2
+		? list.join(" and ")
+		: `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
+
 export function describeProfile(p: AttentionProfile): string[] {
-	const lines: string[] = [];
-	lines.push(
-		`${p.name}: ${plural(p.episodes, "conversation")} in the window; gives ${p.given} attention to people and ${p.room} to the room, receives ${p.received}.`,
-	);
-	if (p.top_out.length) {
-		lines.push(`Gives most attention to ${flowList(p.top_out, 3, true)}.`);
+	const lines: string[] = [
+		`${p.name}: ${plural(p.episodes, "conversation")} in the window.`,
+	];
+	const draw = (p.received + SMOOTHING) / (p.given + SMOOTHING);
+	if (draw >= 1.15) lines.push("Receives more attention than they give.");
+	else if (draw <= 0.85) lines.push("Gives more attention than they get back.");
+	else lines.push("Gives and receives attention about equally.");
+	if (p.room > 0 && p.room / (p.given + p.room) >= 0.3) {
+		lines.push("Often talks to the room rather than to anyone in particular.");
+	}
+
+	const [first, ...rest] = p.top_out;
+	if (first) {
+		const more = rest
+			.slice(0, 2)
+			.map((f) => `${f.name} (${returnBand(f.returned, f.mass)})`);
+		lines.push(
+			`Gives ${shareBand(first.share)} of their attention to ${first.name} (${returnBand(first.returned, first.mass)})${more.length ? `, then ${more.join(", ")}` : ""}.`,
+		);
 		if (p.concentration >= 0.35)
-			lines.push("Attention is concentrated on a few people.");
+			lines.push("Their attention is concentrated on a few people.");
 		else if (p.concentration <= 0.15 && p.top_out.length >= 4) {
-			lines.push("Spreads attention widely across many people.");
+			lines.push("Spreads their attention across many people.");
 		}
 	}
-	if (p.top_in.length)
-		lines.push(`Gets most attention from ${flowList(p.top_in, 3, false)}.`);
-	for (const f of p.pursues.slice(0, 3)) {
+	const topTwoIn = (p.top_in[0]?.share ?? 0) + (p.top_in[1]?.share ?? 0);
+	if (p.top_in.length >= 4 && topTwoIn >= ANCHORED_TOP_TWO_SHARE) {
 		lines.push(
-			`Turns to ${f.name} often; ${f.name} gives back little (${pct(f.mass > 0 ? f.returned / f.mass : 0)}).`,
+			`Most of the attention they get comes from ${names(p.top_in.slice(0, 2).map((f) => f.name))}.`,
 		);
+	} else if (p.top_in.length) {
+		lines.push(
+			`Attention comes to them from ${p.top_in.length >= 4 ? "many people" : names(p.top_in.map((f) => f.name))}${p.top_in.length >= 4 ? `, most from ${names(p.top_in.slice(0, 3).map((f) => f.name))}` : ""}.`,
+		);
+	}
+	for (const f of p.pursues.slice(0, 3)) {
+		lines.push(`Keeps turning to ${f.name}, who gives little back.`);
 	}
 	for (const f of p.pursued_by.slice(0, 3)) {
-		lines.push(`${f.name} keeps turning to ${p.name}, who gives back little.`);
+		lines.push(`${f.name} keeps turning to ${p.name}, who gives little back.`);
 	}
-	if (p.bids.made > 0) {
+	if (p.bids.made >= 3) {
 		lines.push(
-			`When ${p.name} reaches for someone's attention, that person answers ${pct(p.bids.uptake)} of the time (${p.bids.answered} of ${p.bids.made}).`,
+			`When ${p.name} reaches for someone's attention, they ${rateBand(p.bids.uptake)} get an answer.`,
 		);
 	}
-	if (p.bids_to_them.count > 0) {
+	if (p.bids_to_them.count >= 3) {
 		lines.push(
-			`When others reach for ${p.name}'s attention, ${p.name} answers ${pct(p.bids_to_them.answer_rate)} of the time (${p.bids_to_them.answered} of ${p.bids_to_them.count}).`,
+			`When others reach for ${p.name}'s attention, ${p.name} ${rateBand(p.bids_to_them.answer_rate)} answers.`,
 		);
 	}
-	if (p.room_bids.made > 0) {
+	if (p.room_bids.made >= 3) {
 		lines.push(
-			`Messages ${p.name} opens to the whole room: ${p.room_bids.taken_up} of ${p.room_bids.made} picked up by someone.`,
+			`What they open to the whole room is ${rateBand(p.room_bids.taken_up / p.room_bids.made)} picked up.`,
 		);
 	}
 	const s = p.structures;
 	const groups: string[] = [];
 	if (s.centre)
-		groups.push(`centre of attention in ${plural(s.centre, "episode")}`);
-	if (s.unattended) groups.push(`unattended in ${s.unattended}`);
+		groups.push(
+			`the centre of attention in ${plural(s.centre, "conversation")}`,
+		);
+	if (s.unattended) groups.push(`left unanswered in ${s.unattended}`);
 	if (s.room) groups.push(`mostly talking to the room in ${s.room}`);
 	if (groups.length) lines.push(`In groups: ${groups.join(", ")}.`);
 	if (s.pair)
-		lines.push(`In a back-and-forth pair in ${plural(s.pair, "episode")}.`);
+		lines.push(
+			`In a back-and-forth with one person in ${plural(s.pair, "conversation")}.`,
+		);
 	const sit = p.situations;
 	const total = sit.one_on_one + sit.small_group + sit.large_group;
 	if (total > 0) {
-		lines.push(
-			`Takes part in ${sit.one_on_one} one-on-one, ${sit.small_group} small-group (3-4) and ${sit.large_group} large-group (5+) conversations.`,
-		);
+		const mostly =
+			sit.one_on_one / total >= 0.5
+				? "mostly one-on-one"
+				: sit.large_group / total >= 0.4
+					? "often in big groups (5+)"
+					: "mostly in small groups (3-4)";
+		lines.push(`Talks ${mostly}.`);
 	}
-	const w = p.warmth;
-	const gv = w.given.warm + w.given.neutral + w.given.cold;
-	const rc = w.received.warm + w.received.neutral + w.received.cold;
-	if (gv > 0) {
-		lines.push(
-			`Attention given is warm ${pct(w.given.warm / gv)}, cold ${pct(w.given.cold / gv)} of the time.`,
-		);
-	}
-	if (rc > 0) {
-		lines.push(
-			`Attention received is warm ${pct(w.received.warm / rc)}, cold ${pct(w.received.cold / rc)} of the time.`,
-		);
-	}
+	const given = warmthText(p.warmth.given);
+	const received = warmthText(p.warmth.received);
+	if (given) lines.push(`The attention they give is ${given}.`);
+	if (received) lines.push(`The attention they get is ${received}.`);
 	return lines;
 }
 
-function tonesText(tones: Record<string, number>): string {
-	return Object.entries(tones)
-		.sort((x, y) => y[1] - x[1])
-		.slice(0, 3)
-		.map(([t, n]) => `${t} ${n}`)
-		.join(", ");
-}
-
-function valenceText(v: Record<Valence, number>): string {
-	const total = v.warm + v.neutral + v.cold;
-	return total > 0
-		? `${pct(v.warm / total)} warm, ${pct(v.cold / total)} cold`
-		: "";
-}
-
 export function describeEdge(e: AttentionEdge): string[] {
-	const lines: string[] = [];
-	lines.push(
-		`${e.a_name} → ${e.b_name}: ${e.a_to_b} attention; ${e.b_name} → ${e.a_name}: ${e.b_to_a} (${pct(e.reciprocity)} balanced) across ${plural(e.episodes_together, "conversation")}.`,
-	);
+	const lines: string[] = [
+		`${e.a_name} and ${e.b_name}: attention flows ${balanceBand(e.reciprocity)} between them across ${plural(e.episodes_together, "conversation")}.`,
+	];
 	const big = Math.max(e.a_to_b, e.b_to_a);
 	if (big >= PURSUIT_MIN_MASS && e.reciprocity < PURSUIT_RETURN_RATIO) {
 		const [from, to] =
 			e.a_to_b >= e.b_to_a ? [e.a_name, e.b_name] : [e.b_name, e.a_name];
 		lines.push(`${from} turns to ${to} far more than ${to} gives back.`);
+	} else if (e.reciprocity < 0.85 && big > 0) {
+		const [from, to] =
+			e.a_to_b >= e.b_to_a ? [e.a_name, e.b_name] : [e.b_name, e.a_name];
+		lines.push(`${from} gives a bit more than ${to} returns.`);
 	}
 	for (const [from, to, bids] of [
 		[e.a_name, e.b_name, e.bids_a_to_b],
 		[e.b_name, e.a_name, e.bids_b_to_a],
 	] as const) {
-		if (bids.made > 0) {
+		if (bids.made >= 3) {
 			lines.push(
-				`${from}'s bids to ${to} answered ${pct(bids.answered / bids.made)} of the time (${bids.answered} of ${bids.made}).`,
+				`When ${from} reaches for ${to}, ${to} ${rateBand(bids.answered / bids.made)} answers.`,
 			);
 		}
 	}
 	const { one_on_one: duo, group } = e.situations;
-	if (duo + group > 0) {
+	if (duo + group > 0)
 		lines.push(`Together: ${duo} one-on-one, ${group} in groups.`);
-	}
 	if (e.channels.length) {
-		lines.push(
-			`Mostly in ${e.channels.map((c) => `#${c.name} (${c.episodes})`).join(", ")}.`,
-		);
+		lines.push(`Mostly in ${e.channels.map((c) => `#${c.name}`).join(", ")}.`);
 	}
 	for (const [from, to, tones, valence] of [
 		[e.a_name, e.b_name, e.tones_a_to_b, e.valence_a_to_b],
 		[e.b_name, e.a_name, e.tones_b_to_a, e.valence_b_to_a],
 	] as const) {
 		const t = tonesText(tones);
-		const v = valenceText(valence);
+		const v = warmthText(valence);
 		if (t || v)
-			lines.push(`${from} → ${to}: ${[t, v].filter(Boolean).join("; ")}.`);
+			lines.push(`${from} toward ${to}: ${[t, v].filter(Boolean).join("; ")}.`);
 	}
 	return lines;
 }
 
 export function describeStructureOverview(s: SocialStructure): string[] {
 	const lines: string[] = [];
-	if (s.ranking.length) {
-		const top = s.ranking.slice(0, 5);
+	const top = s.ranking.slice(0, 8);
+	const byShape = (shape: SocialShape) =>
+		top.filter((r) => r.shape === shape).map((r) => r.name);
+	const draws = byShape("draws");
+	const engines = byShape("engine");
+	if (draws.length) {
 		lines.push(
-			`Attention flows toward: ${top.map((r) => `${r.name} (standing ${pct(r.standing)}, ${r.reach === 1 ? "1 person gives" : `${r.reach} people give`} them attention, bids answered ${pct(r.uptake)})`).join("; ")}.`,
+			`People turn to ${names(draws)} from many directions; they get more attention than they give.`,
 		);
+	}
+	if (engines.length) {
+		lines.push(
+			`${names(engines)} keep${engines.length === 1 ? "s" : ""} conversations going: they give out more attention than they collect.`,
+		);
+	}
+	const others = top.filter((r) => r.shape === "balanced").map((r) => r.name);
+	if (others.length) lines.push(`Also well placed: ${names(others)}.`);
+	for (const r of top.filter((r) => r.anchors.length)) {
+		lines.push(`Most of ${r.name}'s attention comes from ${names(r.anchors)}.`);
 	}
 	for (const c of s.cliques) {
 		const tone = tonesText(c.tone);
+		const mutual =
+			c.internal_reciprocity >= 0.75
+				? "mostly mutual"
+				: c.internal_reciprocity >= 0.5
+					? "partly mutual"
+					: "one-sided";
 		lines.push(
-			`Group: ${c.members.map((m) => m.name).join(", ")} (${pct(c.internal_reciprocity)} reciprocal${tone ? `, ${tone}` : ""}).`,
+			`Circle: ${names(c.members.map((m) => m.name))} (attention ${mutual}${tone ? `; ${tone}` : ""}).`,
 		);
 	}
-	for (const p of s.periphery) {
+	if (s.periphery.length) {
 		lines.push(
-			`${p.name} makes bids but rarely gets answered (${p.bids} bids, ${pct(p.uptake)} answered${p.unattended_episodes ? `, unattended in ${plural(p.unattended_episodes, "conversation")}` : ""}).`,
+			`Often reaching out without much return, and without anyone they regularly trade attention with: ${names(s.periphery.map((p) => p.name))}.`,
 		);
 	}
 	return lines;

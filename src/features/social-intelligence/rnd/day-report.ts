@@ -235,7 +235,7 @@ async function main() {
 				structuresByPerson.set(id, list);
 			}
 		}
-		const focusLines = describeFocus(focus, nameOf);
+		const focusLines = describeFocus(focus, nameOf, { precise: true });
 		out.push(
 			"**Focus:**",
 			"",
@@ -260,7 +260,7 @@ async function main() {
 					previews,
 					names,
 					conv.participants.length,
-					focusLines,
+					describeFocus(focus, nameOf),
 				));
 			if (generated) cache.set(cacheKey, generated);
 			if (!generated) {
