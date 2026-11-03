@@ -31,6 +31,8 @@ export interface StorylineEpisode {
 	/** "from → to [tone]: note" lines; side remarks and jokes often survive only here */
 	exchanges: string[];
 	bits: string[];
+	/** Personal news shared in the conversation: "who: what" */
+	news: string[];
 }
 
 export type StorylineKind = "thread" | "bit";
@@ -149,6 +151,7 @@ function describeEpisode(e: StorylineEpisode, timeZone: string): string {
 		`   Dynamics: ${e.dynamics}`,
 		...e.exchanges.map((x) => `   - ${x}`),
 		...(e.bits.length ? [`   Bits: ${e.bits.join(" | ")}`] : []),
+		...(e.news.length ? [`   News: ${e.news.join(" | ")}`] : []),
 	].join("\n");
 }
 
@@ -164,7 +167,7 @@ export async function proposeLinks(
 	episodes: StorylineEpisode[],
 	timeZone: string,
 ): Promise<ProposedLink[] | null> {
-	const [general, bits] = await Promise.all([
+	const [general, bits, news] = await Promise.all([
 		OmpRuntime.get().generateStructured<{
 			links: Array<{
 				from: number;
@@ -178,7 +181,8 @@ export async function proposeLinks(
 			schema: LINK_SCHEMA,
 			label: "rnd.storyline-links",
 		}),
-		proposeBitLinks(episodes),
+		proposeFocusedLinks(episodes, "bits"),
+		proposeFocusedLinks(episodes, "news"),
 	]);
 	if (!general?.links) return null;
 	const known = new Set(episodes.map((e) => e.index));
@@ -195,7 +199,16 @@ export async function proposeLinks(
 			kind: "bit",
 			storyline: `bit ${l.what}`,
 		})),
+		...(news ?? []).map((l) => ({
+			from: l.from,
+			to: l.to,
+			kind: "thread",
+			storyline: `news ${l.what}`,
+		})),
 	];
+	const withBits = new Set(
+		episodes.filter((e) => e.bits.length).map((e) => e.index),
+	);
 	for (const l of proposed) {
 		const [from, to] = [Math.max(l.from, l.to), Math.min(l.from, l.to)];
 		const kind: StorylineKind = l.kind === "bit" ? "bit" : "thread";
@@ -206,6 +219,8 @@ export async function proposeLinks(
 		const key = `${from}:${to}:${kind}:${storyline}`;
 		if (from === to || !known.has(from) || !known.has(to) || seen.has(key))
 			continue;
+		// A running joke needs a recorded bit at both ends; otherwise the link is a guess
+		if (kind === "bit" && !(withBits.has(from) && withBits.has(to))) continue;
 		seen.add(key);
 		links.push({ from, to, kind, storyline });
 	}
@@ -213,22 +228,36 @@ export async function proposeLinks(
 }
 
 /**
- * Running jokes get lost among the threads in the general pass (they are side remarks), so
- * they get their own look at just the conversations' bits: which ones are the same joke.
+ * Side material gets lost among the threads in the general pass, so running jokes and
+ * personal news each get a focused look at just their own lines.
  */
-async function proposeBitLinks(
+const FOCUSED_PASSES = {
+	bits: {
+		prompt:
+			"You find running jokes in a Discord channel. Below are the jokes, phrases and memorable lines recorded for each conversation of one day (E numbers in time order). Link two conversations when the same joke, phrase, persona or bit comes back in the later one (same idea, not just the same person joking). Report every such pair; if nothing recurs, report none.",
+		what: "The bit, a few words",
+	},
+	news: {
+		prompt:
+			'You follow what is happening in people\'s lives in a Discord channel. Below is the personal news recorded for each conversation of one day (E numbers in time order): plans, outcomes, updates people shared about themselves. Link two conversations when the later one continues the same person\'s news from the earlier one: a plan carried out, an outcome reported, an update or reaction to the same situation (e.g. "going for an interview" → "got the job"). Different news from the same person is not a link. Report every such pair; if nothing continues, report none.',
+		what: "Whose news and what, a few words",
+	},
+} as const;
+
+async function proposeFocusedLinks(
 	episodes: StorylineEpisode[],
+	field: keyof typeof FOCUSED_PASSES,
 ): Promise<Array<{ from: number; to: number; what: string }> | null> {
-	const withBits = episodes.filter((e) => e.bits.length);
-	if (withBits.length < 2) return [];
+	const withLines = episodes.filter((e) => e[field].length);
+	if (withLines.length < 2) return [];
 	const written = await OmpRuntime.get().generateStructured<{
 		links: Array<{ from: number; to: number; what: string }>;
 	}>({
-		systemPrompt: `You find running jokes in a Discord channel. Below are the jokes, phrases and memorable lines recorded for each conversation of one day (E numbers in time order). Link two conversations when the same joke, phrase, persona or bit comes back in the later one (same idea, not just the same person joking). Report every such pair; if nothing recurs, report none.`,
-		prompt: withBits
+		systemPrompt: FOCUSED_PASSES[field].prompt,
+		prompt: withLines
 			.map(
 				(e) =>
-					`E${e.index} [${e.participants.join(", ")}]: ${e.bits.join(" | ")}`,
+					`E${e.index} [${e.participants.join(", ")}]: ${e[field].join(" | ")}`,
 			)
 			.join("\n"),
 		schema: {
@@ -242,9 +271,9 @@ async function proposeBitLinks(
 							from: { type: "integer", description: "The later conversation" },
 							to: {
 								type: "integer",
-								description: "The earlier conversation where the bit appeared",
+								description: "The earlier conversation it continues",
 							},
-							what: { type: "string", description: "The bit, a few words" },
+							what: { type: "string", description: FOCUSED_PASSES[field].what },
 						},
 						required: ["from", "to", "what"],
 					},
@@ -252,7 +281,7 @@ async function proposeBitLinks(
 			},
 			required: ["links"],
 		},
-		label: "rnd.storyline-bits",
+		label: `rnd.storyline-${field}`,
 	});
 	return written?.links ?? null;
 }

@@ -239,6 +239,8 @@ async function main() {
 				"",
 				`**Bits:** ${d.bits.map(clean).join(" · ") || "none"}`,
 				"",
+				`**News:** ${d.news.map(clean).join(" · ") || "none"}`,
+				"",
 			);
 			storylineInput.push({
 				index: episodeNumber,
@@ -254,6 +256,7 @@ async function main() {
 						`${nameOf(x.from)} → ${nameOf(x.to)} [${x.tone}]: ${clean(x.note)}`,
 				),
 				bits: d.bits.map(clean),
+				news: d.news.map(clean),
 			});
 			out.push(
 				`- drivers: ${d.roles.drivers.map(nameOf).join(", ") || "—"} · responders: ${d.roles.responders.map(nameOf).join(", ") || "—"} · ignored: ${d.roles.ignored.map(nameOf).join(", ") || "—"}`,

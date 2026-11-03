@@ -71,8 +71,14 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 					description:
 						'Running jokes, recurring phrases, nicknames, memorable lines: "Name: what" with a short quote; at most 4',
 				},
+				news: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Personal news people share about their own lives (plans, outcomes, status changes, events), even unanswered: "Name: what"; at most 4',
+				},
 			},
-			required: ["roles", "exchanges", "note", "bits"],
+			required: ["roles", "exchanges", "note", "bits", "news"],
 		},
 	},
 	required: ["summary", "topic_label", "dynamics"],
@@ -547,6 +553,7 @@ Then describe the DYNAMICS, which matter as much as the topics. Fill them in thi
 - "exchanges": one entry per direction for every pair that actually talked to each other, the MAIN thread first (e.g. "toast → lunchie venting about J", then "lunchie → toast advising her to move out"), then side exchanges; at most 8. Each has a tone (${TONES.join(", ")}) and a short note quoting or paraphrasing what the first person did to or for the second.
 - "note": one sentence consistent with the roles and exchanges: who it was really between, who drove it, who was talking to the room unanswered.
 - "bits": running jokes, recurring phrases, nicknames, catchphrases or memorable lines in this conversation, each as "Name: what" with a short quote (e.g. "Sam: keeps calling everything \"goated\""); include side remarks, they are how this group bonds; at most 4, empty if none.
+- "news": personal news people share about their own lives, even in passing and even if nobody responds: plans, outcomes, status changes, events (e.g. "Sam: has a dentist appointment tomorrow", "Sam: got the apartment"); each as "Name: what", with the time if given; at most 4, empty if none.
 
 Conversation (${messageCount} messages, ${participantCount} participants):
 ${messagePreview}
