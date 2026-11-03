@@ -32,6 +32,7 @@ import {
 import {
 	type StorylineEpisode,
 	buildStorylines,
+	chainLinks,
 } from "../conversations/storylines";
 import {
 	ConversationEnrichmentPipeline,
@@ -325,6 +326,68 @@ async function main() {
 				clean(s.arc),
 				"",
 				...s.people.map((p) => `- ${nameOf(p.user_id)}: ${clean(p.part)}`),
+				"",
+			);
+		}
+
+		// Experiment: describe each run of episodes the linker called one conversation as a
+		// whole, next to the separate episode descriptions, to judge whether merging reads better
+		const merges = chainLinks(
+			(built?.continuations ?? []).map((c) => ({
+				...c,
+				kind: "thread" as const,
+			})),
+		);
+		if (merges.length) out.push("## Merged by continuation (experiment)", "");
+		for (const merge of merges) {
+			const convs = merge.episodes
+				.map((n) => conversations[n - 1])
+				.filter((c): c is Segment => !!c);
+			const merged = convs.flatMap((c) => c.messages);
+			const people = [...new Set(merged.map((m) => m.author_id))];
+			const cacheKey = `merged:${convs.map((c) => c.id).join("+")}`;
+			const generated =
+				cache.get(cacheKey) ??
+				(await pipeline.describe(
+					merged.map((m) => {
+						const row = byId.get(m.id) as Row;
+						return {
+							author_id: m.author_id,
+							content: row.content,
+							attachments: row.attachments,
+							embeds: row.embeds,
+						};
+					}),
+					names,
+					people.length,
+				));
+			if (!generated) {
+				out.push(
+					`### ${merge.episodes.map((n) => `E${n}`).join("+")}: summarizer failed`,
+					"",
+				);
+				continue;
+			}
+			cache.set(cacheKey, generated);
+			const d = toStoredDynamics(generated.dynamics, idByName);
+			out.push(
+				`### ${merge.episodes.map((n) => `E${n}`).join("+")} · ${merged.length} messages · ${people.map(nameOf).join(", ")}`,
+				"",
+				"As separate episodes:",
+				...merge.episodes.map((n) => {
+					const e = storylineInput.find((s) => s.index === n);
+					return `- E${n}: ${e?.topic ?? "?"}: ${e?.summary ?? ""}`;
+				}),
+				"",
+				`As one conversation: **${generated.topicLabel}**: ${clean(generated.summary)}`,
+				"",
+				`Dynamics: ${clean(d.note)}`,
+				...d.exchanges.map(
+					(x) =>
+						`- ${nameOf(x.from)} → ${nameOf(x.to)} [${x.tone}]: ${clean(x.note)}`,
+				),
+				`Bits: ${d.bits.map(clean).join(" · ") || "none"}`,
+				`News: ${d.news.map(clean).join(" · ") || "none"}`,
 				"",
 			);
 		}
