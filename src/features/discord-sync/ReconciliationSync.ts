@@ -260,6 +260,21 @@ export class ReconciliationSync {
         releaseLock();
       }
     }
+
+    // Members in the DB but not in the guild left while the bot wasn't listening. A partial
+    // fetch must not mark the whole server as gone, so only act on a complete, sane list.
+    if (members.size >= Math.max(1, Math.floor((guild.memberCount || members.size) * 0.9))) {
+      const departed = await this.db.query(
+        `UPDATE members SET active = false, updated_at = NOW()
+         WHERE guild_id = $1 AND active = true AND NOT (user_id = ANY($2::text[]))
+         RETURNING user_id`,
+        [guild.id, membersArray.map((m) => m.user.id)]
+      );
+      const count = departed.success ? (departed.data?.length ?? 0) : 0;
+      if (count > 0) {
+        console.log(`   👥 ReconciliationSync: ${count} member(s) marked as no longer in the server`);
+      }
+    }
   }
 
   /**
