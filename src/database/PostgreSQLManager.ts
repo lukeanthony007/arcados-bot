@@ -477,7 +477,8 @@ export class PostgreSQLManager {
       await client.query(`
 				ALTER TABLE conversation_segments
 				ADD COLUMN IF NOT EXISTS topic_label TEXT,
-				ADD COLUMN IF NOT EXISTS dynamics JSONB
+				ADD COLUMN IF NOT EXISTS dynamics JSONB,
+				ADD COLUMN IF NOT EXISTS session_id VARCHAR(50)
 			`);
 
       // Who addressed whom inside a conversation: 'rule' rows are inferred turns

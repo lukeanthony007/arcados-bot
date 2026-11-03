@@ -46,6 +46,7 @@ interface StoredSegment {
 	message_ids: string[];
 	status: string;
 	summary: string | null;
+	session_id: string | null;
 }
 
 interface MessageRow {
@@ -103,7 +104,7 @@ async function loadStored(
 	since: Date | null,
 ): Promise<StoredSegment[]> {
 	const result = await db.query(
-		`SELECT id, message_ids, status, summary FROM conversation_segments
+		`SELECT id, message_ids, status, summary, session_id FROM conversation_segments
 		 WHERE guild_id = $1 AND channel_id = $2 AND ($3::timestamptz IS NULL OR start_time >= $3)`,
 		[guildId, channelId, since],
 	);
@@ -178,7 +179,8 @@ async function reconcile(
 		const unchanged =
 			previous !== undefined &&
 			sameIds(previous.message_ids, messageIds) &&
-			previous.status === status;
+			previous.status === status &&
+			previous.session_id === seg.session_id;
 		if (unchanged) {
 			if (status === "active") result.open.push(seg);
 			continue;
@@ -199,17 +201,18 @@ async function reconcile(
 		const upsert = await db.query(
 			`INSERT INTO conversation_segments
 				(id, guild_id, channel_id, participants, start_time, end_time, message_ids, message_count,
-				 status, last_activity_at, ai_processing_status)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $6, $10)
+				 status, last_activity_at, ai_processing_status, session_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $6, $10, $12)
 			 ON CONFLICT (id) DO UPDATE SET
 				participants = EXCLUDED.participants, start_time = EXCLUDED.start_time,
 				end_time = EXCLUDED.end_time, message_ids = EXCLUDED.message_ids,
 				message_count = EXCLUDED.message_count, status = EXCLUDED.status,
-				last_activity_at = EXCLUDED.last_activity_at,
+				last_activity_at = EXCLUDED.last_activity_at, session_id = EXCLUDED.session_id,
 				ai_processing_status = CASE WHEN $11 THEN 'pending' ELSE conversation_segments.ai_processing_status END,
 				summary = CASE WHEN $11 THEN NULL ELSE conversation_segments.summary END,
 				embedding = CASE WHEN $11 THEN NULL ELSE conversation_segments.embedding END,
-				topic_label = CASE WHEN $11 THEN NULL ELSE conversation_segments.topic_label END`,
+				topic_label = CASE WHEN $11 THEN NULL ELSE conversation_segments.topic_label END,
+				dynamics = CASE WHEN $11 THEN NULL ELSE conversation_segments.dynamics END`,
 			[
 				id,
 				guildId,
@@ -222,6 +225,7 @@ async function reconcile(
 				status,
 				processing,
 				summaryStale,
+				seg.session_id,
 			],
 		);
 		if (!upsert.success)

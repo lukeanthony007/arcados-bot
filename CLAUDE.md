@@ -19,6 +19,7 @@ The runtime is Bun (`bun.lock`). There is no build step; TypeScript runs directl
 - **Dossiers:** `npm run dossier:member <id|name>`, `dossier:pair <a> <b>`, `dossier:server`, `dossier:stale [--dry-run]` (the bot writes these itself as they go stale)
 - **Conversations:** `npm run resegment:history [--channel <name>]` (re-apply the segmentation rule to stored history)
 - **Tests:** `npm test` (`bun test src`)
+- **Examine grouping:** `npm run conversations:day <YYYY-MM-DD> [channel] [--all]` prints how the rule groups one day without writing anything
 
 ### Database & debugging
 - **Inspect a message:** `npm run check-message`
@@ -123,7 +124,7 @@ AI infrastructure built on the omp SDK:
 
 **Conversation Lifecycle**:
 1. `ConversationSegmenter` runs every 2 minutes: for each channel with new messages (or an open conversation) it re-segments the recent tail with `segmentChannelTail` and upserts `conversation_segments`
-2. The rule (`conversations/segmenter.ts`, pure): same channel, split on a 20-minute silence unless the next message replies to a message in the open conversation within 6 hours, cap 24 hours, keep runs of 3+ messages from 2+ people; bot commands and bot authors excluded. Ids are `conv_<channel>_<first message id>`, so reruns are no-ops
+2. The rule (`conversations/segmenter.ts`, pure): a **session** is a run in one channel with no silence over 20 minutes (a reply to a message in the run within 2 hours stitches across one), capped at 24 hours; a long session is cut into **episodes** where the active speakers change (overlap ≤ 0.45 over ≥10 messages and ≥3 minutes on each side) or the chat pauses ≥8 minutes, never between a reply and what it answers; runs over 40 messages prefer a cut, over 80 must cut at the best seam. An episode with 3+ messages from 2+ people is a conversation; bot commands and bot authors are excluded. Ids are `conv_<channel>_<first message id>` (and `session_id` the same for the run), so reruns are no-ops
 3. A conversation whose last message is within 20 minutes is stored `status='active'` (live tools read it); afterwards `finalized`. A late reply that reopens a finalized one updates it in place and resets its summary
 4. Finalized conversations with 3+ people or 10+ messages are queued for a summary + `topic_label` + `dynamics` (who it was really between, who drove it, who was ignored, and directed exchanges with a tone); smaller ones are `skipped`
 5. Backfilled messages (downtime recovery) trigger `resegmentChannelHistory` for the channel; `npm run resegment:history` does it for everything (matching conversations keep their summaries)

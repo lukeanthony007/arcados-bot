@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+	EPISODE_HARD_MAX,
+	EPISODE_SOFT_MAX,
 	GAP_MS,
 	MAX_SPAN_MS,
 	REPLY_STITCH_MS,
@@ -7,6 +9,7 @@ import {
 	isOpen,
 	isSignificant,
 	segment,
+	splitEpisodes,
 } from "./segmenter";
 
 const T0 = Date.UTC(2026, 0, 1, 12, 0, 0);
@@ -90,10 +93,15 @@ describe("segment", () => {
 		for (let minute = 0; minute <= MAX_SPAN_MS / MIN + 30; minute += 10)
 			spec.push([minute, minute % 20 ? "a" : "b"]);
 		const out = segment("c", msgs(spec));
-		expect(out.length).toBe(2);
-		expect(out[0]!.end.getTime() - out[0]!.start.getTime()).toBeLessThanOrEqual(
-			MAX_SPAN_MS,
-		);
+		const sessions = new Set(out.map((s) => s.session_id));
+		expect(sessions.size).toBe(2);
+		for (const sessionId of sessions) {
+			const inSession = out.filter((s) => s.session_id === sessionId);
+			const span =
+				inSession[inSession.length - 1]!.end.getTime() -
+				inSession[0]!.start.getTime();
+			expect(span).toBeLessThanOrEqual(MAX_SPAN_MS);
+		}
 	});
 
 	test("drops runs with too few messages or a single author", () => {
@@ -174,5 +182,53 @@ describe("isOpen / isSignificant", () => {
 			msgs(Array.from({ length: 10 }, (_, i) => [i, i % 2 ? "a" : "b"])),
 		);
 		expect(isSignificant(ten[0]!)).toBe(true);
+	});
+});
+
+describe("splitEpisodes", () => {
+	const chat = (
+		count: number,
+		speakers: string[],
+		startMinute = 0,
+	): SegmentMessage[] =>
+		msgs(
+			Array.from({ length: count }, (_, i) => [
+				startMinute + i,
+				speakers[i % speakers.length]!,
+			]),
+		);
+
+	test("short runs are one episode", () => {
+		expect(splitEpisodes(chat(EPISODE_SOFT_MAX, ["a", "b"]))).toHaveLength(1);
+	});
+
+	test("a long run is cut where the speakers change, and the episodes share a session", () => {
+		const run = [...chat(30, ["a", "b"]), ...chat(30, ["c", "d"], 30)];
+		const episodes = splitEpisodes(run);
+		expect(episodes.map((e) => e.length)).toEqual([30, 30]);
+		const segments = segment("c", run);
+		expect(segments).toHaveLength(2);
+		expect(new Set(segments.map((s) => s.session_id)).size).toBe(1);
+		expect(segments[0]?.session_id).toBe(segments[0]?.id);
+	});
+
+	test("a long run with the same speakers throughout is not cut below the hard cap", () => {
+		expect(splitEpisodes(chat(EPISODE_HARD_MAX, ["a", "b"]))).toHaveLength(1);
+		expect(
+			splitEpisodes(chat(EPISODE_HARD_MAX + 30, ["a", "b"])).length,
+		).toBeGreaterThan(1);
+	});
+
+	test("prefers a pause as the cut when speakers stay the same", () => {
+		const run = [...chat(45, ["a", "b"]), ...chat(45, ["a", "b"], 45 + 9)];
+		const episodes = splitEpisodes(run);
+		expect(episodes[0]).toHaveLength(45);
+	});
+
+	test("never cuts between a reply and the message it answers", () => {
+		const run = [...chat(30, ["a", "b"]), ...chat(30, ["c", "d"], 30)];
+		run[30] = { ...run[30]!, referenced_message_id: run[29]!.id };
+		const [first] = splitEpisodes(run);
+		expect(first!.length).not.toBe(30);
 	});
 });

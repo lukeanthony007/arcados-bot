@@ -21,7 +21,8 @@
     "enrich:conversations:24h": "bun run src/features/social-intelligence/enrichment-pipeline/scripts/enrich-conversations-manual.ts 24",
     "enrich:conversations:7d": "bun run src/features/social-intelligence/enrichment-pipeline/scripts/enrich-conversations-manual.ts 168",
     "enrich:conversations:force": "bun run src/features/social-intelligence/enrichment-pipeline/scripts/enrich-conversations-manual.ts --force",
-    "migrate:voice-state": "bun run src/scripts/migrate-voice-state.ts"
+    "migrate:voice-state": "bun run src/scripts/migrate-voice-state.ts",
+    "conversations:day": "bun run src/features/social-intelligence/conversations/scripts/show-day.ts"
   },
   "keywords": [
     "discord",
