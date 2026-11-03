@@ -4,11 +4,9 @@
  * Builds and manages member personas the bot can speak as.
  *
  * Build pipeline (/persona init):
- * 1. Refresh the member's social-intelligence profile:
- *    - closeness is computed on demand from messages (no stored relationship data)
- *    - UserProfileEnrichmentPipeline.enrichUser → summary + Big Five/MBTI + behavior patterns
- *      (only runs once enough newly enriched conversations exist)
- *    - PsychologicalProfiler.profileUser → psych/behavior/temporal profile when enrichment skipped
+ * 1. Get the member's dossier (understanding/memberDossier.ts):
+ *    - closeness and facts are computed on demand from messages
+ *    - the dossier is reused unless missing or stale, then rewritten whole in one pass
  * 2. Gather the refreshed profile, recent messages, conversation summaries and top relationships
  * 3. Have the LLM write a character profile; keep real messages as voice examples
  * 4. Store in user_personas
@@ -21,17 +19,20 @@ import type {
 	UserPersonaData,
 	UserProfileData,
 } from "../../database/PostgreSQLManager";
-import { UserProfileEnrichmentPipeline } from "../social-intelligence/enrichment-pipeline/layers/UserProfileEnrichmentPipeline";
 import {
 	type Connection,
 	getConnections,
 } from "../social-intelligence/facts/closeness";
-import { PsychologicalProfiler } from "../social-intelligence/psychological-profiling/PsychologicalProfiler";
-import type {
-	BehaviorPatterns,
-	PsychProfile,
-	TemporalProfile,
-} from "../social-intelligence/psychological-profiling/types";
+import { describeMemberFacts } from "../social-intelligence/facts/memberFacts";
+import {
+	MIN_MESSAGES,
+	isMemberStale,
+	writeMemberDossier,
+} from "../social-intelligence/understanding/memberDossier";
+import {
+	BIG_FIVE_TRAITS,
+	type MemberDossier,
+} from "../social-intelligence/understanding/types";
 import { describeConnection } from "./personaContext";
 import {
 	PROFILE_WRITER_PERSONA,
@@ -39,7 +40,6 @@ import {
 	buildProfileRequest,
 } from "./personaPrompt";
 
-const MIN_MESSAGES = 30;
 const MESSAGE_FETCH_LIMIT = 600;
 const DOSSIER_MESSAGE_LIMIT = 250;
 const DOSSIER_MESSAGE_CHARS = 14000;
@@ -49,8 +49,7 @@ const RELATIONSHIP_LIMIT = 8;
 
 export interface PersonaPipelineReport {
 	relationships: number;
-	enrichedProfileVersion: number | null;
-	psychProfiled: boolean;
+	dossierWritten: boolean;
 	messagesAnalyzed: number;
 	conversationsAnalyzed: number;
 }
@@ -169,31 +168,27 @@ export class UserPersonaService {
 				};
 			}
 
-			// 1. Refresh the social-intelligence profile
+			// 1. Reuse the member's dossier unless it's missing or stale, then rewrite it whole
 			await onProgress?.("Analyzing personality and conversations…");
-			// A failed enrichment shouldn't block the persona; the profiler below fills in
-			const enrichedProfileVersion = await new UserProfileEnrichmentPipeline(
-				this.db,
-			)
-				.enrichUser(userId, guildId)
-				.catch((error: unknown) => {
-					console.warn(
-						"🔸 Persona:",
-						error instanceof Error ? error.message : error,
-					);
-					return null;
-				});
-			const psychProfiled =
-				enrichedProfileVersion === null
-					? await new PsychologicalProfiler(this.db).profileUser(
-							userId,
-							guildId,
-						)
-					: false;
+			let profileResult = await this.db.getUserProfile(userId, guildId);
+			let dossier = profileResult.success
+				? profileResult.data?.dossier
+				: undefined;
+			let dossierWritten = false;
+			if (!dossier || (await isMemberStale(this.db, guildId, userId))) {
+				dossier = (await writeMemberDossier(this.db, guildId, userId)) ?? dossier;
+				dossierWritten = true;
+				profileResult = await this.db.getUserProfile(userId, guildId);
+			}
+			if (!dossier) {
+				return {
+					success: false,
+					error: `Not enough activity to write a dossier for ${name}.`,
+				};
+			}
 
-			// 2. Gather the refreshed profile and context
+			// 2. Gather context
 			await onProgress?.("Writing character profile…");
-			const profileResult = await this.db.getUserProfile(userId, guildId);
 			const profile = profileResult.success ? profileResult.data : undefined;
 			const conversations = await this.getConversations(guildId, userId);
 			const interactions = await getConnections(
@@ -204,16 +199,17 @@ export class UserPersonaService {
 			);
 
 			// 3. Synthesize the character profile
-			const dossier = this.buildDossier(
+			const dossierText = this.buildDossier(
 				name,
 				member,
+				dossier,
 				profile,
 				messages,
 				conversations,
 				interactions,
 				names.users,
 			);
-			const characterProfile = await this.writeCharacterProfile(name, dossier);
+			const characterProfile = await this.writeCharacterProfile(name, dossierText);
 			if (!characterProfile) {
 				return {
 					success: false,
@@ -224,8 +220,7 @@ export class UserPersonaService {
 			// 4. Store
 			const report: PersonaPipelineReport = {
 				relationships: interactions.length,
-				enrichedProfileVersion,
-				psychProfiled,
+				dossierWritten,
 				messagesAnalyzed: Math.min(messages.length, DOSSIER_MESSAGE_LIMIT),
 				conversationsAnalyzed: conversations.length,
 			};
@@ -352,6 +347,7 @@ export class UserPersonaService {
 	private buildDossier(
 		name: string,
 		member: MemberRow,
+		dossier: MemberDossier,
 		profile: UserProfileData | undefined,
 		messages: string[],
 		conversations: ConversationRow[],
@@ -371,27 +367,32 @@ export class UserPersonaService {
 			`NAME: ${name}${aliases.length ? ` (also known as: ${[...new Set(aliases)].join(", ")})` : ""}`,
 		);
 
-		if (profile?.summary) {
-			sections.push(`EXISTING PROFILE SUMMARY:\n${profile.summary}`);
-		}
-		if (profile?.keywords?.length) {
-			sections.push(`KEYWORDS: ${profile.keywords.slice(0, 25).join(", ")}`);
-		}
-		if (profile?.notes?.length) {
-			sections.push(
-				`NOTES:\n${profile.notes
-					.slice(0, 10)
-					.map((note) => `- ${note}`)
-					.join("\n")}`,
-			);
+		const sectionText: Array<[string, string | undefined]> = [
+			["IDENTITY", dossier.identity],
+			["VOICE", dossier.voice],
+			["INTERESTS", dossier.interests.join("; ")],
+			["PEOPLE", dossier.people],
+			["RECENT", dossier.recent],
+		];
+		for (const [label, text] of sectionText) {
+			if (text) sections.push(`${label}:\n${text}`);
 		}
 
-		const signals = this.describeSignals(profile);
-		if (signals) {
-			sections.push(
-				`BEHAVIORAL SIGNALS (statistical, may be noisy):\n${signals}`,
-			);
-		}
+		const big5 = BIG_FIVE_TRAITS.map(
+			(trait) =>
+				`${trait} ${dossier.personality.big_five[trait].score.toFixed(1)}`,
+		).join(", ");
+		const mbti = dossier.personality.mbti;
+		const mbtiText =
+			mbti && mbti.confidence >= 0.35 && !mbti.type.includes("X")
+				? `; MBTI estimate ${mbti.type}`
+				: "";
+		sections.push(`PERSONALITY (0-1, relative to the server): ${big5}${mbtiText}`);
+		sections.push(
+			`MEASURED FACTS:\n${describeMemberFacts(dossier.facts)
+				.map((line) => `- ${line}`)
+				.join("\n")}`,
+		);
 
 		if (interactions.length) {
 			sections.push(
@@ -442,48 +443,6 @@ export class UserPersonaService {
 		);
 
 		return sections.join("\n\n");
-	}
-
-	private describeSignals(profile: UserProfileData | undefined): string {
-		if (!profile) return "";
-		const psych: PsychProfile = profile.psych_profile ?? {};
-		const behavior: BehaviorPatterns = profile.behavior_patterns ?? {};
-		const temporal: TemporalProfile = profile.temporal_profile ?? {};
-		const lines: string[] = [];
-
-		if (psych.big_five_proxies) {
-			const traits = Object.entries(psych.big_five_proxies)
-				.map(([trait, value]) => `${trait} ${value.score.toFixed(2)}`)
-				.join(", ");
-			lines.push(`- Big Five (0-1): ${traits}`);
-		}
-		if (
-			psych.mbti_type &&
-			psych.mbti_type.confidence >= 0.35 &&
-			!psych.mbti_type.type.includes("X")
-		) {
-			lines.push(`- MBTI estimate: ${psych.mbti_type.type}`);
-		}
-		const style = psych.communication_style;
-		if (style) {
-			const verbosity =
-				style.verbosity !== undefined
-					? `, verbosity ${style.verbosity.toFixed(2)}`
-					: "";
-			lines.push(
-				`- Formality ${style.formality.toFixed(2)} (0 casual, 1 formal)${verbosity}, emoji richness ${style.emoji_richness.toFixed(2)}`,
-			);
-		}
-		const topEmojis = Object.keys(behavior.emoji_signature?.top_emojis ?? {});
-		if (topEmojis.length) {
-			lines.push(`- Top emojis: ${topEmojis.slice(0, 8).join(" ")}`);
-		}
-		const rhythm = temporal.circadian_rhythm;
-		if (rhythm?.timezone_estimate) {
-			lines.push(`- Likely timezone: ${rhythm.timezone_estimate}`);
-		}
-
-		return lines.join("\n");
 	}
 
 	private async writeCharacterProfile(

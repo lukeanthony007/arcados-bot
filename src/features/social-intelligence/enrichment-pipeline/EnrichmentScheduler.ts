@@ -1,17 +1,15 @@
 /**
  * EnrichmentScheduler
  *
- * Drains the in-memory enrichment queue on a short interval using node-cron.
- *
- * The queue is process-local and is lost on restart, so jobs must not sit in it for
- * hours waiting for a once-a-day tick (the previous 02:00 / Monday 03:00 / 1st-of-month
- * schedule only enriched what happened to survive in memory until then). Work is bounded
- * by EnrichmentRateLimiter ($1/day, $40/month), not by the schedule, so draining
- * frequently in small batches is cost-safe. ReconciliationSync repopulates the queue
- * from the database (pending conversations, unenriched users/relationships/guild).
+ * Every 5 minutes: sweep each guild for stale dossiers (members, pairs, server), then drain
+ * a small batch of the in-memory enrichment queue. Work is bounded by EnrichmentRateLimiter
+ * ($1/day, $40/month), not by the schedule, so draining often in small batches is cost-safe.
+ * The queue is process-local; conversation jobs lost on restart are repopulated by
+ * ReconciliationSync, dossier jobs by the next sweep.
  */
 
 import cron, { type ScheduledTask } from "node-cron";
+import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { EnrichmentPipelineOrchestrator } from "./EnrichmentPipelineOrchestrator";
 
 /** Jobs processed per tick */
@@ -19,46 +17,34 @@ const BATCH_SIZE = 5;
 
 export class EnrichmentScheduler {
 	private static instance: EnrichmentScheduler;
-	private orchestrator: EnrichmentPipelineOrchestrator;
-	private jobs: ScheduledTask[] = [];
+	private readonly orchestrator = EnrichmentPipelineOrchestrator.getInstance();
+	private task: ScheduledTask | null = null;
 
-	private constructor() {
-		this.orchestrator = EnrichmentPipelineOrchestrator.getInstance();
-	}
+	private constructor() {}
 
 	public static getInstance(): EnrichmentScheduler {
-		if (!EnrichmentScheduler.instance) {
-			EnrichmentScheduler.instance = new EnrichmentScheduler();
-		}
+		EnrichmentScheduler.instance ??= new EnrichmentScheduler();
 		return EnrichmentScheduler.instance;
 	}
 
-	/**
-	 * Start the enrichment scheduler
-	 */
-	public async start() {
-		if (this.jobs.length > 0) return;
-
-		// Every 5 minutes: drain a small batch of queued enrichments
-		this.jobs.push(
-			cron.schedule("*/5 * * * *", async () => {
-				try {
-					await this.orchestrator.processPendingEnrichments(BATCH_SIZE);
-				} catch (error) {
-					console.error("❌ Error in scheduled enrichment drain:", error);
+	public start(db: PostgreSQLManager): void {
+		if (this.task) return;
+		this.task = cron.schedule("*/5 * * * *", async () => {
+			try {
+				const guilds = await db.query("SELECT id FROM guilds");
+				for (const guild of (guilds.data ?? []) as Array<{ id: string }>) {
+					await this.orchestrator.enqueueStaleDossiers(guild.id);
 				}
-			}),
-		);
+				await this.orchestrator.processPendingEnrichments(BATCH_SIZE);
+			} catch (error) {
+				console.error("❌ Error in scheduled enrichment drain:", error);
+			}
+		});
 	}
 
-	/**
-	 * Stop the enrichment scheduler
-	 */
-	public stop() {
-		for (const job of this.jobs) {
-			job.stop();
-		}
-		this.jobs = [];
+	public stop(): void {
+		this.task?.stop();
+		this.task = null;
 		console.log("⏸️  Enrichment scheduler stopped");
 	}
 }

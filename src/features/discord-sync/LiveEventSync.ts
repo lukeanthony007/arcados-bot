@@ -226,38 +226,6 @@ export class LiveEventSync {
 			);
 
 			this.stats.messagesProcessed++;
-
-			// Track message count for enrichment trigger (every 50 messages)
-			if (!isBot) {
-				try {
-					const countResult = await this.db.query(
-						`SELECT COUNT(*) as count FROM messages WHERE author_id = $1 AND guild_id = $2`,
-						[authorId, guildId],
-					);
-
-					if (countResult.success && countResult.data && countResult.data[0]) {
-						const messageCount = parseInt(countResult.data[0].count);
-
-						// Trigger user enrichment every 50 messages
-						if (messageCount % 50 === 0) {
-							const { EnrichmentPipelineOrchestrator } = await import(
-								"../social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator"
-							);
-							await EnrichmentPipelineOrchestrator.getInstance().handleMessageBurst(
-								authorId,
-								guildId,
-							);
-						}
-					}
-				} catch (error) {
-					// Silently fail - enrichment trigger is non-critical
-					if (this.verbose) {
-						console.warn(
-							`🔸 Failed to trigger enrichment for message burst: ${error}`,
-						);
-					}
-				}
-			}
 		} catch (error) {
 			console.error(`🔸 LiveEventSync: Exception saving message ${message.id}:`, error);
 			throw error;

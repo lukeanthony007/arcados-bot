@@ -16,12 +16,9 @@ The runtime is Bun (`bun.lock`). There is no build step; TypeScript runs directl
 
 ### Social intelligence
 - **Enrich conversations:** `npm run enrich:conversations:24h` / `:7d` / `:force`
-- **Enrich user profiles:** `npm run enrich:users:24h` / `:7d` / `:stale`
-- **Enrich relationships:** `npm run enrich:relationships:24h` / `:significant`
-- **Enrich guild summary:** `npm run enrich:guild:summary` / `enrich:guild:full`
-- **Psychological profiling:** `npm run profile:users`, `profile:users:stale`, `profile:view-user`
+- **Dossiers:** `npm run dossier:member <id|name>`, `dossier:pair <a> <b>`, `dossier:server`, `dossier:stale [--dry-run]` (the bot writes these itself as they go stale)
 - **Keywords:** `npm run keywords:build-vocabulary`, `keywords:extract-all`, `diagnose-keywords`
-- **Conversations:** `npm run view-conversations`, `regenerate:conversations`, `analyze:grouping`, `analyze:sorting`, `tune:parameters`, `generate:summaries`
+- **Conversations:** `npm run view-conversations`, `regenerate:conversations`, `analyze:grouping`, `analyze:sorting`, `tune:parameters`
 
 ### Database & debugging
 - **Inspect a message:** `npm run check-message`
@@ -54,10 +51,14 @@ Transforms raw Discord interactions into structured relationship and conversatio
 - **Facts** (`facts/closeness.ts`): the one definition of closeness between two members, computed on demand from `messages` + `conversation_segments` (never stored): replies (3 pts), direct mentions (2), shared conversations (1), 180-day half-life decay; per pair `strength`, `share` of the subject's interactions, `reciprocity`. `getConnections`, `getPairFacts`, `getGuildGraph`, `describeStrength`
 - **Relationship Mapping** (`relationship-mapping/`): `RelationshipMapper.recordInteraction` keeps live `relationship_edges` counters (used only by conversation grouping and enrichment scheduling)
 - **Conversation Detection** (`conversation-detection/`): Groups messages into multi-participant conversation segments using multi-strategy grouping
-- **Semantic Analysis** (`semantic-analysis/`): Extracts keywords (TF-IDF + semantic), generates embeddings, labels topics with AI
-- **Psychological Profiling** (`psychological-profiling/`): Statistical analyzers plus Big Five/MBTI estimators → `user_profiles.psych_profile`, `behavior_patterns`, `temporal_profile`
-- **Enrichment Pipeline** (`enrichment-pipeline/`): Four cascading layers run through `EnrichmentPipelineOrchestrator` and `EnrichmentQueue` (in-memory, retries failed jobs up to 3 times): conversation summaries → user profiles → relationship profiles → guild summary
-- **Types** (`types.ts`): Defines `ConversationEntry`, `AffinityScoreResult`, `UserInteractionSummary`, `StreamingConversation`
+- **Facts** also include `facts/memberFacts.ts` (`getMemberFacts`: activity, writing style, timing in America/New_York, responsiveness, measured from `messages`) and `facts/graph.ts` (`summarizeGraph`: hubs, strongest pairs, communities by label propagation)
+- **Understanding** (`understanding/`): dossiers written in one pass from facts + conversation summaries + real messages via `generateStructured`, stored as JSON sections plus rendered text, regenerated whole when stale (never appended to):
+  - `memberDossier.ts` → `user_profiles.dossier` + `summary` (identity, voice, interests, people, recent, Big Five with evidence/confidence, MBTI derived relative to the server's other dossiers, `X` where undecided); stale after 25 new messages or a new summarized conversation; needs 30+ messages
+  - `pairDossier.ts` → `pair_dossiers` (dynamic, history, tone) for the strongest pairs with 3+ summarized shared conversations
+  - `serverDossier.ts` → `guilds.dossier` + `guilds.server_summary` (overview, culture, topics from summaries, hubs/communities from the graph, recent); stale after 20 new summaries or 7 days
+- **Semantic Analysis** (`semantic-analysis/`): Extracts keywords (TF-IDF + semantic), generates embeddings
+- **Enrichment Pipeline** (`enrichment-pipeline/`): one budgeted in-memory queue (`EnrichmentQueue`, retries failed jobs up to 3 times; `EnrichmentRateLimiter` $1/day at real Grok prices) drained every 5 minutes by `EnrichmentScheduler`, which first runs `EnrichmentPipelineOrchestrator.enqueueStaleDossiers` per guild. Jobs: conversation summaries (`layers/ConversationEnrichmentPipeline.ts`, enqueued by the detector), member/pair/server dossiers. Nothing cascades
+- **Types** (`types.ts`): Defines `ConversationEntry`, `StreamingConversation`, keyword types
 
 #### Member Personas (`src/features/user-personas/`)
 `/persona init|change|clear` lets the bot speak as a server member (see Common Tasks).
@@ -189,8 +190,8 @@ Commands only receive the interaction. Shared services are attached to the Disco
 - [closeness.ts](src/features/social-intelligence/facts/closeness.ts) - The one definition of closeness between members
 - [ConversationDetector.ts](src/features/social-intelligence/conversation-detection/ConversationDetector.ts) - Conversation detection and grouping
 - [EnrichmentPipelineOrchestrator.ts](src/features/social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator.ts) - Enrichment layers, cascades and queue processing
-- [UserProfileEnrichmentPipeline.ts](src/features/social-intelligence/enrichment-pipeline/layers/UserProfileEnrichmentPipeline.ts) - Incremental user profile summaries
-- [PsychologicalProfiler.ts](src/features/social-intelligence/psychological-profiling/PsychologicalProfiler.ts) - Behavioral and personality profiling
+- [memberDossier.ts](src/features/social-intelligence/understanding/memberDossier.ts) - Member dossier writer, staleness, server-relative MBTI
+- [serverDossier.ts](src/features/social-intelligence/understanding/serverDossier.ts) - Server dossier (what chat prepends to the first turn)
 
 ### AI Infrastructure
 - [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts) - AI entry point on the omp SDK
@@ -213,7 +214,7 @@ Commands only receive the interaction. Shared services are attached to the Disco
 - To change the model or fallback, edit `MODEL_PROVIDER`/`MODEL_ID`/`FALLBACK_MODELS` in [OmpRuntime.ts](src/ai/runtime/OmpRuntime.ts); the provider needs an omp login or a key set via `authStorage.keys.setRuntime`
 
 **Member personas** (`/persona init|change|clear`, [src/features/user-personas/](src/features/user-personas/)):
-- `UserPersonaService.buildPersona` refreshes the member's profile (UserProfileEnrichmentPipeline, falling back to PsychologicalProfiler), gathers recent messages, conversation summaries and their closest connections, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
+- `UserPersonaService.buildPersona` makes sure the member has a fresh dossier (`writeMemberDossier` when missing or stale), gathers recent messages, conversation summaries and their closest connections, has the model write a character profile, and stores it in `user_personas` with real messages as voice examples
 - `/persona change` sets the guild's row in `guild_active_personas`; MessageHandler looks it up on every mention/reply and passes the persona to `generateChatResponse` (voice is unaffected)
 - Each turn, `personaContext.ts` adds (1) who the persona member is actually closest to (`getConnections`, see Facts above), which overrides the profile on who they're close to, and (2) their real history with the people involved (speaker, @mentions, members named in the message): pair facts, shared conversation summaries (slurs masked), and recent messages between them (group pings, bare mentions/links and slurs filtered)
 - The profile writer gets the same `getConnections` ranking, so rebuilt profiles describe the right people
@@ -222,7 +223,7 @@ Commands only receive the interaction. Shared services are attached to the Disco
 
 **Add a database table or column**: add `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` to `PostgreSQLManager.initializeSchema()`; it runs on every startup.
 
-**Add an enrichment step**: use `OmpRuntime.generate` with a task-focused system prompt (or `generateStructured` for JSON); throw on `success: false` so `EnrichmentQueue` records and retries the job, and return `null` only for legitimate skips.
+**Add a dossier section or a new dossier kind**: dossier shapes live in `understanding/types.ts`; each writer (`memberDossier.ts`, `pairDossier.ts`, `serverDossier.ts`) gathers facts + summaries + real messages, calls `OmpRuntime.generateStructured`, renders text, and stores both in one statement. Writers throw on model failure (the queue retries up to 3 times) and return `null` only for "not enough evidence". New kinds need a `find*Stale` query, an `EnrichmentLayer` value, and a case in `EnrichmentPipelineOrchestrator.processJob`.
 
 **Track new interaction types**: ConversationDetector uses multi-strategy grouping; add new strategies in `conversation-detection/strategies/` directory.
 

@@ -154,38 +154,12 @@ export class EnrichmentRateLimiter {
 	}
 
 	/**
-	 * Estimate cost for user profile enrichment
+	 * Estimate cost of writing one dossier (member, pair or server): facts + summaries +
+	 * message sample in (~8k chars of evidence), structured sections out
 	 */
-	public estimateUserProfileCost(conversationCount: number): CostEstimate {
-		// Input: conversation summaries + user data + prompt
-		// Output: profile summary delta (~300 tokens)
-		const inputTokens = Math.min(conversationCount * 200, 4000);
-		const outputTokens = 300;
-
-		return this.estimateCost(inputTokens, outputTokens, "grok");
-	}
-
-	/**
-	 * Estimate cost for relationship profile enrichment
-	 */
-	public estimateRelationshipCost(sharedConversations: number): CostEstimate {
-		// Input: shared conversation summaries + user profiles + interaction metrics
-		// Output: relationship summary (~250 tokens)
-		const inputTokens = Math.min(sharedConversations * 200 + 1000, 4000);
-		const outputTokens = 250;
-
-		return this.estimateCost(inputTokens, outputTokens, "grok");
-	}
-
-	/**
-	 * Estimate cost for guild summary enrichment
-	 */
-	public estimateGuildCost(topConversations: number): CostEstimate {
-		// Input: top conversations + relationship data + community structure
-		// Output: guild summary (~400 tokens)
-		const inputTokens = Math.min(topConversations * 150 + 2000, 5000);
-		const outputTokens = 400;
-
+	public estimateDossierCost(kind: "member" | "pair" | "server"): CostEstimate {
+		const inputTokens = { member: 4000, pair: 3000, server: 6000 }[kind];
+		const outputTokens = { member: 900, pair: 400, server: 900 }[kind];
 		return this.estimateCost(inputTokens, outputTokens, "grok");
 	}
 

@@ -2,6 +2,7 @@ import { Pool, PoolClient, QueryResult } from "pg";
 import pgvector from "pgvector/pg";
 import { config } from "../config/index.js";
 import type { ConversationEntry } from "../features/social-intelligence/types";
+import type { MemberDossier } from "../features/social-intelligence/understanding/types";
 
 // Export pgvector for use in other modules
 export { pgvector };
@@ -81,26 +82,13 @@ export interface MemberData {
 export interface UserProfileData {
   guild_id: string;
   user_id: string;
-
-  // AI profile data
+  /** Rendered text of the dossier (same writer, never drifts) */
   summary?: string;
-  keywords?: string[];
-  emojis?: string[];
-  notes?: string[];
   aliases?: string[];
-
-  // Psychological profiling
-  psych_profile?: any; // JSONB - Big 5, MBTI, etc.
-  behavior_patterns?: any; // JSONB
-  temporal_profile?: any; // JSONB
-
-  // Incremental enrichment tracking (UserProfileEnrichmentPipeline)
-  last_enriched_conversation_count?: number;
-  last_enriched_conversation_id?: string;
-  profile_version?: number;
-  enrichment_history?: unknown; // JSONB, parsed by IncrementalEnrichment.parseHistory
-
-  // Metadata
+  dossier?: MemberDossier;
+  dossier_written_at?: Date;
+  dossier_message_count?: number;
+  dossier_conversation_count?: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -363,41 +351,40 @@ export class PostgreSQLManager {
 				)
 			`);
 
-      // User profiles - centralized AI-focused user data
+      // User profiles: aliases plus the member dossier (understanding/memberDossier.ts)
       await client.query(`
 				CREATE TABLE IF NOT EXISTS user_profiles (
 					guild_id VARCHAR(20) NOT NULL,
 					user_id VARCHAR(20) NOT NULL,
-					
-					-- AI profile data
 					summary TEXT,
-					keywords TEXT[] DEFAULT '{}',
-					emojis TEXT[] DEFAULT '{}',
-					notes TEXT[] DEFAULT '{}',
 					aliases TEXT[] DEFAULT '{}',
-					
-					-- Psychological profiling
-					psych_profile JSONB DEFAULT '{}',
-					behavior_patterns JSONB DEFAULT '{}',
-					temporal_profile JSONB DEFAULT '{}',
-					
-					-- Metadata
+					dossier JSONB,
+					dossier_written_at TIMESTAMP WITH TIME ZONE,
+					dossier_message_count INTEGER DEFAULT 0,
+					dossier_conversation_count INTEGER DEFAULT 0,
 					created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
 					updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					
 					PRIMARY KEY (guild_id, user_id),
 					FOREIGN KEY (guild_id, user_id) REFERENCES members(guild_id, user_id) ON DELETE CASCADE
 				)
 			`);
-
-      // Incremental enrichment tracking used by UserProfileEnrichmentPipeline
       await client.query(`
 				ALTER TABLE user_profiles
-				ADD COLUMN IF NOT EXISTS last_enriched_conversation_count INTEGER DEFAULT 0,
-				ADD COLUMN IF NOT EXISTS last_enriched_conversation_id VARCHAR(50),
-				ADD COLUMN IF NOT EXISTS profile_version INTEGER DEFAULT 1,
-				ADD COLUMN IF NOT EXISTS enrichment_history JSONB DEFAULT '[]'::jsonb,
-				ADD COLUMN IF NOT EXISTS last_enriched_at TIMESTAMP WITH TIME ZONE
+				ADD COLUMN IF NOT EXISTS dossier JSONB,
+				ADD COLUMN IF NOT EXISTS dossier_written_at TIMESTAMP WITH TIME ZONE,
+				ADD COLUMN IF NOT EXISTS dossier_message_count INTEGER DEFAULT 0,
+				ADD COLUMN IF NOT EXISTS dossier_conversation_count INTEGER DEFAULT 0,
+				DROP COLUMN IF EXISTS keywords,
+				DROP COLUMN IF EXISTS emojis,
+				DROP COLUMN IF EXISTS notes,
+				DROP COLUMN IF EXISTS psych_profile,
+				DROP COLUMN IF EXISTS behavior_patterns,
+				DROP COLUMN IF EXISTS temporal_profile,
+				DROP COLUMN IF EXISTS last_enriched_conversation_count,
+				DROP COLUMN IF EXISTS last_enriched_conversation_id,
+				DROP COLUMN IF EXISTS profile_version,
+				DROP COLUMN IF EXISTS enrichment_history,
+				DROP COLUMN IF EXISTS last_enriched_at
 			`);
 
       await client.query(`
@@ -559,11 +546,31 @@ export class PostgreSQLManager {
 				ADD COLUMN IF NOT EXISTS current_owner_id VARCHAR(20)
 			`);
 
-      // Add server-wide summary column for guilds
+      // Server dossier (understanding/serverDossier.ts): sections + rendered text used by chat
       await client.query(`
         ALTER TABLE guilds
-        ADD COLUMN IF NOT EXISTS server_summary TEXT
+        ADD COLUMN IF NOT EXISTS server_summary TEXT,
+        ADD COLUMN IF NOT EXISTS dossier JSONB,
+        ADD COLUMN IF NOT EXISTS dossier_written_at TIMESTAMP WITH TIME ZONE,
+        ADD COLUMN IF NOT EXISTS dossier_conversation_count INTEGER DEFAULT 0
       `);
+
+      // Pair dossiers (understanding/pairDossier.ts): what two members have with each other
+      await client.query(`
+				CREATE TABLE IF NOT EXISTS pair_dossiers (
+					guild_id VARCHAR(20) NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
+					user_a VARCHAR(20) NOT NULL,
+					user_b VARCHAR(20) NOT NULL,
+					dossier JSONB NOT NULL,
+					summary TEXT NOT NULL,
+					written_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+					shared_conversation_count INTEGER NOT NULL DEFAULT 0,
+					PRIMARY KEY (guild_id, user_a, user_b),
+					CHECK (user_a < user_b)
+				);
+				DROP TABLE IF EXISTS relationship_profiles;
+				DROP TABLE IF EXISTS guild_metadata;
+			`);
 
       // Voice channel preferences - user preferences for voice channels
       await client.query(`
@@ -777,15 +784,15 @@ export class PostgreSQLManager {
 				-- User profiles indexes for AI retrieval
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_guild_id ON user_profiles(guild_id);
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_psych_profile ON user_profiles USING GIN (psych_profile);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_behavior_patterns ON user_profiles USING GIN (behavior_patterns);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_temporal_profile ON user_profiles USING GIN (temporal_profile);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_psych_profile_metadata ON user_profiles USING GIN ((psych_profile->'profile_metadata'));
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_psych_profile_last_updated ON user_profiles ((psych_profile->'profile_metadata'->>'last_updated'));
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_keywords ON user_profiles USING GIN (keywords);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_emojis ON user_profiles USING GIN (emojis);
-				CREATE INDEX IF NOT EXISTS idx_user_profiles_notes ON user_profiles USING GIN (notes);
 				CREATE INDEX IF NOT EXISTS idx_user_profiles_aliases ON user_profiles USING GIN (aliases);
+				DROP INDEX IF EXISTS idx_user_profiles_psych_profile;
+				DROP INDEX IF EXISTS idx_user_profiles_behavior_patterns;
+				DROP INDEX IF EXISTS idx_user_profiles_temporal_profile;
+				DROP INDEX IF EXISTS idx_user_profiles_psych_profile_metadata;
+				DROP INDEX IF EXISTS idx_user_profiles_psych_profile_last_updated;
+				DROP INDEX IF EXISTS idx_user_profiles_keywords;
+				DROP INDEX IF EXISTS idx_user_profiles_emojis;
+				DROP INDEX IF EXISTS idx_user_profiles_notes;
 			`);
     } catch (error: any) {
       // Only log as error if it's not a vector extension issue (which we already handled)
@@ -1127,7 +1134,7 @@ export class PostgreSQLManager {
       // Update aliases in user_profiles if we added any
       if (aliasesSet.size > currentAliases.length) {
         const updatedAliases = Array.from(aliasesSet);
-        await this.updateUserProfileField(userId, guildId, 'aliases', updatedAliases);
+        await this.setUserProfileAliases(userId, guildId, updatedAliases);
       }
     } catch (error) {
       console.error("🔸 Failed to update aliases from name change:", error);
@@ -1362,79 +1369,6 @@ export class PostgreSQLManager {
   }
 
   // User profile operations
-  async upsertUserProfile(
-    profileData: UserProfileData
-  ): Promise<DatabaseResult<UserProfileData>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-				INSERT INTO user_profiles (
-					guild_id, user_id, summary, keywords, emojis, notes, aliases,
-					psych_profile, behavior_patterns, temporal_profile,
-					updated_at
-				)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-				ON CONFLICT (guild_id, user_id) DO UPDATE SET
-					summary = EXCLUDED.summary,
-					keywords = EXCLUDED.keywords,
-					emojis = EXCLUDED.emojis,
-					notes = EXCLUDED.notes,
-					aliases = EXCLUDED.aliases,
-					psych_profile = EXCLUDED.psych_profile,
-					behavior_patterns = EXCLUDED.behavior_patterns,
-					temporal_profile = EXCLUDED.temporal_profile,
-					updated_at = NOW()
-				RETURNING *
-			`;
-
-      const values = [
-        profileData.guild_id,
-        profileData.user_id,
-        profileData.summary || null,
-        profileData.keywords || [],
-        profileData.emojis || [],
-        profileData.notes || [],
-        profileData.aliases || [],
-        profileData.psych_profile ? JSON.stringify(profileData.psych_profile) : '{}',
-        profileData.behavior_patterns ? JSON.stringify(profileData.behavior_patterns) : '{}',
-        profileData.temporal_profile ? JSON.stringify(profileData.temporal_profile) : '{}',
-      ];
-
-      const result = await client.query(query, values);
-      const row = result.rows[0];
-
-      return {
-        success: true,
-        data: {
-          guild_id: row.guild_id,
-          user_id: row.user_id,
-          summary: row.summary,
-          keywords: row.keywords || [],
-          emojis: row.emojis || [],
-          notes: row.notes || [],
-          aliases: row.aliases || [],
-          psych_profile: row.psych_profile || {},
-          behavior_patterns: row.behavior_patterns || {},
-          temporal_profile: row.temporal_profile || {},
-          created_at: row.created_at,
-          updated_at: row.updated_at,
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Failed to upsert user profile:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
   async getUserProfile(
     userId: string,
     guildId: string
@@ -1445,35 +1379,25 @@ export class PostgreSQLManager {
 
     const client = await this.pool!.connect();
     try {
-      const query = `
-				SELECT * FROM user_profiles
-				WHERE user_id = $1 AND guild_id = $2
-			`;
-
-      const result = await client.query(query, [userId, guildId]);
-
-      if (result.rows.length === 0) {
+      const result = await client.query(
+        `SELECT * FROM user_profiles WHERE user_id = $1 AND guild_id = $2`,
+        [userId, guildId]
+      );
+      const row = result.rows[0];
+      if (!row) {
         return { success: true, data: undefined };
       }
-
-      const row = result.rows[0];
       return {
         success: true,
         data: {
           guild_id: row.guild_id,
           user_id: row.user_id,
-          summary: row.summary,
-          keywords: row.keywords || [],
-          emojis: row.emojis || [],
-          notes: row.notes || [],
+          summary: row.summary ?? undefined,
           aliases: row.aliases || [],
-          psych_profile: row.psych_profile || {},
-          behavior_patterns: row.behavior_patterns || {},
-          temporal_profile: row.temporal_profile || {},
-          last_enriched_conversation_count: row.last_enriched_conversation_count ?? 0,
-          last_enriched_conversation_id: row.last_enriched_conversation_id ?? undefined,
-          profile_version: row.profile_version ?? undefined,
-          enrichment_history: row.enrichment_history ?? undefined,
+          dossier: row.dossier ?? undefined,
+          dossier_written_at: row.dossier_written_at ?? undefined,
+          dossier_message_count: row.dossier_message_count ?? 0,
+          dossier_conversation_count: row.dossier_conversation_count ?? 0,
           created_at: row.created_at,
           updated_at: row.updated_at,
         },
@@ -1489,11 +1413,10 @@ export class PostgreSQLManager {
     }
   }
 
-  async updateUserProfileField(
+  async setUserProfileAliases(
     userId: string,
     guildId: string,
-    field: 'summary' | 'keywords' | 'emojis' | 'notes' | 'aliases',
-    value: string | string[]
+    aliases: string[]
   ): Promise<DatabaseResult<void>> {
     if (!this.isConnected()) {
       return { success: false, error: "Database not connected" };
@@ -1501,104 +1424,15 @@ export class PostgreSQLManager {
 
     const client = await this.pool!.connect();
     try {
-      const query = `
-				UPDATE user_profiles
-				SET ${field} = $1, updated_at = NOW()
-				WHERE user_id = $2 AND guild_id = $3
-			`;
-
-      const result = await client.query(query, [value, userId, guildId]);
-
-      if (result.rowCount === 0) {
-        // Create profile if it doesn't exist
-        const now = new Date();
-        await this.upsertUserProfile({
-          guild_id: guildId,
-          user_id: userId,
-          [field]: value,
-          created_at: now,
-          updated_at: now,
-        } as UserProfileData);
-      }
-
+      await client.query(
+        `INSERT INTO user_profiles (guild_id, user_id, aliases)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET aliases = EXCLUDED.aliases, updated_at = NOW()`,
+        [guildId, userId, aliases]
+      );
       return { success: true };
     } catch (error) {
-      console.error(`🔸 Failed to update user profile field ${field}:`, error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  async updateUserProfilePsych(
-    userId: string,
-    guildId: string,
-    psychProfile: any,
-    behaviorPatterns?: any,
-    temporalProfile?: any
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const updates: string[] = [];
-      const values: any[] = [];
-      let paramCount = 1;
-
-      if (psychProfile !== undefined) {
-        // Replace the profile, but keep the previous AI estimates when this run produced none
-        updates.push(`psych_profile = jsonb_strip_nulls(jsonb_build_object(
-          'big_five_proxies', psych_profile->'big_five_proxies',
-          'mbti_type', psych_profile->'mbti_type'
-        )) || $${paramCount}::jsonb`);
-        values.push(JSON.stringify(psychProfile));
-        paramCount++;
-      }
-
-      if (behaviorPatterns !== undefined) {
-        updates.push(`behavior_patterns = $${paramCount}`);
-        values.push(JSON.stringify(behaviorPatterns));
-        paramCount++;
-      }
-
-      if (temporalProfile !== undefined) {
-        updates.push(`temporal_profile = $${paramCount}`);
-        values.push(JSON.stringify(temporalProfile));
-        paramCount++;
-      }
-
-      if (updates.length === 0) {
-        return { success: false, error: "No fields to update" };
-      }
-
-      values.push(userId, guildId);
-      const query = `
-				UPDATE user_profiles
-				SET ${updates.join(', ')}, updated_at = NOW()
-				WHERE user_id = $${paramCount} AND guild_id = $${paramCount + 1}
-			`;
-
-      const result = await client.query(query, values);
-
-      if (result.rowCount === 0) {
-        // Create profile if it doesn't exist
-        await this.upsertUserProfile({
-          guild_id: guildId,
-          user_id: userId,
-          psych_profile: psychProfile,
-          behavior_patterns: behaviorPatterns,
-          temporal_profile: temporalProfile,
-        } as UserProfileData);
-      }
-
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to update user profile psych:", error);
+      console.error("🔸 Failed to update user profile aliases:", error);
       return {
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",

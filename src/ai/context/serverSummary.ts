@@ -1,7 +1,7 @@
 import type { PostgreSQLManager } from "../../database/PostgreSQLManager";
 
-/** Max characters of server summary prepended to a conversation's first turn */
-const MAX_PREFACE_CHARS = 300;
+/** Max characters of server notes prepended to a conversation's first turn (a rendered dossier is ~2.5k) */
+const MAX_PREFACE_CHARS = 2800;
 
 /**
  * "Server <name>: <summary>" for framing the first turn of a conversation, or "" if the guild
@@ -21,8 +21,8 @@ export async function getServerSummaryPreface(
 		| undefined = result.success ? result.data?.[0] : undefined;
 	if (!row?.server_summary) return "";
 
-	const text = `Server ${row.name || guildId}: ${row.server_summary}`;
+	const text = `Background notes on the Discord server "${row.name || guildId}" (private context for you, don't recite them):\n${row.server_summary}`;
 	return text.length > MAX_PREFACE_CHARS
-		? `${text.slice(0, MAX_PREFACE_CHARS - 3)}...`
+		? `${text.slice(0, MAX_PREFACE_CHARS - 1)}…`
 		: text;
 }

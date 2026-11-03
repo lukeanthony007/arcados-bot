@@ -3,10 +3,7 @@ import {
   type ToolContext,
   type DatabaseToolResult,
 } from "../registry/DatabaseTools";
-import {
-  type GraphEdge,
-  getGuildGraph,
-} from "../../../features/social-intelligence/facts/closeness";
+import { summarizeGraph } from "../../../features/social-intelligence/facts/graph";
 
 /**
  * Get server/guild statistics
@@ -382,47 +379,6 @@ export const getTrendingTopicsTool: DatabaseTool = {
 };
 
 /**
- * Deterministic label propagation over the strong edges: every node starts in its own
- * community and repeatedly adopts the label with the most edge weight among its
- * neighbours (ties → smallest label), in sorted node order.
- */
-function findCommunities(edges: GraphEdge[]): Map<string, string> {
-  const neighbours = new Map<string, Array<[string, number]>>();
-  for (const e of edges) {
-    if (!neighbours.has(e.a)) neighbours.set(e.a, []);
-    if (!neighbours.has(e.b)) neighbours.set(e.b, []);
-    neighbours.get(e.a)?.push([e.b, e.strength]);
-    neighbours.get(e.b)?.push([e.a, e.strength]);
-  }
-  const nodes = [...neighbours.keys()].sort();
-  const label = new Map(nodes.map((n) => [n, n]));
-  for (let pass = 0; pass < 15; pass++) {
-    let changed = false;
-    for (const node of nodes) {
-      const weight = new Map<string, number>();
-      for (const [other, w] of neighbours.get(node) ?? []) {
-        const l = label.get(other) as string;
-        weight.set(l, (weight.get(l) ?? 0) + w);
-      }
-      let best = label.get(node) as string;
-      let bestWeight = weight.get(best) ?? 0;
-      for (const [l, w] of weight) {
-        if (w > bestWeight || (w === bestWeight && l < best)) {
-          best = l;
-          bestWeight = w;
-        }
-      }
-      if (best !== label.get(node)) {
-        label.set(node, best);
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
-  return label;
-}
-
-/**
  * Get overall relationship network insights
  */
 export const getServerNetworkTool: DatabaseTool = {
@@ -439,67 +395,17 @@ export const getServerNetworkTool: DatabaseTool = {
     context: ToolContext
   ): Promise<string | DatabaseToolResult> => {
     try {
-      const [edges, membersResult] = await Promise.all([
-        getGuildGraph(context.db, context.guildId),
-        context.db.query(
-          `SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
-           FROM members
-           WHERE guild_id = $1 AND active = true AND bot = false`,
-          [context.guildId]
-        ),
-      ]);
-
-      if (!membersResult.success || !membersResult.data) {
-        return { success: false, error: "Failed to get members" };
-      }
-      const names = new Map<string, string>(
-        (membersResult.data as Array<{ user_id: string; name: string }>).map((m) => [
-          m.user_id,
-          m.name,
-        ])
-      );
-      const nameOf = (id: string) => names.get(id) ?? id;
-      // Only edges between current members count
-      const live = edges.filter((e) => names.has(e.a) && names.has(e.b));
-
-      const totals = new Map<string, number>();
-      for (const e of live) {
-        totals.set(e.a, (totals.get(e.a) ?? 0) + e.strength);
-        totals.set(e.b, (totals.get(e.b) ?? 0) + e.strength);
-      }
-      const hubs = [...totals.entries()]
-        .sort((x, y) => y[1] - x[1])
-        .slice(0, 10)
-        .map(([id, strength]) => ({ name: nameOf(id), strength: Math.round(strength) }));
-      const pairs = live.slice(0, 10).map((e) => ({
-        a: nameOf(e.a),
-        b: nameOf(e.b),
-        strength: Math.round(e.strength),
-        reciprocity: e.reciprocity,
+      const graph = await summarizeGraph(context.db, context.guildId);
+      const { hubs, communities } = graph;
+      const pairs = graph.strongestPairs.map((p) => ({
+        a: p.a.name,
+        b: p.b.name,
+        strength: p.strength,
+        reciprocity: p.reciprocity,
       }));
 
-      const maxStrength = live[0]?.strength ?? 0;
-      const labels = findCommunities(live.filter((e) => e.strength >= maxStrength * 0.1));
-      const groups = new Map<string, string[]>();
-      for (const [id, l] of labels) {
-        if (!groups.has(l)) groups.set(l, []);
-        groups.get(l)?.push(id);
-      }
-      const communities = [...groups.values()]
-        .filter((ids) => ids.length >= 2)
-        .sort((x, y) => y.length - x.length)
-        .slice(0, 6)
-        .map((ids) =>
-          ids
-            .sort((x, y) => (totals.get(y) ?? 0) - (totals.get(x) ?? 0))
-            .slice(0, 12)
-            .map(nameOf)
-        );
-
-      const isolated = [...names.keys()].filter((id) => !totals.has(id)).length;
-
       const parts = [
-        `Server network: ${names.size} members, ${live.length} connected pairs, ${isolated} members with no interactions.`,
+        `Server network: ${graph.members} members, ${graph.connectedPairs} connected pairs, ${graph.isolated} members with no interactions.`,
         `Top hubs (total interaction strength): ${hubs.map((h) => `${h.name} (${h.strength})`).join(", ") || "none"}`,
         `Strongest pairs:`,
         ...pairs.map(
@@ -507,21 +413,21 @@ export const getServerNetworkTool: DatabaseTool = {
             `  - ${p.a} ↔ ${p.b}: strength ${p.strength}, ${(p.reciprocity * 100).toFixed(0)}% reciprocal`
         ),
         `Communities (clusters of strongly connected members):`,
-        ...communities.map((c, i) => `  ${i + 1}. ${c.join(", ")}`),
+        ...communities.map((c, i) => `  ${i + 1}. ${c.map((m) => m.name).join(", ")}`),
       ];
 
       return {
         success: true,
-        summary: `${live.length} connected pairs among ${names.size} members`,
+        summary: `${graph.connectedPairs} connected pairs among ${graph.members} members`,
         data: {
           formatted: parts.join("\n"),
           network: {
-            totalMembers: names.size,
-            connectedPairs: live.length,
-            isolatedMembers: isolated,
-            hubs,
+            totalMembers: graph.members,
+            connectedPairs: graph.connectedPairs,
+            isolatedMembers: graph.isolated,
+            hubs: hubs.map((h) => ({ name: h.name, strength: h.strength })),
             strongestPairs: pairs,
-            communities,
+            communities: communities.map((c) => c.map((m) => m.name)),
           },
         },
       };

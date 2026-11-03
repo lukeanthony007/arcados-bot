@@ -74,12 +74,8 @@ export class Bot {
         const { EnrichmentScheduler } = await import(
           "./features/social-intelligence/enrichment-pipeline/EnrichmentScheduler"
         );
-        const orchestrator = EnrichmentPipelineOrchestrator.getInstance();
-        await orchestrator.initialize(this.db);
-
-        // Start scheduler
-        const scheduler = EnrichmentScheduler.getInstance();
-        await scheduler.start();
+        EnrichmentPipelineOrchestrator.getInstance().initialize(this.db);
+        EnrichmentScheduler.getInstance().start(this.db);
 
       } catch (error) {
         console.error("🔸 Error initializing enrichment pipeline:", error);

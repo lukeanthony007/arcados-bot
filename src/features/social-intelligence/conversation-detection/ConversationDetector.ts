@@ -2540,10 +2540,9 @@ export class ConversationDetector {
         const orchestrator = EnrichmentPipelineOrchestrator.getInstance();
 
         // Check significance
-        const isSignificant = await orchestrator.isConversationSignificant(
+        const isSignificant = orchestrator.isConversationSignificant(
           participants.length,
           segmentMessages.length,
-          features?.keywords,
         );
 
         if (isSignificant) {
@@ -2554,7 +2553,7 @@ export class ConversationDetector {
                 ? "medium"
                 : "low";
 
-          await orchestrator.enqueueConversation(segmentId, buffer.guildId, significance);
+          orchestrator.enqueueConversation(segmentId, buffer.guildId, significance);
         }
       } catch (error) {
         // Silently fail - enrichment trigger is non-critical

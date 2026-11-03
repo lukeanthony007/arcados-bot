@@ -9,15 +9,15 @@
 
 export enum EnrichmentLayer {
 	CONVERSATION = 1,
-	USER = 2,
-	RELATIONSHIP = 3,
+	MEMBER = 2,
+	PAIR = 3,
 	SERVER = 4,
 }
 
 export interface EnrichmentJob {
 	id: string;
 	layer: EnrichmentLayer;
-	entityId: string; // conversation_id, user_id, or "user_a:user_b" for relationships
+	entityId: string; // conversation_id, user_id, "user_a:user_b" for pairs, guild_id for server
 	guildId: string;
 	priority: number; // Higher = more urgent
 	enqueuedAt: Date;
@@ -38,8 +38,8 @@ export class EnrichmentQueue {
 	private constructor() {
 		this.queues = new Map([
 			[EnrichmentLayer.CONVERSATION, []],
-			[EnrichmentLayer.USER, []],
-			[EnrichmentLayer.RELATIONSHIP, []],
+			[EnrichmentLayer.MEMBER, []],
+			[EnrichmentLayer.PAIR, []],
 			[EnrichmentLayer.SERVER, []],
 		]);
 		this.processing = new Set();
@@ -73,9 +73,7 @@ export class EnrichmentQueue {
 
 		const queue = this.queues.get(job.layer);
 		if (!queue) {
-			console.error(
-				`❌ Invalid enrichment layer: ${job.layer}`,
-			);
+			console.error(`❌ Invalid enrichment layer: ${job.layer}`);
 			return;
 		}
 
@@ -122,8 +120,8 @@ export class EnrichmentQueue {
 		// Process layers in order: conversation -> user -> relationship -> server
 		for (const layer of [
 			EnrichmentLayer.CONVERSATION,
-			EnrichmentLayer.USER,
-			EnrichmentLayer.RELATIONSHIP,
+			EnrichmentLayer.MEMBER,
+			EnrichmentLayer.PAIR,
 			EnrichmentLayer.SERVER,
 		]) {
 			while (jobs.length < maxCount) {
@@ -214,8 +212,8 @@ export class EnrichmentQueue {
 	public getQueueDepths(): Record<string, number> {
 		return {
 			conversation: this.queues.get(EnrichmentLayer.CONVERSATION)?.length || 0,
-			user: this.queues.get(EnrichmentLayer.USER)?.length || 0,
-			relationship: this.queues.get(EnrichmentLayer.RELATIONSHIP)?.length || 0,
+			member: this.queues.get(EnrichmentLayer.MEMBER)?.length || 0,
+			pair: this.queues.get(EnrichmentLayer.PAIR)?.length || 0,
 			server: this.queues.get(EnrichmentLayer.SERVER)?.length || 0,
 			processing: this.processing.size,
 			failed: this.failed.size,
@@ -259,9 +257,7 @@ export class EnrichmentQueue {
 	/**
 	 * Parse job ID back to components
 	 */
-	private parseJobId(
-		jobId: string,
-	): [EnrichmentLayer | null, string, string] {
+	private parseJobId(jobId: string): [EnrichmentLayer | null, string, string] {
 		const parts = jobId.split(":");
 		if (parts.length < 3) {
 			return [null, "", ""];
@@ -282,10 +278,10 @@ export class EnrichmentQueue {
 		switch (layer) {
 			case EnrichmentLayer.CONVERSATION:
 				return "conversation";
-			case EnrichmentLayer.USER:
-				return "user";
-			case EnrichmentLayer.RELATIONSHIP:
-				return "relationship";
+			case EnrichmentLayer.MEMBER:
+				return "member";
+			case EnrichmentLayer.PAIR:
+				return "pair";
 			case EnrichmentLayer.SERVER:
 				return "server";
 			default:

@@ -175,9 +175,6 @@ export class StateSyncService {
       messagesFilled: number;
       messageEmbeddingsGenerated: number;
       conversationEmbeddingsGenerated: number;
-      usersQueued: number;
-      relationshipsQueued: number;
-      guildsQueued: number;
     };
     coordinator: {
       activeLocks: number;
@@ -193,9 +190,6 @@ export class StateSyncService {
         messagesFilled: reconciliationStats.messagesFilled,
         messageEmbeddingsGenerated: reconciliationStats.messageEmbeddingsGenerated || 0,
         conversationEmbeddingsGenerated: reconciliationStats.conversationEmbeddingsGenerated || 0,
-        usersQueued: reconciliationStats.usersQueued || 0,
-        relationshipsQueued: reconciliationStats.relationshipsQueued || 0,
-        guildsQueued: reconciliationStats.guildsQueued || 0,
       },
       coordinator: this.coordinator.getStats(),
     };

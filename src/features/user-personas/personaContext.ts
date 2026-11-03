@@ -14,6 +14,7 @@ import {
 	getConnections,
 	getPairFacts,
 } from "../social-intelligence/facts/closeness";
+import { getPairDossier } from "../social-intelligence/understanding/pairDossier";
 import { SLUR_PATTERN } from "./personaPrompt";
 
 /** People to add history for per turn */
@@ -154,11 +155,7 @@ async function describeHistory(
 
 	const [pair, profile, conversations, own, theirs] = await Promise.all([
 		getPairFacts(db, guildId, persona.user_id, personId),
-		db.query(
-			`SELECT summary FROM relationship_profiles
-			WHERE guild_id = $1 AND user_a = LEAST($2, $3) AND user_b = GREATEST($2, $3) AND summary IS NOT NULL`,
-			[guildId, persona.user_id, personId],
-		),
+		getPairDossier(db, guildId, persona.user_id, personId),
 		db.query(
 			`SELECT start_time, topic_label, summary FROM conversation_segments
 			WHERE guild_id = $1 AND $2 = ANY(participants) AND $3 = ANY(participants) AND summary IS NOT NULL
@@ -195,10 +192,7 @@ async function describeHistory(
 		);
 	}
 
-	const profileRows: Array<{ summary: string }> =
-		profile.success && profile.data ? profile.data : [];
-	if (profileRows[0])
-		lines.push(`- Relationship summary: ${maskSlurs(profileRows[0].summary)}`);
+	if (profile) lines.push(`- Relationship summary: ${maskSlurs(profile.summary)}`);
 
 	const conversationRows: ConversationRow[] =
 		conversations.success && conversations.data ? conversations.data : [];
