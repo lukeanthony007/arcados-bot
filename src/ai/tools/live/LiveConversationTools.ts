@@ -1,13 +1,77 @@
-import type { DatabaseTool, ToolContext } from "../registry/DatabaseTools";
-import { ConversationDetector } from "../../../features/social-intelligence/conversation-detection/ConversationDetector";
 import {
 	describeStrength,
 	getPairFacts,
 } from "../../../features/social-intelligence/facts/closeness";
+import type { DatabaseTool, ToolContext } from "../registry/DatabaseTools";
+
+interface SegmentRow {
+	id: string;
+	channel_id: string;
+	participants: string[];
+	message_ids: string[] | null;
+	message_count: number;
+	start_time: Date;
+	end_time: Date;
+	summary: string | null;
+	topic_label: string | null;
+	status: string;
+}
+
+/** Accepts a channel ID, a channel name ("chat" / "#chat"), or falls back to the context channel. */
+async function resolveChannelId(
+	input: unknown,
+	context: ToolContext,
+): Promise<string | null> {
+	const raw = typeof input === "string" ? input.trim().replace(/^#/, "") : "";
+	if (raw.length === 0) return context.channelId ?? null;
+	if (/^\d{15,22}$/.test(raw)) return raw;
+	const result = await context.db.query(
+		`SELECT id FROM channels
+     WHERE guild_id = $1 AND LOWER(name) = LOWER($2)
+     ORDER BY id LIMIT 1`,
+		[context.guildId, raw],
+	);
+	return result.success && result.data && result.data.length > 0
+		? result.data[0].id
+		: null;
+}
+
+async function loadNames(
+	context: ToolContext,
+	ids: string[],
+): Promise<Map<string, string>> {
+	const names = new Map<string, string>();
+	if (ids.length === 0) return names;
+	const result = await context.db.query(
+		`SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
+     FROM members
+     WHERE user_id = ANY($1::text[]) AND guild_id = $2`,
+		[[...new Set(ids)], context.guildId],
+	);
+	if (result.success && result.data) {
+		for (const member of result.data) names.set(member.user_id, member.name);
+	}
+	return names;
+}
+
+async function getActiveSegments(
+	context: ToolContext,
+	channelId: string,
+): Promise<SegmentRow[]> {
+	const result = await context.db.query(
+		`SELECT id, channel_id, participants, message_ids, message_count, start_time, end_time,
+            summary, topic_label, status
+     FROM conversation_segments
+     WHERE guild_id = $1 AND channel_id = $2 AND status = 'active'
+     ORDER BY end_time DESC`,
+		[context.guildId, channelId],
+	);
+	return result.success && result.data ? result.data : [];
+}
 
 /**
  * Get live conversation context from the current channel
- * Returns active conversation participants and recent messages before finalization
+ * Returns the still-going conversation(s) and their latest messages
  */
 export const getLiveConversationContext: DatabaseTool = {
 	name: "getLiveConversationContext",
@@ -18,28 +82,29 @@ export const getLiveConversationContext: DatabaseTool = {
 		properties: {
 			channelId: {
 				type: "string",
-				description: "Channel ID to get live conversation from",
+				description: "Channel ID (or name) to get the live conversation from",
 			},
 			messageLimit: {
 				type: "number",
 				description:
-					"Number of recent messages to retrieve from buffer (default: 10, max: 20)",
+					"Number of recent messages to retrieve (default: 10, max: 20)",
 			},
 		},
 		required: ["channelId"],
 	},
-	execute: async (params: any, context: ToolContext) => {
+	execute: async (params: Record<string, unknown>, context: ToolContext) => {
 		try {
-			const channelId = String(params.channelId);
-			const messageLimit = Math.min(params.messageLimit || 10, 20);
-
-			const conversationManager = new ConversationDetector(context.db);
-			const liveData = conversationManager.getLiveConversationInChannel(
-				channelId,
-				context.guildId,
+			const channelId = await resolveChannelId(
+				String(params.channelId ?? ""),
+				context,
 			);
+			const messageLimit = Math.min(Number(params.messageLimit) || 10, 20);
+			if (!channelId) {
+				return { success: false, error: "Channel not found" };
+			}
 
-			if (!liveData.buffer || liveData.activeConversations.length === 0) {
+			const segments = await getActiveSegments(context, channelId);
+			if (segments.length === 0) {
 				return {
 					success: true,
 					summary: "No active conversation in this channel right now",
@@ -52,93 +117,73 @@ export const getLiveConversationContext: DatabaseTool = {
 				};
 			}
 
-			// Get participant details
-			const participantIds = new Set<string>();
-			for (const convo of liveData.activeConversations) {
-				for (const participantId of convo.participants) {
-					participantIds.add(participantId);
-				}
-			}
+			const participantIds = [
+				...new Set(segments.flatMap((s) => s.participants)),
+			];
+			const messageIds = segments.flatMap((s) => s.message_ids ?? []);
+			const msgResult =
+				messageIds.length > 0
+					? await context.db.query(
+							`SELECT id, author_id, content, created_at, referenced_message_id
+               FROM messages
+               WHERE id = ANY($1::text[]) AND guild_id = $2 AND active = true
+               ORDER BY created_at DESC
+               LIMIT $3`,
+							[messageIds, context.guildId, messageLimit],
+						)
+					: null;
+			const recent: Array<{
+				id: string;
+				author_id: string;
+				content: string | null;
+				created_at: Date;
+				referenced_message_id: string | null;
+			}> =
+				msgResult?.success && msgResult.data
+					? [...msgResult.data].reverse()
+					: [];
 
-			const participants: Array<{
-				userId: string;
-				displayName: string;
-				username: string;
-			}> = [];
+			const names = await loadNames(context, [
+				...participantIds,
+				...recent.map((m) => m.author_id),
+			]);
+			const participants = participantIds.map((userId) => ({
+				userId,
+				displayName: names.get(userId) ?? "Unknown User",
+			}));
 
-			for (const userId of participantIds) {
-				const memberResult = await context.db.query(
-					`SELECT display_name, username, global_name
-           FROM members
-           WHERE guild_id = $1 AND user_id = $2`,
-					[context.guildId, userId],
-				);
+			const formattedMessages = recent.map((msg) => ({
+				author: names.get(msg.author_id) ?? "Unknown",
+				content: msg.content ?? "",
+				timestamp: new Date(msg.created_at).toISOString(),
+				isReply: !!msg.referenced_message_id,
+			}));
 
-				if (memberResult.success && memberResult.data && memberResult.data.length > 0) {
-					const member = memberResult.data[0];
-					participants.push({
-						userId,
-						displayName: member.display_name || member.global_name || member.username,
-						username: member.username,
-					});
-				} else {
-					participants.push({
-						userId,
-						displayName: "Unknown User",
-						username: "unknown",
-					});
-				}
-			}
-
-			// Get recent messages
-			const recentMessages = liveData.recentMessages.slice(-messageLimit);
-
-			// Format messages for AI consumption
-			const formattedMessages = await Promise.all(
-				recentMessages.map(async (msg) => {
-					const authorResult = await context.db.query(
-						`SELECT display_name, username, global_name
-             FROM members
-             WHERE guild_id = $1 AND user_id = $2`,
-						[context.guildId, msg.author_id],
-					);
-
-					const authorName =
-						authorResult.success &&
-						authorResult.data &&
-						authorResult.data.length > 0
-							? authorResult.data[0].display_name ||
-								authorResult.data[0].global_name ||
-								authorResult.data[0].username
-							: "Unknown";
-
-					return {
-						author: authorName,
-						content: msg.content,
-						timestamp: msg.created_at.toISOString(),
-						isReply: !!msg.referenced_message_id,
-						hasMentions: (msg.mentioned_user_ids?.length || 0) > 0,
-					};
-				}),
+			const startTime = new Date(
+				Math.min(...segments.map((s) => new Date(s.start_time).getTime())),
 			);
-
-			// Calculate conversation duration
-			const buffer = liveData.buffer;
+			const lastActivity = new Date(
+				Math.max(...segments.map((s) => new Date(s.end_time).getTime())),
+			);
 			const durationMinutes = Math.round(
-				(buffer.lastActivity.getTime() - buffer.startTime.getTime()) / (1000 * 60),
+				(lastActivity.getTime() - startTime.getTime()) / 60000,
 			);
+			const topics = segments
+				.map((s) => s.topic_label)
+				.filter((t): t is string => !!t);
 
-			// Format as natural text for AI
 			const formatted = `Active Conversation in Channel:
 
 Participants (${participants.length}):
-${participants.map((p) => `- ${p.displayName} (@${p.username})`).join("\n")}
+${participants.map((p) => `- ${p.displayName}`).join("\n")}
 
 Conversation Timeline:
-- Started: ${buffer.startTime.toLocaleString()}
-- Last Activity: ${buffer.lastActivity.toLocaleString()}
+- Started: ${startTime.toLocaleString()}
+- Last Activity: ${lastActivity.toLocaleString()}
 - Duration: ${durationMinutes} minutes
-- Messages: ${recentMessages.length} recent messages
+- Messages so far: ${segments.reduce((sum, s) => sum + s.message_count, 0)}${
+				topics.length > 0 ? `\n- Topic: ${topics.join("; ")}` : ""
+			}
 
 Recent Messages:
 ${formattedMessages
@@ -150,16 +195,16 @@ ${formattedMessages
 
 			return {
 				success: true,
-				summary: `Active conversation with ${participants.length} participants, ${recentMessages.length} recent messages, ongoing for ${durationMinutes} minutes`,
+				summary: `Active conversation with ${participants.length} participants, ${formattedMessages.length} recent messages, ongoing for ${durationMinutes} minutes`,
 				data: {
 					hasActiveConversation: true,
 					participants,
 					messages: formattedMessages,
-					conversationStart: buffer.startTime,
-					lastActivity: buffer.lastActivity,
+					conversationStart: startTime,
+					lastActivity,
 					durationMinutes,
-					messageCount: recentMessages.length,
-					activeConversationCount: liveData.activeConversations.length,
+					messageCount: formattedMessages.length,
+					activeConversationCount: segments.length,
 				},
 				formatted,
 			};
@@ -186,23 +231,26 @@ export const getConversationParticipantRelationships: DatabaseTool = {
 		properties: {
 			channelId: {
 				type: "string",
-				description: "Channel ID to analyze participant relationships",
+				description:
+					"Channel ID (or name) to analyze participant relationships",
 			},
 		},
 		required: ["channelId"],
 	},
-	execute: async (params: any, context: ToolContext) => {
+	execute: async (params: Record<string, unknown>, context: ToolContext) => {
 		try {
-			const channelId = String(params.channelId);
+			const channelId = await resolveChannelId(
+				String(params.channelId ?? ""),
+				context,
+			);
+			if (!channelId) {
+				return { success: false, error: "Channel not found" };
+			}
 
-			const conversationManager = new ConversationDetector(context.db);
-
-			// Get active participants
-			const participantIds =
-				conversationManager.getActiveParticipantsInChannel(
-					channelId,
-					context.guildId,
-				);
+			const segments = await getActiveSegments(context, channelId);
+			const participantIds = [
+				...new Set(segments.flatMap((s) => s.participants)),
+			];
 
 			if (participantIds.length === 0) {
 				return {
@@ -218,36 +266,13 @@ export const getConversationParticipantRelationships: DatabaseTool = {
 					success: true,
 					summary: "Only one participant in conversation",
 					data: { relationships: [] },
-					formatted: "Only one participant in the conversation (no relationships to analyze).",
+					formatted:
+						"Only one participant in the conversation (no relationships to analyze).",
 				};
 			}
 
-			// Get participant names
-			const participantNames = new Map<string, string>();
-			for (const userId of participantIds) {
-				const memberResult = await context.db.query(
-					`SELECT display_name, username, global_name
-           FROM members
-           WHERE guild_id = $1 AND user_id = $2`,
-					[context.guildId, userId],
-				);
+			const participantNames = await loadNames(context, participantIds);
 
-				if (
-					memberResult.success &&
-					memberResult.data &&
-					memberResult.data.length > 0
-				) {
-					const member = memberResult.data[0];
-					participantNames.set(
-						userId,
-						member.display_name || member.global_name || member.username,
-					);
-				} else {
-					participantNames.set(userId, "Unknown User");
-				}
-			}
-
-			// Closeness for every participant pair (from the first member's point of view)
 			const relationships: Array<{
 				user1: string;
 				user2: string;
@@ -276,11 +301,14 @@ export const getConversationParticipantRelationships: DatabaseTool = {
 					user1: participantNames.get(user1Id) || "Unknown",
 					user2: participantNames.get(user2Id) || "Unknown",
 					interacted: facts !== null,
-					description: facts ? describeStrength(facts) : "no recorded interactions",
+					description: facts
+						? describeStrength(facts)
+						: "no recorded interactions",
 					share: facts?.share ?? 0,
 					reciprocity: facts?.reciprocity ?? 0,
 					replies: (facts?.a_to_b.replies ?? 0) + (facts?.b_to_a.replies ?? 0),
-					mentions: (facts?.a_to_b.mentions ?? 0) + (facts?.b_to_a.mentions ?? 0),
+					mentions:
+						(facts?.a_to_b.mentions ?? 0) + (facts?.b_to_a.mentions ?? 0),
 					sharedConversations: facts?.shared_conversations ?? 0,
 				});
 			});
@@ -337,18 +365,19 @@ ${strangers.length > 0 ? `- ${strangers.length} pair(s) have never interacted` :
 
 /**
  * Get recent conversation topics from a channel
- * Queries finalized conversation segments for historical context
+ * Reads stored conversation segments (topic_label + summary)
  */
 export const getRecentChannelTopics: DatabaseTool = {
 	name: "getRecentChannelTopics",
 	description:
-		"Get recent conversation topics and summaries from a channel's finalized conversation segments. Use this to understand what has been discussed in the past hours/days, beyond the current active conversation.",
+		"Get recent conversation topics and summaries from a channel's stored conversations (topic label plus summary). Use this to understand what has been discussed in the past hours/days, beyond the current active conversation.",
 	parameters: {
 		type: "object",
 		properties: {
 			channelId: {
 				type: "string",
-				description: "Channel ID to retrieve conversation topics from",
+				description:
+					"Channel ID (or name) to retrieve conversation topics from",
 			},
 			lookbackHours: {
 				type: "number",
@@ -357,233 +386,68 @@ export const getRecentChannelTopics: DatabaseTool = {
 			},
 			limit: {
 				type: "number",
-				description: "Maximum number of conversation topics to return (default: 10)",
+				description:
+					"Maximum number of conversation topics to return (default: 10)",
 			},
 		},
 		required: ["channelId"],
 	},
 	execute: async (params: any, context: ToolContext) => {
 		try {
-			const channelId = String(params.channelId);
-			const lookbackHours = Math.min(params.lookbackHours || 24, 168); // Max 7 days
-			const limit = Math.min(params.limit || 10, 20); // Max 20 conversations
+			const channelId = await resolveChannelId(params.channelId, context);
+			if (!channelId) {
+				return { success: false, error: "Channel not found" };
+			}
+			const lookbackHours = Math.min(params.lookbackHours || 24, 168);
+			const limit = Math.min(params.limit || 10, 20);
+			const lookbackTime = new Date(
+				Date.now() - lookbackHours * 60 * 60 * 1000,
+			);
 
-			const lookbackTime = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
-
-			// Query finalized and active conversation segments
 			const result = await context.db.query(
-				`SELECT
-          id,
-          participants,
-          start_time,
-          end_time,
-          message_count,
-          features,
-          summary,
-          message_ids,
-          status
-        FROM conversation_segments
-        WHERE guild_id = $1
-          AND channel_id = $2
-          AND end_time >= $3
-          AND status IN ('finalized', 'active')
-        ORDER BY end_time DESC
-        LIMIT $4`,
+				`SELECT id, channel_id, participants, message_ids, message_count, start_time, end_time,
+                summary, topic_label, status
+         FROM conversation_segments
+         WHERE guild_id = $1
+           AND channel_id = $2
+           AND end_time >= $3
+         ORDER BY end_time DESC
+         LIMIT $4`,
 				[context.guildId, channelId, lookbackTime, limit],
 			);
+			const segments: SegmentRow[] =
+				result.success && result.data ? result.data : [];
 
-			let conversations: any[] = [];
-
-			// If we found segments, use them
-			if (result.success && result.data && result.data.length > 0) {
-				conversations = result.data;
-			} else {
-				// Fallback: Query recent messages directly from messages table
-				const messagesResult = await context.db.query(
-					`SELECT
-            m.id,
-            m.author_id,
-            m.content,
-            m.created_at,
-            mem.display_name,
-            mem.username,
-            mem.global_name
-          FROM messages m
-          LEFT JOIN members mem ON mem.user_id = m.author_id AND mem.guild_id = m.guild_id
-          WHERE m.guild_id = $1
-            AND m.channel_id = $2
-            AND m.created_at >= $3
-            AND m.active = true
-          ORDER BY m.created_at DESC
-          LIMIT $4`,
-					[context.guildId, channelId, lookbackTime, limit * 10], // Get more messages to group into conversations
-				);
-
-				if (messagesResult.success && messagesResult.data && messagesResult.data.length > 0) {
-					// Group messages into conversation-like summaries
-					const messages = messagesResult.data as Array<{
-						id: string;
-						author_id: string;
-						content: string;
-						created_at: string | Date;
-						display_name?: string;
-						username?: string;
-						global_name?: string;
-					}>;
-
-					// Sort messages chronologically (oldest first) for proper grouping
-					const sortedMessages = [...messages].sort(
-						(a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
-					);
-
-					// Group messages by time windows (messages within 30 minutes of each other)
-					const grouped: Array<{
-						participants: Set<string>;
-						participantNames: Map<string, string>;
-						messages: typeof messages;
-						startTime: Date;
-						endTime: Date;
-					}> = [];
-
-					for (const msg of sortedMessages) {
-						const msgTime = new Date(msg.created_at);
-						const authorName = msg.display_name || msg.global_name || msg.username || "Unknown";
-
-						// Find or create a group for this message
-						let added = false;
-						for (const group of grouped) {
-							const timeDiff = msgTime.getTime() - group.endTime.getTime();
-							// If within 30 minutes of the last message in group, add to it
-							if (timeDiff >= 0 && timeDiff <= 30 * 60 * 1000) {
-								group.messages.push(msg);
-								group.participants.add(msg.author_id);
-								group.participantNames.set(msg.author_id, authorName);
-								group.endTime = msgTime; // Update end time
-								added = true;
-								break;
-							}
-						}
-
-						if (!added) {
-							// Create new group
-							grouped.push({
-								participants: new Set([msg.author_id]),
-								participantNames: new Map([[msg.author_id, authorName]]),
-								messages: [msg],
-								startTime: msgTime,
-								endTime: msgTime,
-							});
-						}
-					}
-
-					// Convert grouped messages into conversation-like format
-					conversations = grouped
-						.filter((group) => group.messages.length >= 2) // Only include groups with 2+ messages
-						.slice(0, limit)
-						.map((group, idx) => {
-							const participantIds = Array.from(group.participants);
-							const participantNames = Array.from(group.participantNames.values());
-							const durationMinutes = Math.round(
-								(group.endTime.getTime() - group.startTime.getTime()) / (1000 * 60),
-							);
-
-							// Create a simple summary from message content
-							const messageSnippets = group.messages
-								.slice(0, 3)
-								.map((m) => {
-									const content = (m.content || "").trim();
-									return content.length > 100 ? `${content.substring(0, 100)}...` : content;
-								})
-								.filter((s) => s.length > 0);
-
-							const summary =
-								messageSnippets.length > 0
-									? `Discussion about: ${messageSnippets.join("; ")}`
-									: "Recent conversation";
-
-							return {
-								id: `msg-group-${idx}`,
-								participants: participantIds,
-								participantNames,
-								start_time: group.startTime,
-								end_time: group.endTime,
-								message_count: group.messages.length,
-								summary,
-								features: {},
-								message_ids: group.messages.map((m) => m.id),
-								status: "active", // These are derived from messages, so mark as active
-							};
-						});
-				}
-
-				// If still no conversations found, return early
-				if (conversations.length === 0) {
-					return {
-						success: true,
-						summary: "No recent conversations found in this channel",
-						data: { conversations: [] },
-						formatted: `No conversations or messages in the past ${lookbackHours} hours.`,
-					};
-				}
+			if (segments.length === 0) {
+				return {
+					success: true,
+					summary: "No recent conversations found in this channel",
+					data: { conversations: [] },
+					formatted: `No conversations in the past ${lookbackHours} hours.`,
+				};
 			}
 
-			// Enrich with participant names
-			const enriched = await Promise.all(
-				conversations.map(async (convo: any) => {
-					const participantIds = convo.participants || [];
-					let participantNames: string[] = [];
-
-					// If participantNames already exists (from message fallback), use it
-					if (convo.participantNames && Array.isArray(convo.participantNames)) {
-						participantNames = convo.participantNames;
-					} else {
-						// Otherwise, look up names from database
-						for (const userId of participantIds) {
-							const memberResult = await context.db.query(
-								`SELECT display_name, username, global_name
-               FROM members
-               WHERE guild_id = $1 AND user_id = $2`,
-								[context.guildId, userId],
-							);
-
-							if (
-								memberResult.success &&
-								memberResult.data &&
-								memberResult.data.length > 0
-							) {
-								const member = memberResult.data[0];
-								participantNames.push(
-									member.display_name || member.global_name || member.username,
-								);
-							}
-						}
-					}
-
-					// Calculate duration
-					const durationMinutes = Math.round(
-						(new Date(convo.end_time).getTime() -
-							new Date(convo.start_time).getTime()) /
-							(1000 * 60),
-					);
-
-					// Extract interaction types from features
-					const interactionTypes = convo.features?.interaction_types || [];
-
-					return {
-						id: convo.id,
-						participants: participantNames,
-						participantCount: participantIds.length,
-						startTime: new Date(convo.start_time),
-						endTime: new Date(convo.end_time),
-						durationMinutes,
-						messageCount: convo.message_count,
-						summary: convo.summary || "No summary available",
-						interactionTypes,
-					};
-				}),
+			const names = await loadNames(
+				context,
+				segments.flatMap((s) => s.participants),
 			);
+			const enriched = segments.map((seg) => ({
+				id: seg.id,
+				participants: seg.participants.map((id) => names.get(id) ?? "Unknown"),
+				participantCount: seg.participants.length,
+				startTime: new Date(seg.start_time),
+				endTime: new Date(seg.end_time),
+				durationMinutes: Math.round(
+					(new Date(seg.end_time).getTime() -
+						new Date(seg.start_time).getTime()) /
+						60000,
+				),
+				messageCount: seg.message_count,
+				topic: seg.topic_label,
+				summary: seg.summary,
+				ongoing: seg.status === "active",
+			}));
 
-			// Format as natural text
 			const now = new Date();
 			const formatted = `Recent Conversations in Channel (past ${lookbackHours}h):
 
@@ -592,18 +456,19 @@ ${enriched
 		const hoursAgo = Math.round(
 			(now.getTime() - convo.endTime.getTime()) / (1000 * 60 * 60),
 		);
-		const timeAgo =
-			hoursAgo < 1
+		const timeAgo = convo.ongoing
+			? "Happening now"
+			: hoursAgo < 1
 				? "Less than 1 hour ago"
 				: hoursAgo === 1
 					? "1 hour ago"
 					: `${hoursAgo} hours ago`;
 
-		return `${i + 1}. ${timeAgo}
+		return `${i + 1}. ${timeAgo}${convo.topic ? ` - ${convo.topic}` : ""}
    Participants: ${convo.participants.join(", ")} (${convo.participantCount} users)
    Duration: ${convo.durationMinutes} minutes
    Messages: ${convo.messageCount}
-   ${convo.summary ? `Summary: ${convo.summary}` : ""}`;
+   ${convo.summary ? `Summary: ${convo.summary}` : "Summary: (not yet summarized)"}`;
 	})
 	.join("\n\n")}
 
@@ -657,27 +522,28 @@ export const getServerActivitySummary: DatabaseTool = {
 		try {
 			const lookbackHours = Math.min(params.lookbackHours || 24, 168);
 			const channelLimit = Math.min(params.channelLimit || 5, 10);
-			const lookbackTime = new Date(Date.now() - lookbackHours * 60 * 60 * 1000);
+			const lookbackTime = new Date(
+				Date.now() - lookbackHours * 60 * 60 * 1000,
+			);
 
-			// Get most active channels with conversation counts
 			const channelActivity = await context.db.query(
 				`SELECT
-          channel_id,
-          COUNT(*) as conversation_count,
-          SUM(message_count) as total_messages,
+          cs.channel_id,
+          COALESCE(c.name, 'unknown-channel') AS channel_name,
+          COUNT(*) AS conversation_count,
+          SUM(cs.message_count) AS total_messages,
           (
             SELECT COUNT(DISTINCT participant_id)
             FROM conversation_segments cs2, unnest(cs2.participants) participant_id
-            WHERE cs2.channel_id = conversation_segments.channel_id
+            WHERE cs2.channel_id = cs.channel_id
               AND cs2.guild_id = $1
               AND cs2.end_time >= $2
-              AND cs2.status = 'finalized'
-          ) as unique_participants
-        FROM conversation_segments
-        WHERE guild_id = $1
-          AND end_time >= $2
-          AND status = 'finalized'
-        GROUP BY channel_id
+          ) AS unique_participants
+        FROM conversation_segments cs
+        LEFT JOIN channels c ON c.id = cs.channel_id AND c.guild_id = cs.guild_id
+        WHERE cs.guild_id = $1
+          AND cs.end_time >= $2
+        GROUP BY cs.channel_id, c.name
         ORDER BY conversation_count DESC
         LIMIT $3`,
 				[context.guildId, lookbackTime, channelLimit],
@@ -696,29 +562,14 @@ export const getServerActivitySummary: DatabaseTool = {
 				};
 			}
 
-			// Get channel names
 			const enrichedChannels = await Promise.all(
 				channelActivity.data.map(async (ch: any) => {
-					const channelResult = await context.db.query(
-						`SELECT name, type FROM channels WHERE id = $1 AND guild_id = $2`,
-						[ch.channel_id, context.guildId],
-					);
-
-					const channelName =
-						channelResult.success &&
-						channelResult.data &&
-						channelResult.data.length > 0
-							? channelResult.data[0].name
-							: "unknown-channel";
-
-					// Get recent conversation topics for this channel
 					const recentTopics = await context.db.query(
-						`SELECT summary, message_count, participants
+						`SELECT topic_label, summary, message_count, participants
             FROM conversation_segments
             WHERE guild_id = $1
               AND channel_id = $2
               AND end_time >= $3
-              AND status = 'finalized'
             ORDER BY end_time DESC
             LIMIT 3`,
 						[context.guildId, ch.channel_id, lookbackTime],
@@ -727,6 +578,7 @@ export const getServerActivitySummary: DatabaseTool = {
 					const topics =
 						recentTopics.success && recentTopics.data
 							? recentTopics.data.map((t: any) => ({
+									topic: t.topic_label || null,
 									summary: t.summary || "Conversation",
 									messageCount: t.message_count,
 									participantCount: (t.participants || []).length,
@@ -735,29 +587,33 @@ export const getServerActivitySummary: DatabaseTool = {
 
 					return {
 						channelId: ch.channel_id,
-						channelName,
-						conversationCount: ch.conversation_count,
-						totalMessages: ch.total_messages,
-						uniqueParticipants: ch.unique_participants,
+						channelName: ch.channel_name as string,
+						conversationCount: Number(ch.conversation_count),
+						totalMessages: Number(ch.total_messages),
+						uniqueParticipants: Number(ch.unique_participants),
 						recentTopics: topics,
 					};
 				}),
 			);
 
-			// Format as natural text
 			const formatted = `Server Activity Summary (past ${lookbackHours}h):
 
 Most Active Channels:
 ${enrichedChannels
-	.map((ch: { channelName: string; conversationCount: number; totalMessages: number; uniqueParticipants: number; recentTopics: Array<{ summary: string; participantCount: number; messageCount: number }> }, i: number) => {
+	.map((ch, i) => {
 		const topicsText =
 			ch.recentTopics.length > 0
 				? ch.recentTopics
 						.map(
-							(t: any) =>
-								`${t.summary} (${t.participantCount} participants, ${t.messageCount} messages)`,
+							(t: {
+								topic: string | null;
+								summary: string;
+								participantCount: number;
+								messageCount: number;
+							}) =>
+								`${t.topic ? `${t.topic}: ` : ""}${t.summary} (${t.participantCount} participants, ${t.messageCount} messages)`,
 						)
-						.join(", ")
+						.join(" | ")
 				: "No recent topics";
 
 		return `${i + 1}. #${ch.channelName}
@@ -768,7 +624,7 @@ ${enrichedChannels
 	})
 	.join("\n\n")}
 
-Server-wide: ${enrichedChannels.reduce((sum: number, ch: { conversationCount: number }) => sum + ch.conversationCount, 0)} conversations, ${enrichedChannels.reduce((sum: number, ch: { totalMessages: number }) => sum + ch.totalMessages, 0)} messages`;
+Server-wide: ${enrichedChannels.reduce((sum, ch) => sum + ch.conversationCount, 0)} conversations, ${enrichedChannels.reduce((sum, ch) => sum + ch.totalMessages, 0)} messages`;
 
 			return {
 				success: true,

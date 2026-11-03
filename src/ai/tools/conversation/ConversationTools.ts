@@ -2,11 +2,92 @@ import {
   type DatabaseTool,
   type ToolContext,
   type DatabaseToolResult,
-  formatConversation,
+  resolveUserId,
 } from "../registry/DatabaseTools";
-import { ConversationDetector } from "../../../features/social-intelligence/conversation-detection/ConversationDetector";
 import { pgvector } from "../../../database/PostgreSQLManager.js";
 import { EmbeddingService } from "../../../features/social-intelligence/semantic-analysis/EmbeddingService.js";
+
+interface SegmentRow {
+  id: string;
+  channel_id: string;
+  channel_name: string | null;
+  start_time: Date;
+  end_time: Date;
+  message_count: number;
+  summary: string | null;
+  topic_label: string | null;
+  status: string;
+  participants: string[];
+}
+
+async function loadNames(context: ToolContext, ids: string[]): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  if (ids.length === 0) return names;
+  const result = await context.db.query(
+    `SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
+     FROM members
+     WHERE user_id = ANY($1::text[]) AND guild_id = $2`,
+    [[...new Set(ids)], context.guildId]
+  );
+  if (result.success && result.data) {
+    for (const member of result.data) names.set(member.user_id, member.name);
+  }
+  return names;
+}
+
+async function resolvePair(
+  user1: string,
+  user2: string,
+  context: ToolContext
+): Promise<{ a: string; b: string } | { error: string }> {
+  const first = await resolveUserId(user1, context.guildId, context.db);
+  if (!first.success || !first.userId) return { error: first.error ?? `User "${user1}" not found` };
+  const second = await resolveUserId(user2, context.guildId, context.db);
+  if (!second.success || !second.userId) {
+    return { error: second.error ?? `User "${user2}" not found` };
+  }
+  return { a: first.userId, b: second.userId };
+}
+
+async function queryPairSegments(
+  context: ToolContext,
+  a: string,
+  b: string,
+  limit: number
+): Promise<SegmentRow[]> {
+  const result = await context.db.query(
+    `SELECT cs.id, cs.channel_id, c.name AS channel_name, cs.start_time, cs.end_time,
+            cs.message_count, cs.summary, cs.topic_label, cs.status, cs.participants
+     FROM conversation_segments cs
+     LEFT JOIN channels c ON c.id = cs.channel_id AND c.guild_id = cs.guild_id
+     WHERE cs.guild_id = $1 AND cs.participants @> ARRAY[$2, $3]::text[]
+     ORDER BY cs.end_time DESC
+     LIMIT $4`,
+    [context.guildId, a, b, limit]
+  );
+  if (!result.success || !result.data) {
+    throw new Error(`Failed to get conversations: ${result.error}`);
+  }
+  return result.data;
+}
+
+function formatSegment(seg: SegmentRow, names: Map<string, string>): string {
+  const who = seg.participants.map((id) => names.get(id) ?? id).join(", ");
+  const minutes = Math.round(
+    (new Date(seg.end_time).getTime() - new Date(seg.start_time).getTime()) / 60000
+  );
+  const lines = [
+    `${seg.id}: #${seg.channel_name ?? seg.channel_id}, ${new Date(
+      seg.start_time
+    ).toLocaleString()} (${seg.message_count} messages, ${minutes} min${
+      seg.status === "active" ? ", still going" : ""
+    })`,
+    `  Participants: ${who}`,
+  ];
+  if (seg.topic_label) lines.push(`  Topic: ${seg.topic_label}`);
+  if (seg.summary) lines.push(`  Summary: ${seg.summary}`);
+  return lines.join("\n");
+}
 
 /**
  * Get conversations between two users
@@ -14,17 +95,17 @@ import { EmbeddingService } from "../../../features/social-intelligence/semantic
 export const getConversationsBetweenTool: DatabaseTool = {
   name: "getConversationsBetween",
   description:
-    "Get conversation entries between two users including metadata like duration, message count, and interaction types. Use this to understand how users interact.",
+    "Get the stored conversations two users both took part in, newest first, with topic, summary, channel, date and message count. Accepts names or IDs. Use this to understand how users interact.",
   parameters: {
     type: "object",
     properties: {
       user1Id: {
         type: "string",
-        description: "First user's Discord ID",
+        description: "First user's name or Discord ID",
       },
       user2Id: {
         type: "string",
-        description: "Second user's Discord ID",
+        description: "Second user's name or Discord ID",
       },
       limit: {
         type: "number",
@@ -37,54 +118,41 @@ export const getConversationsBetweenTool: DatabaseTool = {
     params: Record<string, any>,
     context: ToolContext
   ): Promise<string | DatabaseToolResult> => {
-    const { user1Id, user2Id, limit } = params as { user1Id: string; user2Id: string; limit?: number };
+    const { user1Id, user2Id, limit } = params as {
+      user1Id: string;
+      user2Id: string;
+      limit?: number;
+    };
     try {
-      const conversationManager = new ConversationDetector(context.db);
-      const result = await conversationManager.detectConversations(
-        user1Id,
-        user2Id,
-        context.guildId,
-        5
+      const pair = await resolvePair(user1Id, user2Id, context);
+      if ("error" in pair) return { success: false, error: pair.error };
+
+      const conversations = await queryPairSegments(context, pair.a, pair.b, limit || 10);
+      const names = await loadNames(
+        context,
+        conversations.flatMap((c) => c.participants)
       );
-
-      if (!result.success || !result.data) {
-        return {
-          success: false,
-          error: `Failed to get conversations: ${result.error}`,
-        };
-      }
-
-      let conversations = result.data;
-      if (limit) {
-        conversations = conversations.slice(0, limit);
-      }
-
-      // Sort by most recent
-      conversations = conversations.sort(
-        (a, b) =>
-          new Date(b.end_time).getTime() - new Date(a.end_time).getTime()
-      );
-
-      const formatted = conversations.map(formatConversation).join("\n\n");
-
-      const totalMessages = conversations.reduce(
-        (sum, conv) => sum + conv.message_count,
-        0
-      );
-      const totalDuration = conversations.reduce(
-        (sum, conv) => sum + (conv.duration_minutes || 0),
-        0
-      );
+      const formatted = conversations.map((c) => formatSegment(c, names)).join("\n\n");
+      const totalMessages = conversations.reduce((sum, c) => sum + c.message_count, 0);
 
       return {
         success: true,
         summary: `Found ${conversations.length} conversation(s) with ${totalMessages} total messages`,
         data: {
-          formatted,
-          conversations,
+          formatted: formatted || "No conversations found between these users",
+          conversations: conversations.map((c) => ({
+            conversation_id: c.id,
+            channel: c.channel_name,
+            start_time: c.start_time,
+            end_time: c.end_time,
+            message_count: c.message_count,
+            topic_label: c.topic_label,
+            summary: c.summary,
+            status: c.status,
+            participants: c.participants.map((id) => names.get(id) ?? id),
+          })),
           count: conversations.length,
           totalMessages,
-          totalDuration,
         },
       };
     } catch (error) {
@@ -101,74 +169,104 @@ export const getConversationsBetweenTool: DatabaseTool = {
 };
 
 /**
- * Get details for a specific conversation
+ * Get details and messages for a specific stored conversation
  */
 export const getConversationDetailsTool: DatabaseTool = {
   name: "getConversationDetails",
   description:
-    "Get detailed information about a specific conversation by conversation ID. Use this when you have a conversation ID and need full details.",
+    "Get a stored conversation by its ID: topic, summary, participants and the actual messages (with author names). Use this when you have a conversation ID and need to see what was said.",
   parameters: {
     type: "object",
     properties: {
       conversationId: {
         type: "string",
-        description: "Conversation ID to get details for",
+        description: "Conversation ID",
       },
-      user1Id: {
-        type: "string",
-        description: "First user's Discord ID (to locate conversation)",
-      },
-      user2Id: {
-        type: "string",
-        description: "Second user's Discord ID (to locate conversation)",
+      limit: {
+        type: "number",
+        description: "Maximum number of messages to return (default: 50)",
       },
     },
-    required: ["conversationId", "user1Id", "user2Id"],
+    required: ["conversationId"],
   },
   execute: async (
     params: Record<string, any>,
     context: ToolContext
   ): Promise<string | DatabaseToolResult> => {
-    const { conversationId, user1Id, user2Id } = params as {
-      conversationId: string;
-      user1Id: string;
-      user2Id: string;
-    };
+    const { conversationId, limit } = params as { conversationId: string; limit?: number };
     try {
-      const conversationManager = new ConversationDetector(context.db);
-      const result = await conversationManager.detectConversations(
-        user1Id,
-        user2Id,
-        context.guildId,
-        5
+      const segResult = await context.db.query(
+        `SELECT cs.id, cs.channel_id, c.name AS channel_name, cs.start_time, cs.end_time,
+                cs.message_count, cs.summary, cs.topic_label, cs.status, cs.participants,
+                cs.message_ids
+         FROM conversation_segments cs
+         LEFT JOIN channels c ON c.id = cs.channel_id AND c.guild_id = cs.guild_id
+         WHERE cs.guild_id = $1 AND cs.id = $2`,
+        [context.guildId, conversationId]
       );
-
-      if (!result.success || !result.data) {
-        return {
-          success: false,
-          error: `Failed to get conversations: ${result.error}`,
-        };
+      const seg: (SegmentRow & { message_ids: string[] | null }) | undefined =
+        segResult.success && segResult.data ? segResult.data[0] : undefined;
+      if (!seg) {
+        return { success: false, error: `Conversation ${conversationId} not found` };
       }
 
-      const conversation = result.data.find(
-        (conv) => conv.conversation_id === conversationId
-      );
-
-      if (!conversation) {
-        return {
-          success: false,
-          error: `Conversation ${conversationId} not found`,
-        };
+      const messageIds = (seg.message_ids ?? []).slice(0, limit || 50);
+      const messages: Array<{
+        id: string;
+        author_id: string;
+        content: string | null;
+        created_at: Date;
+      }> = [];
+      if (messageIds.length > 0) {
+        const msgResult = await context.db.query(
+          `SELECT id, author_id, content, created_at
+           FROM messages
+           WHERE id = ANY($1::text[]) AND guild_id = $2 AND active = true
+           ORDER BY created_at ASC`,
+          [messageIds, context.guildId]
+        );
+        if (!msgResult.success || !msgResult.data) {
+          return { success: false, error: "Failed to get messages" };
+        }
+        messages.push(...msgResult.data);
       }
 
-      const formatted = formatConversation(conversation);
+      const names = await loadNames(context, [
+        ...seg.participants,
+        ...messages.map((m) => m.author_id),
+      ]);
+      const transcript = messages
+        .map((m) => {
+          const time = new Date(m.created_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+          return `[${time}] ${names.get(m.author_id) ?? m.author_id}: ${m.content || "(no content)"}`;
+        })
+        .join("\n");
+      const formatted = `${formatSegment(seg, names)}\n\nMessages:\n${transcript || "(none)"}`;
 
       return {
         success: true,
-        summary: `Conversation: ${conversation.message_count} messages over ${conversation.duration_minutes} minutes`,
+        summary: `Conversation: ${seg.message_count} messages, ${messages.length} returned`,
         data: {
           formatted,
-          conversation,
+          conversation: {
+            conversation_id: seg.id,
+            channel: seg.channel_name,
+            start_time: seg.start_time,
+            end_time: seg.end_time,
+            message_count: seg.message_count,
+            topic_label: seg.topic_label,
+            summary: seg.summary,
+            status: seg.status,
+            participants: seg.participants.map((id) => names.get(id) ?? id),
+          },
+          messages: messages.map((m) => ({
+            author: names.get(m.author_id) ?? m.author_id,
+            content: m.content,
+            created_at: m.created_at,
+          })),
         },
       };
     } catch (error) {
@@ -302,166 +400,22 @@ export const getRecentConversationsTool: DatabaseTool = {
 };
 
 /**
- * Get actual message content for a conversation
- */
-export const getConversationMessagesTool: DatabaseTool = {
-  name: "getConversationMessages",
-  description:
-    "Get the actual message content from a conversation. Use this when you need to see what was said in a conversation.",
-  parameters: {
-    type: "object",
-    properties: {
-      conversationId: {
-        type: "string",
-        description: "Conversation ID to get messages for",
-      },
-      user1Id: {
-        type: "string",
-        description: "First user's Discord ID",
-      },
-      user2Id: {
-        type: "string",
-        description: "Second user's Discord ID",
-      },
-      limit: {
-        type: "number",
-        description: "Maximum number of messages to return (default: 50)",
-      },
-    },
-    required: ["conversationId", "user1Id", "user2Id"],
-  },
-  execute: async (
-    params: Record<string, any>,
-    context: ToolContext
-  ): Promise<string | DatabaseToolResult> => {
-    const { conversationId, user1Id, user2Id, limit } = params as {
-      conversationId: string;
-      user1Id: string;
-      user2Id: string;
-      limit?: number;
-    };
-    try {
-      // First get the conversation to find message IDs
-      const conversationManager = new ConversationDetector(context.db);
-      const convResult = await conversationManager.detectConversations(
-        user1Id,
-        user2Id,
-        context.guildId,
-        5
-      );
-
-      if (!convResult.success || !convResult.data) {
-        return {
-          success: false,
-          error: `Failed to get conversation: ${convResult.error}`,
-        };
-      }
-
-      const conversation = convResult.data.find(
-        (conv) => conv.conversation_id === conversationId
-      );
-
-      if (!conversation) {
-        return {
-          success: false,
-          error: `Conversation ${conversationId} not found`,
-        };
-      }
-
-      // Get messages by IDs
-      const messageIds = conversation.message_ids?.slice(0, limit || 50) || [];
-
-      if (messageIds.length === 0) {
-        return {
-          success: true,
-          summary: "No messages in this conversation",
-          data: {
-            formatted: "No messages found",
-            messages: [],
-          },
-        };
-      }
-
-      const messagesResult = await context.db.query(
-        `SELECT id, author_id, content, created_at, edited_at
-         FROM messages 
-         WHERE id = ANY($1::text[]) AND guild_id = $2 AND active = true
-         ORDER BY created_at ASC`,
-        [messageIds, context.guildId]
-      );
-
-      if (!messagesResult.success || !messagesResult.data) {
-        return {
-          success: false,
-          error: "Failed to get messages",
-        };
-      }
-
-      // Get user display names
-      const userIds = [...new Set([user1Id, user2Id])];
-      const namesResult = await context.db.query(
-        `SELECT user_id, display_name, username 
-         FROM members 
-         WHERE user_id = ANY($1::text[]) AND guild_id = $2 AND active = true`,
-        [userIds, context.guildId]
-      );
-
-      const nameMap = new Map();
-      if (namesResult.success && namesResult.data) {
-        for (const member of namesResult.data) {
-          nameMap.set(member.user_id, member.display_name || member.username);
-        }
-      }
-
-      const formatted = messagesResult.data
-        .map((msg: any) => {
-          const authorName = nameMap.get(msg.author_id) || msg.author_id;
-          const timestamp = new Date(msg.created_at).toLocaleTimeString();
-          return `[${timestamp}] ${authorName}: ${
-            msg.content || "(no content)"
-          }`;
-        })
-        .join("\n");
-
-      return {
-        success: true,
-        summary: `Retrieved ${messagesResult.data.length} message(s) from conversation`,
-        data: {
-          formatted,
-          messages: messagesResult.data,
-          count: messagesResult.data.length,
-        },
-      };
-    } catch (error) {
-      console.error("🔸 Error in getConversationMessages:", error);
-      return {
-        success: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to get conversation messages",
-      };
-    }
-  },
-};
-
-/**
  * Analyze conversation patterns between users
  */
 export const analyzeConversationPatternsTool: DatabaseTool = {
   name: "analyzeConversationPatterns",
   description:
-    "Analyze conversation patterns including frequency, duration, time of day, and interaction types. Use this for detailed insights about how two users interact.",
+    "Simple stats over the stored conversations two users took part in together: how many, how long they usually run, per-month counts, busiest hours, channels and recurring topics. Accepts names or IDs.",
   parameters: {
     type: "object",
     properties: {
       user1Id: {
         type: "string",
-        description: "First user's Discord ID",
+        description: "First user's name or Discord ID",
       },
       user2Id: {
         type: "string",
-        description: "Second user's Discord ID",
+        description: "Second user's name or Discord ID",
       },
     },
     required: ["user1Id", "user2Id"],
@@ -472,117 +426,82 @@ export const analyzeConversationPatternsTool: DatabaseTool = {
   ): Promise<string | DatabaseToolResult> => {
     const { user1Id, user2Id } = params as { user1Id: string; user2Id: string };
     try {
-      const conversationManager = new ConversationDetector(context.db);
-      const result = await conversationManager.detectConversations(
-        user1Id,
-        user2Id,
-        context.guildId,
-        5
-      );
+      const pair = await resolvePair(user1Id, user2Id, context);
+      if ("error" in pair) return { success: false, error: pair.error };
 
-      if (!result.success || !result.data) {
-        return {
-          success: false,
-          error: `Failed to get conversations: ${result.error}`,
-        };
-      }
+      const rows = await queryPairSegments(context, pair.a, pair.b, 2000);
+      const names = await loadNames(context, [pair.a, pair.b]);
+      const label = `${names.get(pair.a) ?? pair.a} & ${names.get(pair.b) ?? pair.b}`;
 
-      const conversations = result.data;
-
-      if (conversations.length === 0) {
+      if (rows.length === 0) {
         return {
           success: true,
-          summary: "No conversations found to analyze",
-          data: {
-            formatted: "No conversation patterns detected",
-            patterns: {},
-          },
+          summary: `No conversations found between ${label}`,
+          data: { formatted: `No conversations found between ${label}`, patterns: {} },
         };
       }
 
-      // Calculate patterns
-      const totalConversations = conversations.length;
-      const totalMessages = conversations.reduce(
-        (sum, conv) => sum + conv.message_count,
-        0
+      const median = (values: number[]): number => {
+        const sorted = [...values].sort((x, y) => x - y);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+      };
+      const tally = (keys: string[]): Array<[string, number]> => {
+        const counts = new Map<string, number>();
+        for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+        return [...counts.entries()].sort((x, y) => y[1] - x[1]);
+      };
+
+      const totalMessages = rows.reduce((sum, r) => sum + r.message_count, 0);
+      const durations = rows.map(
+        (r) => (new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000
       );
-      const avgDuration =
-        conversations.reduce((sum, conv) => sum + (conv.duration_minutes || 0), 0) /
-        totalConversations;
-      const totalDuration = conversations.reduce(
-        (sum, conv) => sum + (conv.duration_minutes || 0),
-        0
-      );
+      const typicalMessages = median(rows.map((r) => r.message_count));
+      const typicalMinutes = median(durations);
 
-      // Time of day analysis
-      const hourCounts = new Map<number, number>();
-      conversations.forEach((conv) => {
-        const hour = new Date(conv.start_time).getHours();
-        hourCounts.set(hour, (hourCounts.get(hour) || 0) + 1);
-      });
-      const peakHour = Array.from(hourCounts.entries()).sort(
-        (a, b) => b[1] - a[1]
-      )[0]?.[0];
+      const perMonth = tally(
+        rows.map((r) => {
+          const d = new Date(r.start_time);
+          return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+        })
+      ).sort((x, y) => x[0].localeCompare(y[0]));
+      const topHours = tally(rows.map((r) => String(new Date(r.start_time).getHours()))).slice(0, 3);
+      const topChannels = tally(rows.map((r) => r.channel_name ?? "unknown")).slice(0, 3);
+      const topTopics = tally(
+        rows.map((r) => r.topic_label?.trim().toLowerCase() ?? "").filter((t) => t.length > 0)
+      ).slice(0, 5);
 
-      // Interaction types
-      const interactionTypes = new Set<string>();
-      conversations.forEach((conv) => {
-        if (conv.interaction_types) {
-          conv.interaction_types.forEach((type) => interactionTypes.add(type));
-        }
-      });
+      const first = rows[rows.length - 1]!;
+      const last = rows[0]!;
+      const dateRange = `${new Date(first.start_time).toLocaleDateString()} to ${new Date(
+        last.end_time
+      ).toLocaleDateString()}`;
 
-      // Date range
-      const sortedByTime = [...conversations].sort(
-        (a, b) =>
-          new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
-      );
-      const firstConversation = sortedByTime[0];
-      const lastConversation = sortedByTime[sortedByTime.length - 1];
-      const dateRange = firstConversation && lastConversation
-        ? new Date(firstConversation.start_time).toLocaleDateString() +
-          " to " +
-          new Date(lastConversation.end_time).toLocaleDateString()
-        : "Unknown";
-
-      const parts: string[] = [];
-      parts.push(`Conversation Pattern Analysis:`);
-      parts.push(`  - Total Conversations: ${totalConversations}`);
-      parts.push(`  - Total Messages: ${totalMessages}`);
-      parts.push(`  - Average Duration: ${avgDuration.toFixed(1)} minutes`);
+      const parts: string[] = [`Conversation patterns for ${label}:`];
+      parts.push(`  - Conversations: ${rows.length} (${dateRange})`);
+      parts.push(`  - Total messages: ${totalMessages}`);
       parts.push(
-        `  - Total Conversation Time: ${totalDuration.toFixed(1)} minutes`
+        `  - Typical conversation: ${typicalMessages} messages over ${typicalMinutes.toFixed(0)} minutes`
       );
-      parts.push(`  - Date Range: ${dateRange}`);
-
-      if (peakHour !== undefined) {
-        parts.push(`  - Most Active Hour: ${peakHour}:00`);
+      parts.push(`  - Per month: ${perMonth.map(([m, n]) => `${m}: ${n}`).join(", ")}`);
+      parts.push(`  - Busiest hours: ${topHours.map(([h, n]) => `${h}:00 (${n})`).join(", ")}`);
+      parts.push(`  - Channels: ${topChannels.map(([c, n]) => `#${c} (${n})`).join(", ")}`);
+      if (topTopics.length > 0) {
+        parts.push(`  - Recurring topics: ${topTopics.map(([t, n]) => `${t} (${n})`).join(", ")}`);
       }
-
-      if (interactionTypes.size > 0) {
-        parts.push(
-          `  - Interaction Types: ${Array.from(interactionTypes).join(", ")}`
-        );
-      }
-
-      const hasNameUsage = conversations.some((conv) => conv.has_name_usage);
-      parts.push(`  - Direct Name Usage: ${hasNameUsage ? "Yes" : "No"}`);
 
       return {
         success: true,
-        summary: `${totalConversations} conversations, ${totalMessages} messages, avg ${avgDuration.toFixed(
-          1
-        )} min`,
+        summary: `${rows.length} conversations, ${totalMessages} messages, typically ${typicalMessages} messages`,
         data: {
           formatted: parts.join("\n"),
           patterns: {
-            totalConversations,
+            totalConversations: rows.length,
             totalMessages,
-            avgDuration,
-            totalDuration,
-            peakHour,
-            interactionTypes: Array.from(interactionTypes),
-            hasNameUsage,
+            typicalMessages,
+            typicalMinutes,
+            perMonth: Object.fromEntries(perMonth),
+            hours: Object.fromEntries(topHours),
             dateRange,
           },
         },
@@ -726,7 +645,7 @@ export const searchConversationsSemanticTool: DatabaseTool = {
           cs.end_time,
           cs.message_count,
           cs.summary,
-          cs.features,
+          cs.topic_label,
           c.name as channel_name,
           ${queryEmbedding ? `(cs.embedding <=> $${paramIndex - 1}::vector) as similarity_score` : "0 as similarity_score"}
         FROM conversation_segments cs
@@ -789,7 +708,7 @@ export const searchConversationsSemanticTool: DatabaseTool = {
 
           return `${idx + 1}. [#${conv.channel_name || "unknown"}] ${date} ${time} ${simScore}
    Participants: ${participantNames}
-   Summary: ${summary}
+   ${conv.topic_label ? `Topic: ${conv.topic_label}\n   ` : ""}Summary: ${summary}
    ${conv.message_count} messages`;
         })
         .join("\n\n");
@@ -887,7 +806,7 @@ export const getRecentConversationMessagesTool: DatabaseTool = {
           start_time,
           end_time,
           message_count,
-          features,
+          topic_label,
           summary,
           message_ids,
           status
@@ -1069,7 +988,6 @@ export const conversationTools: DatabaseTool[] = [
   getConversationsBetweenTool,
   getConversationDetailsTool,
   getRecentConversationsTool,
-  getConversationMessagesTool,
   analyzeConversationPatternsTool,
   searchConversationsSemanticTool,
   getRecentConversationMessagesTool,

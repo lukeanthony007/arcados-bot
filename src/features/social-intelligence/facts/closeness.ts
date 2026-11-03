@@ -7,6 +7,7 @@
  *   reply         a replied to b's message                          3 points, a → b
  *   mention       a mentioned b directly (message pings ≤ 3 people) 2 points, a → b
  *   conversation  a and b took part in the same conversation         1 point, both directions
+ *   reaction      a reacted to b's message (recorded live from now on) 1 point, a → b
  *
  * Each interaction's weight decays with a 180-day half-life, so "closeness" means current
  * closeness; raw counts are reported alongside it. For a pair:
@@ -15,15 +16,14 @@
  *   reciprocity = min(a→b, b→a) / max(a→b, b→a)   (1 = balanced, 0 = one-sided)
  *   share       = strength / Σ strength over all of a's pairs   ("x% of a's interactions")
  *
- * Group pings (> 3 mentions) and bots are excluded. Reactions are not counted: they were
- * never recorded as events in this database.
+ * Group pings (> 3 mentions) and bots are excluded.
  */
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 
 export const HALF_LIFE_DAYS = 180;
 const MAX_MENTIONS_PER_MESSAGE = 3;
-const WEIGHTS = { reply: 3, mention: 2, conversation: 1 } as const;
+const WEIGHTS = { reply: 3, mention: 2, reaction: 1, conversation: 1 } as const;
 
 export interface Connection {
 	user_id: string;
@@ -107,12 +107,17 @@ function eventsCte(subjectFilter: boolean): string {
 				CROSS JOIN LATERAL unnest(cs.participants) AS p1(id)
 				CROSS JOIN LATERAL unnest(cs.participants) AS p2(id)
 				WHERE cs.guild_id = $1 AND p1.id <> p2.id
+				UNION ALL
+				SELECT r.user_id, r.author_id, 'reaction', r.created_at
+				FROM message_reactions r
+				JOIN members rm ON rm.guild_id = r.guild_id AND rm.user_id = r.user_id AND rm.bot = false
+				WHERE r.guild_id = $1 AND r.user_id <> r.author_id
 			) e
 			WHERE true ${involves}
 		),
 		weighted AS (
 			SELECT a, b, kind, ts,
-				CASE kind WHEN 'reply' THEN ${WEIGHTS.reply} WHEN 'mention' THEN ${WEIGHTS.mention} ELSE ${WEIGHTS.conversation} END
+				CASE kind WHEN 'reply' THEN ${WEIGHTS.reply} WHEN 'mention' THEN ${WEIGHTS.mention} WHEN 'reaction' THEN ${WEIGHTS.reaction} ELSE ${WEIGHTS.conversation} END
 					* exp(-ln(2) * EXTRACT(EPOCH FROM (NOW() - ts)) / (${HALF_LIFE_DAYS} * 86400)) AS w
 			FROM events
 		)`;

@@ -199,12 +199,12 @@ export const getActiveMembersTool: DatabaseTool = {
 };
 
 /**
- * Get trending topics/keywords
+ * Get trending topics from conversation topic labels
  */
 export const getTrendingTopicsTool: DatabaseTool = {
   name: "getTrendingTopics",
   description:
-    "Analyze trending keywords and topics from recent conversations. Returns conversation summaries and top keywords aggregated from the specified time window. Use this when users ask 'what have people been talking about', 'what's trending', 'recent topics', or similar broad questions about server activity.",
+    "Analyze trending topics from recent conversations. Returns the most common conversation topic labels plus recent conversation summaries from the specified time window. Use this when users ask 'what have people been talking about', 'what's trending', 'recent topics', or similar broad questions about server activity.",
   parameters: {
     type: "object",
     properties: {
@@ -229,7 +229,7 @@ export const getTrendingTopicsTool: DatabaseTool = {
       const since = new Date();
       since.setDate(since.getDate() - timeWindowDays);
 
-      // Get recent conversations with summaries and keywords
+      // Get recent summarized conversations (topic_label + summary)
       const conversationsResult = await context.db.query(
         `SELECT
           id,
@@ -238,12 +238,12 @@ export const getTrendingTopicsTool: DatabaseTool = {
           end_time,
           message_count,
           summary,
-          features,
+          topic_label,
           participants
         FROM conversation_segments
         WHERE guild_id = $1
-          AND status = 'finalized'
           AND start_time >= $2
+          AND (topic_label IS NOT NULL OR summary IS NOT NULL)
         ORDER BY start_time DESC`,
         [context.guildId, since]
       );
@@ -269,54 +269,34 @@ export const getTrendingTopicsTool: DatabaseTool = {
         };
       }
 
-      // Extract and aggregate keywords from conversations
-      interface KeywordScore {
-        word: string;
-        totalScore: number;
-        frequency: number;
+      // Count topic labels across the summarized conversations
+      interface TopicCount {
+        topic: string;
         conversationCount: number;
+        messageCount: number;
       }
 
-      const keywordMap = new Map<string, KeywordScore>();
-
+      const topicMap = new Map<string, TopicCount>();
       for (const conv of conversations) {
-        if (conv.features?.keywords) {
-          let keywords: any[] = [];
-
-          // Handle both array and object formats for keywords
-          if (Array.isArray(conv.features.keywords)) {
-            keywords = conv.features.keywords;
-          } else if (conv.features.keywords.terms) {
-            keywords = conv.features.keywords.terms;
-          }
-
-          for (const kw of keywords) {
-            const word = kw.word;
-            const existing = keywordMap.get(word);
-
-            if (existing) {
-              existing.totalScore += kw.score || 1;
-              existing.frequency += kw.frequency || 1;
-              existing.conversationCount += 1;
-            } else {
-              keywordMap.set(word, {
-                word,
-                totalScore: kw.score || 1,
-                frequency: kw.frequency || 1,
-                conversationCount: 1,
-              });
-            }
-          }
+        const topic = typeof conv.topic_label === "string" ? conv.topic_label.trim().toLowerCase() : "";
+        if (!topic) continue;
+        const existing = topicMap.get(topic);
+        if (existing) {
+          existing.conversationCount += 1;
+          existing.messageCount += conv.message_count;
+        } else {
+          topicMap.set(topic, {
+            topic,
+            conversationCount: 1,
+            messageCount: conv.message_count,
+          });
         }
       }
 
-      // Sort keywords by total score and conversation count
-      const topKeywords = Array.from(keywordMap.values())
-        .sort((a, b) => {
-          // Prioritize keywords appearing in multiple conversations
-          const scoreDiff = (b.totalScore * b.conversationCount) - (a.totalScore * a.conversationCount);
-          return scoreDiff;
-        })
+      const topTopics = Array.from(topicMap.values())
+        .sort(
+          (a, b) => b.conversationCount - a.conversationCount || b.messageCount - a.messageCount
+        )
         .slice(0, limit);
 
       // Get channel names
@@ -337,10 +317,12 @@ export const getTrendingTopicsTool: DatabaseTool = {
       const parts: string[] = [];
       parts.push(`**Recent Topics (last ${timeWindowDays} days)**\n`);
 
-      if (topKeywords.length > 0) {
-        parts.push(`**Top Keywords:**`);
-        topKeywords.slice(0, Math.min(8, limit)).forEach((kw, idx) => {
-          parts.push(`${idx + 1}. *${kw.word}* - appeared in ${kw.conversationCount} conversation(s)`);
+      if (topTopics.length > 0) {
+        parts.push(`**Top Topics:**`);
+        topTopics.slice(0, Math.min(8, limit)).forEach((t, idx) => {
+          parts.push(
+            `${idx + 1}. *${t.topic}* - ${t.conversationCount} conversation(s), ${t.messageCount} messages`
+          );
         });
         parts.push("");
       }
@@ -351,15 +333,17 @@ export const getTrendingTopicsTool: DatabaseTool = {
         const channelName = channelMap.get(conv.channel_id) || "unknown";
         const date = new Date(conv.start_time).toLocaleDateString();
         const summary = conv.summary || "(no summary)";
-        parts.push(`${idx + 1}. [#${channelName}] ${date}: ${summary}`);
+        parts.push(
+          `${idx + 1}. [#${channelName}] ${date}${conv.topic_label ? ` (${conv.topic_label})` : ""}: ${summary}`
+        );
       });
 
       return {
         success: true,
-        summary: `Found ${topKeywords.length} trending topics from ${conversations.length} conversations`,
+        summary: `Found ${topTopics.length} trending topics from ${conversations.length} conversations`,
         data: {
           formatted: parts.join("\n"),
-          keywords: topKeywords,
+          topics: topTopics,
           conversations: conversations.slice(0, 5),
           totalConversations: conversations.length,
           timeWindow: timeWindowDays,

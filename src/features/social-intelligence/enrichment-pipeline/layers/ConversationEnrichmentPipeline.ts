@@ -1,31 +1,60 @@
 /**
- * ConversationEnrichmentPipeline (Layer 1)
+ * ConversationEnrichmentPipeline (Layer 3 enrichment)
  *
- * Enriches conversation segments with:
- * - AI-generated summaries
- * - Semantic embeddings
- * - Topic keywords
- * - Media detection
+ * Enriches a conversation segment with:
+ * - an AI-written summary and a short topic label (one structured call)
+ * - a semantic embedding of the summary
  *
- * Extracted from EnhancementOrchestrator with budget checking and enrichment tracking.
+ * Budget checking, skipped semantics and retries live here; the segment itself is
+ * produced by the deterministic segmenter.
  */
 
 import { pgvector, type PostgreSQLManager } from "../../../../database/PostgreSQLManager.js";
-import { OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
+import { type JsonObjectSchema, OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
+import { SLUR_PATTERN } from "../../../user-personas/personaPrompt";
 import { ENRICHMENT_SYSTEM_PROMPT } from "../enrichmentPrompt";
 import { EmbeddingService } from "../../semantic-analysis/EmbeddingService.js";
 import { EnrichmentRateLimiter } from "../EnrichmentRateLimiter";
 
-const SUMMARY_STOP_WORDS = new Set([
-	"the", "and", "but", "that", "with", "for", "you", "your", "are", "was", "were",
-	"this", "have", "has", "had", "about", "from", "they", "their", "them", "what",
-	"when", "where", "how", "why", "there", "then", "just", "like", "that's", "thats",
-	"aint", "dont", "didnt", "doesnt", "cant", "im", "ive", "ill", "its", "lol",
-]);
+const SLUR_MASK = new RegExp(SLUR_PATTERN.source, "gi");
+
+const SUMMARY_SCHEMA: JsonObjectSchema = {
+	type: "object",
+	properties: {
+		summary: {
+			type: "string",
+			description: "1-2 concise sentences stating the key topics/actions directly",
+		},
+		topic_label: {
+			type: "string",
+			description:
+				"2-5 words naming the subject, e.g. 'A Plague Tale' or \"JOHNNY's work suspension\"",
+		},
+	},
+	required: ["summary", "topic_label"],
+};
+
+interface WrittenSummary {
+	summary: string;
+	topic_label: string;
+}
+
+interface GeneratedSummary {
+	summary: string;
+	topicLabel: string;
+}
+
+interface PreviewMessage {
+	author_id: string;
+	content: string | null;
+	attachments: string[] | null;
+	embeds: string[] | null;
+}
 
 export interface EnrichmentResult {
 	success: boolean;
 	summary?: string;
+	topicLabel?: string;
 	embedding?: number[];
 	significance: number;
 	confidence: number;
@@ -121,7 +150,6 @@ export class ConversationEnrichmentPipeline {
 			const significance = this.calculateSignificance(
 				participantCount,
 				messages.length,
-				undefined, // TODO: Extract keywords from segment.features
 			);
 
 			// Estimate cost and check budget
@@ -141,22 +169,17 @@ export class ConversationEnrichmentPipeline {
 				};
 			}
 
-			// Extract topic hints
-			const topicHintText = this.extractTopicHints(messages);
+			// Sample messages for preview, attributed by author name
+			const names = await this.loadNames(guildId, messages, segment.participants);
+			const messagePreview = this.buildMessagePreview(this.sampleMessages(messages), names);
 
-			// Sample messages for preview
-			const sampledMessages = this.sampleMessages(messages);
-			const messagePreview = this.buildMessagePreview(sampledMessages);
-
-			// Generate summary using AI
-			const summary = await this.generateSummary(
+			const generated = await this.generateSummary(
 				messages.length,
 				participantCount,
 				messagePreview,
-				topicHintText,
 			);
 
-			if (!summary) {
+			if (!generated) {
 				return {
 					success: false,
 					significance,
@@ -164,6 +187,7 @@ export class ConversationEnrichmentPipeline {
 					error: "Failed to generate summary",
 				};
 			}
+			const { summary, topicLabel } = generated;
 
 			// Generate embedding
 			let embedding: number[] | null = null;
@@ -184,39 +208,29 @@ export class ConversationEnrichmentPipeline {
 			// Update database with enrichment metadata
 			const enrichmentVersion = (segment.enrichment_version || 0) + 1;
 
-			let updateResult;
-			if (embedding) {
-				updateResult = await this.db.query(
-					`
-					UPDATE conversation_segments
-					SET summary = $2,
-						embedding = $3::vector,
-						enrichment_version = $4,
-						last_enriched_at = NOW(),
-						enrichment_confidence = $5,
-						ai_processing_status = 'completed',
-						ai_processed_at = NOW()
-					WHERE id = $1
-					RETURNING id
-					`,
-					[conversationId, summary, pgvector.toSql(embedding), enrichmentVersion, confidence],
-				);
-			} else {
-				updateResult = await this.db.query(
-					`
-					UPDATE conversation_segments
-					SET summary = $2,
-						enrichment_version = $3,
-						last_enriched_at = NOW(),
-						enrichment_confidence = $4,
-						ai_processing_status = 'completed',
-						ai_processed_at = NOW()
-					WHERE id = $1
-					RETURNING id
-					`,
-					[conversationId, summary, enrichmentVersion, confidence],
-				);
-			}
+			const updateResult = await this.db.query(
+				`
+				UPDATE conversation_segments
+				SET summary = $2,
+					topic_label = $3,
+					embedding = COALESCE($4::vector, embedding),
+					enrichment_version = $5,
+					last_enriched_at = NOW(),
+					enrichment_confidence = $6,
+					ai_processing_status = 'completed',
+					ai_processed_at = NOW()
+				WHERE id = $1
+				RETURNING id
+				`,
+				[
+					conversationId,
+					summary,
+					topicLabel,
+					embedding ? pgvector.toSql(embedding) : null,
+					enrichmentVersion,
+					confidence,
+				],
+			);
 
 			if (!updateResult.success) {
 				throw new Error(`failed to save conversation: ${updateResult.error}`);
@@ -238,6 +252,7 @@ export class ConversationEnrichmentPipeline {
 			return {
 				success: true,
 				summary,
+				topicLabel,
 				embedding: embedding || undefined,
 				significance,
 				confidence,
@@ -283,48 +298,39 @@ export class ConversationEnrichmentPipeline {
 	private calculateSignificance(
 		participantCount: number,
 		messageCount: number,
-		keywords?: string[],
 	): number {
 		let score = 0;
 		if (participantCount >= 3) score += 0.5;
 		if (participantCount >= 5) score += 0.2; // Bonus for larger groups
 		if (messageCount >= 10) score += 0.3;
-		if (keywords && keywords.length > 0) score += 0.2;
 		return Math.min(1.0, score);
 	}
 
 	/**
-	 * Extract topic hints from messages
+	 * Display names for the authors and participants of a segment
 	 */
-	private extractTopicHints(messages: any[]): string {
-		const termCounts = new Map<string, number>();
-
-		for (const rawMessage of messages) {
-			const content = (rawMessage.content || "")
-				.toLowerCase()
-				.replace(/https?:\/\/\S+/g, " ")
-				.replace(/[^\w@#]+/g, " ");
-
-			const tokens = content.split(/\s+/);
-			for (const token of tokens) {
-				const normalized = token.trim();
-				if (!normalized || normalized.length < 3) continue;
-				if (SUMMARY_STOP_WORDS.has(normalized)) continue;
-				termCounts.set(normalized, (termCounts.get(normalized) || 0) + 1);
-			}
-		}
-
-		const topTerms = Array.from(termCounts.entries())
-			.sort((a, b) => b[1] - a[1])
-			.slice(0, 8);
-
-		return topTerms.map(([term, count]) => `${term} (${count})`).join(", ");
+	private async loadNames(
+		guildId: string,
+		messages: PreviewMessage[],
+		participants: unknown,
+	): Promise<Map<string, string>> {
+		const ids = new Set<string>(messages.map((m) => m.author_id));
+		if (Array.isArray(participants)) for (const p of participants) ids.add(String(p));
+		const result = await this.db.query(
+			`SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
+			 FROM members WHERE guild_id = $1 AND user_id = ANY($2::TEXT[])`,
+			[guildId, [...ids]],
+		);
+		if (!result.success) throw new Error(`failed to read member names: ${result.error}`);
+		const names = new Map<string, string>();
+		for (const row of result.data ?? []) names.set(String(row.user_id), String(row.name));
+		return names;
 	}
 
 	/**
 	 * Sample messages for preview (beginning, middle, end)
 	 */
-	private sampleMessages(messages: any[]): any[] {
+	private sampleMessages(messages: PreviewMessage[]): PreviewMessage[] {
 		if (messages.length <= 30) {
 			return messages;
 		}
@@ -340,13 +346,18 @@ export class ConversationEnrichmentPipeline {
 	/**
 	 * Build message preview with media detection
 	 */
-	private buildMessagePreview(sampledMessages: any[]): string {
+	private buildMessagePreview(sampledMessages: PreviewMessage[], names: Map<string, string>): string {
+		const scrub = (text: string): string =>
+			text
+				.replace(/<@!?(\d+)>/g, (_, id: string) => `@${names.get(id) ?? "someone"}`)
+				.replace(SLUR_MASK, "[slur]");
 		return sampledMessages
-			.map((m: any) => {
+			.map((m) => {
+				const author = scrub(names.get(m.author_id) ?? "Unknown");
 				const content = (m.content || "").trim();
 				// Skip bot commands
 				if (content.match(/^(m!|!|\.)\w+/i)) {
-					return "(bot command)";
+					return `${author}: (bot command)`;
 				}
 
 				// Check for attachments and embeds
@@ -357,9 +368,9 @@ export class ConversationEnrichmentPipeline {
 				let mediaPlaceholder = "";
 				if (hasAttachments || hasEmbeds) {
 					const allUrls = [
-						...(hasAttachments ? m.attachments : []),
+						...(hasAttachments ? (m.attachments ?? []) : []),
 						...(hasEmbeds
-							? m.embeds
+							? (m.embeds ?? [])
 									.map((e: string) => {
 										try {
 											const embed = JSON.parse(e);
@@ -407,7 +418,7 @@ export class ConversationEnrichmentPipeline {
 							? mediaPlaceholder.trim()
 							: "(no text content)";
 
-				return fullContent;
+				return `${author}: ${scrub(fullContent)}`;
 			})
 			.join("\n")
 			.substring(0, 3000);
@@ -420,9 +431,8 @@ export class ConversationEnrichmentPipeline {
 		messageCount: number,
 		participantCount: number,
 		messagePreview: string,
-		topicHintText: string,
-	): Promise<string | null> {
-		const prompt = `Summarize this Discord conversation in 1-2 concise sentences. State the key topics/actions directly.
+	): Promise<GeneratedSummary | null> {
+		const prompt = `Summarize this Discord conversation. Return a "summary" (1-2 concise sentences stating the key topics/actions directly) and a "topic_label" (2-5 words naming the subject, e.g. "A Plague Tale", "JOHNNY's work suspension").
 
 BAD EXAMPLES (DO NOT USE):
 ❌ "Discussed suggestive humor and innuendos..." (generic "discussed", euphemistic)
@@ -446,18 +456,17 @@ RULES:
 2. Use semicolons to separate multiple topics within the summary
 3. For sexual/crude content: state it plainly (e.g., "joked about masturbation", "made crude sexual remarks")
 4. Public figures (Trump, celebrities) CAN be mentioned by name
-5. Avoid Discord user IDs like <@123456> or usernames
+5. Refer to people by the names shown before each line; never use Discord user IDs like <@123456>
 6. IGNORE bot commands (lines marked as "(bot command)")
 7. Start directly with the content - no meta-commentary like "The conversation was about..."
-8. Prioritize the dominant subject matter indicated by the top recurring terms below; if there's a conflict or repeated grievance, you MUST capture it explicitly
+8. If there is a conflict or repeated grievance, you MUST capture it explicitly
 9. When multiple topics appear, emphasize the ones that span the most messages or have emotional weight (arguments, complaints, requests)
+10. The topic_label names the dominant subject (a game, event, person's situation), not a generic activity like "chatting" or "banter"
 
 Conversation (${messageCount} messages, ${participantCount} participants):
 ${messagePreview}
 
-Top recurring terms (by frequency): ${topicHintText || "none"}
-
-Summary:`;
+Each line is "Name: message".`;
 
 		// Retry logic for rate limits
 		const isRateLimit = (message: string): boolean => {
@@ -468,17 +477,20 @@ Summary:`;
 		let retries = 3;
 
 		while (retries > 0) {
-			let failure: string;
+			let failure = "";
 			try {
-				const response = await OmpRuntime.get().generate({
+				const written = await OmpRuntime.get().generateStructured<WrittenSummary>({
 					systemPrompt: ENRICHMENT_SYSTEM_PROMPT,
 					prompt,
+					schema: SUMMARY_SCHEMA,
 					label: "enrichment.conversation-summary",
 				});
-				if (response.success && response.content) {
-					return response.content.trim();
+				const summary = written?.summary?.trim();
+				const topicLabel = written?.topic_label?.trim();
+				if (summary && topicLabel) {
+					return { summary, topicLabel };
 				}
-				failure = response.error ?? "";
+				failure = "no structured summary submitted";
 			} catch (error) {
 				failure = error instanceof Error ? error.message : String(error);
 			}

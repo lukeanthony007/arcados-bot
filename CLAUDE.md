@@ -17,8 +17,8 @@ The runtime is Bun (`bun.lock`). There is no build step; TypeScript runs directl
 ### Social intelligence
 - **Enrich conversations:** `npm run enrich:conversations:24h` / `:7d` / `:force`
 - **Dossiers:** `npm run dossier:member <id|name>`, `dossier:pair <a> <b>`, `dossier:server`, `dossier:stale [--dry-run]` (the bot writes these itself as they go stale)
-- **Keywords:** `npm run keywords:build-vocabulary`, `keywords:extract-all`, `diagnose-keywords`
-- **Conversations:** `npm run view-conversations`, `regenerate:conversations`, `analyze:grouping`, `analyze:sorting`, `tune:parameters`
+- **Conversations:** `npm run resegment:history [--channel <name>]` (re-apply the segmentation rule to stored history)
+- **Tests:** `npm test` (`bun test src`)
 
 ### Database & debugging
 - **Inspect a message:** `npm run check-message`
@@ -35,7 +35,7 @@ The runtime is Bun (`bun.lock`). There is no build step; TypeScript runs directl
 1. Connects to PostgreSQL (optional but enables all advanced features); `PostgreSQLManager.connect()` runs `initializeSchema()`
 2. Sets up Discord event handlers (slash commands, messages, voice state, buttons)
 3. Deploys commands (guild-specific when `GUILD_ID` is set, otherwise global) via `CommandDeployer`
-4. Initializes conversation workflow, message handler, member personas, voice assistant, voice-state coordinator, media player, state sync, and the enrichment orchestrator/scheduler
+4. Initializes the conversation segmenter, message handler, member personas, voice assistant, voice-state coordinator, media player, state sync, and the enrichment orchestrator/scheduler
 
 ### Feature Layers
 
@@ -49,16 +49,14 @@ Syncs Discord data to PostgreSQL with real-time updates:
 #### Social Intelligence (`src/features/social-intelligence/`)
 Transforms raw Discord interactions into structured relationship and conversation insights:
 - **Facts** (`facts/closeness.ts`): the one definition of closeness between two members, computed on demand from `messages` + `conversation_segments` (never stored): replies (3 pts), direct mentions (2), shared conversations (1), 180-day half-life decay; per pair `strength`, `share` of the subject's interactions, `reciprocity`. `getConnections`, `getPairFacts`, `getGuildGraph`, `describeStrength`
-- **Relationship Mapping** (`relationship-mapping/`): `RelationshipMapper.recordInteraction` keeps live `relationship_edges` counters (used only by conversation grouping and enrichment scheduling)
-- **Conversation Detection** (`conversation-detection/`): Groups messages into multi-participant conversation segments using multi-strategy grouping
+- **Conversations** (`conversations/`): `segmenter.ts` is the pure rule (see Conversation Lifecycle), `store.ts` applies it to a channel's tail or whole history idempotently, `ConversationSegmenter.ts` runs it every 2 minutes; `message_reactions` is written by LiveEventSync for closeness
 - **Facts** also include `facts/memberFacts.ts` (`getMemberFacts`: activity, writing style, timing in America/New_York, responsiveness, measured from `messages`) and `facts/graph.ts` (`summarizeGraph`: hubs, strongest pairs, communities by label propagation)
 - **Understanding** (`understanding/`): dossiers written in one pass from facts + conversation summaries + real messages via `generateStructured`, stored as JSON sections plus rendered text, regenerated whole when stale (never appended to):
   - `memberDossier.ts` → `user_profiles.dossier` + `summary` (identity, voice, interests, people, recent, Big Five with evidence/confidence, MBTI derived relative to the server's other dossiers, `X` where undecided); stale after 25 new messages or a new summarized conversation; needs 30+ messages
   - `pairDossier.ts` → `pair_dossiers` (dynamic, history, tone) for the strongest pairs with 3+ summarized shared conversations
   - `serverDossier.ts` → `guilds.dossier` + `guilds.server_summary` (overview, culture, topics from summaries, hubs/communities from the graph, recent); stale after 20 new summaries or 7 days
-- **Semantic Analysis** (`semantic-analysis/`): Extracts keywords (TF-IDF + semantic), generates embeddings
-- **Enrichment Pipeline** (`enrichment-pipeline/`): one budgeted in-memory queue (`EnrichmentQueue`, retries failed jobs up to 3 times; `EnrichmentRateLimiter` $1/day at real Grok prices) drained every 5 minutes by `EnrichmentScheduler`, which first runs `EnrichmentPipelineOrchestrator.enqueueStaleDossiers` per guild. Jobs: conversation summaries (`layers/ConversationEnrichmentPipeline.ts`, enqueued by the detector), member/pair/server dossiers. Nothing cascades
-- **Types** (`types.ts`): Defines `ConversationEntry`, `StreamingConversation`, keyword types
+- **Semantic Analysis** (`semantic-analysis/EmbeddingService.ts`): local embeddings for message and summary search
+- **Enrichment Pipeline** (`enrichment-pipeline/`): one budgeted in-memory queue (`EnrichmentQueue`, retries failed jobs up to 3 times; `EnrichmentRateLimiter` $1/day at real Grok prices) drained every 5 minutes by `EnrichmentScheduler`, which first runs `EnrichmentPipelineOrchestrator.enqueueStaleDossiers` per guild. Jobs: conversation summaries + topic labels (`layers/ConversationEnrichmentPipeline.ts`, enqueued by the segmenter), member/pair/server dossiers. Nothing cascades
 
 #### Member Personas (`src/features/user-personas/`)
 `/persona init|change|clear` lets the bot speak as a server member (see Common Tasks).
@@ -117,20 +115,18 @@ AI infrastructure built on the omp SDK:
 - Analysis tools provide metadata and trends
 
 **LiveEventSync events**:
-- messageCreate → increments relationship edges, buffers message for conversation detection, queues user enrichment every 50 messages
-- reactionAdd/reactionRemove → increments edge counters
+- messageCreate → stores the message (conversations and closeness are derived from stored messages, nothing else happens here)
+- reactionAdd/reactionRemove → `message_reactions` rows (closeness counts them)
 - guildMemberAdd/Update → updates member profiles
 - channelCreate/Update/Delete → updates channel records
 - roleCreate/Update/Delete → updates role records
-- Conversations are finalized after 10-20 min of channel inactivity (in-memory buffers; lost on a crash)
 
 **Conversation Lifecycle**:
-1. ConversationDetector buffers human messages per channel in memory (bot commands are dropped at ingest)
-2. After 10-20 min inactivity, a 50-message buffer or a 30-min span: multi-strategy grouping (reply chains, mentions, proximity) + validation (≥3 messages, ≥2 participants, ≤24h, no gap >8h)
-3. Finalized segments stored in `conversation_segments` as `pending`; nearby/overlapping segments are merged
-4. The enrichment queue summarizes significant `pending` segments; small ones are marked `skipped`
-5. Monologues and exchanges under 3 messages are intentionally never grouped
-6. Messages the live detector missed (downtime, old history) are added with `npm run regenerate:conversations [--since YYYY-MM-DD] [--until YYYY-MM-DD]`, which replays stored messages per channel; re-runs skip already-grouped messages
+1. `ConversationSegmenter` runs every 2 minutes: for each channel with new messages (or an open conversation) it re-segments the recent tail with `segmentChannelTail` and upserts `conversation_segments`
+2. The rule (`conversations/segmenter.ts`, pure): same channel, split on a 20-minute silence unless the next message replies to a message in the open conversation within 6 hours, cap 24 hours, keep runs of 3+ messages from 2+ people; bot commands and bot authors excluded. Ids are `conv_<channel>_<first message id>`, so reruns are no-ops
+3. A conversation whose last message is within 20 minutes is stored `status='active'` (live tools read it); afterwards `finalized`. A late reply that reopens a finalized one updates it in place and resets its summary
+4. Finalized conversations with 3+ people or 10+ messages are queued for a summary + `topic_label`; smaller ones are `skipped`
+5. Backfilled messages (downtime recovery) trigger `resegmentChannelHistory` for the channel; `npm run resegment:history` does it for everything (matching conversations keep their summaries)
 
 ## Configuration
 
@@ -188,7 +184,7 @@ Commands only receive the interaction. Shared services are attached to the Disco
 
 ### Social Intelligence
 - [closeness.ts](src/features/social-intelligence/facts/closeness.ts) - The one definition of closeness between members
-- [ConversationDetector.ts](src/features/social-intelligence/conversation-detection/ConversationDetector.ts) - Conversation detection and grouping
+- [segmenter.ts](src/features/social-intelligence/conversations/segmenter.ts) - The conversation rule; [store.ts](src/features/social-intelligence/conversations/store.ts) applies it to a channel idempotently
 - [EnrichmentPipelineOrchestrator.ts](src/features/social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator.ts) - Enrichment layers, cascades and queue processing
 - [memberDossier.ts](src/features/social-intelligence/understanding/memberDossier.ts) - Member dossier writer, staleness, server-relative MBTI
 - [serverDossier.ts](src/features/social-intelligence/understanding/serverDossier.ts) - Server dossier (what chat prepends to the first turn)
@@ -225,8 +221,8 @@ Commands only receive the interaction. Shared services are attached to the Disco
 
 **Add a dossier section or a new dossier kind**: dossier shapes live in `understanding/types.ts`; each writer (`memberDossier.ts`, `pairDossier.ts`, `serverDossier.ts`) gathers facts + summaries + real messages, calls `OmpRuntime.generateStructured`, renders text, and stores both in one statement. Writers throw on model failure (the queue retries up to 3 times) and return `null` only for "not enough evidence". New kinds need a `find*Stale` query, an `EnrichmentLayer` value, and a case in `EnrichmentPipelineOrchestrator.processJob`.
 
-**Track new interaction types**: ConversationDetector uses multi-strategy grouping; add new strategies in `conversation-detection/strategies/` directory.
+**Change what counts as a conversation**: the rule is `conversations/segmenter.ts` (pure, tested with `npm test`); change the constants or the split logic there, then `npm run resegment:history` to apply it to stored history (matching conversations keep their summaries).
 
-**Debug conversation detection**: ConversationDetector buffers messages per channel with 10-20 min inactivity timeouts; inspect `conversation_segments` (coverage = messages appearing in some segment's `message_ids`) or add logging.
+**Debug conversation detection**: conversations are recomputed from `messages` every 2 minutes (`ConversationSegmenter`); inspect `conversation_segments` (`status='active'` = still going; coverage = messages appearing in some `message_ids`). Nothing lives in memory, so re-running a pass or `resegment:history` is always safe.
 
 **Extend bot mention handling**: Message handling logic lives in `src/handlers/chat/MessageHandler.ts`; modify sanitization, context resolution, or chunking there.

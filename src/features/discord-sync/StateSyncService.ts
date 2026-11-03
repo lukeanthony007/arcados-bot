@@ -1,6 +1,4 @@
 import type { Client, Guild, Message, Channel, GuildMember } from "discord.js";
-import type { RelationshipMapper } from "../social-intelligence/relationship-mapping/RelationshipMapper";
-import type { ConversationDetector } from "../social-intelligence/conversation-detection/ConversationDetector";
 import { LiveEventSync } from "./LiveEventSync";
 import { ReconciliationSync } from "./ReconciliationSync";
 import { SyncCoordinator } from "./SyncCoordinator";
@@ -25,8 +23,6 @@ import { timeOperation } from "../../utils/timing";
 export class StateSyncService {
   private client: Client;
   private db: PostgreSQLManager;
-  private relationshipMapper: RelationshipMapper;
-  private conversationDetector: ConversationDetector;
 
   private liveEventSync: LiveEventSync;
   private reconciliationSync: ReconciliationSync;
@@ -35,40 +31,18 @@ export class StateSyncService {
   private maintenanceTimer?: NodeJS.Timeout;
   private verbose: boolean;
 
-  constructor(
-    client: Client,
-    db: PostgreSQLManager,
-    relationshipMapper: RelationshipMapper,
-    conversationDetector: ConversationDetector,
-    verbose: boolean = false
-  ) {
+  constructor(client: Client, db: PostgreSQLManager, verbose: boolean = false) {
     this.client = client;
     this.db = db;
-    this.relationshipMapper = relationshipMapper;
-    this.conversationDetector = conversationDetector;
     this.verbose = verbose;
 
     // Initialize coordinator first (shared state manager)
     this.coordinator = new SyncCoordinator(db, verbose);
 
     // Initialize sync components
-    this.liveEventSync = new LiveEventSync(
-      client,
-      db,
-      relationshipMapper,
-      conversationDetector,
-      this.coordinator,
-      verbose
-    );
+    this.liveEventSync = new LiveEventSync(client, db, this.coordinator, verbose);
 
-    this.reconciliationSync = new ReconciliationSync(
-      client,
-      db,
-      relationshipMapper,
-      conversationDetector,
-      this.coordinator,
-      verbose
-    );
+    this.reconciliationSync = new ReconciliationSync(client, db, this.coordinator, verbose);
   }
 
   /**

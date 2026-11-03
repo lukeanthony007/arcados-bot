@@ -3,7 +3,6 @@ import {
   type MemberData,
   type UserProfileData,
 } from "../../../database/PostgreSQLManager";
-import type { ConversationEntry } from "../../../features/social-intelligence/types";
 import {
   type Connection,
   describeStrength,
@@ -194,27 +193,4 @@ export async function resolveUserId(
     success: false,
     error: `User "${identifier}" not found in this server. Try using searchUsers to find users by name.`,
   };
-}
-
-/**
- * Format conversation entry for AI consumption
- */
-export function formatConversation(conv: ConversationEntry): string {
-  const parts: string[] = [];
-  parts.push(`Conversation (${conv.conversation_id}):`);
-  parts.push(`  - Start: ${new Date(conv.start_time).toLocaleString()}`);
-  parts.push(`  - End: ${new Date(conv.end_time).toLocaleString()}`);
-  parts.push(`  - Duration: ${conv.duration_minutes} minutes`);
-  parts.push(`  - Messages: ${conv.message_count}`);
-  parts.push(`  - Channel: ${conv.channel_id}`);
-
-  if (conv.interaction_types && conv.interaction_types.length > 0) {
-    parts.push(`  - Interaction types: ${conv.interaction_types.join(", ")}`);
-  }
-
-  if (conv.has_name_usage) {
-    parts.push(`  - Direct name usage: Yes`);
-  }
-
-  return parts.join("\n");
 }

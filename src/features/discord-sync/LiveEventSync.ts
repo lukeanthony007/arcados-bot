@@ -7,8 +7,6 @@ import type {
 	VoiceState,
 } from "discord.js";
 import { Message } from "discord.js";
-import { RelationshipMapper } from "../social-intelligence/relationship-mapping/RelationshipMapper";
-import { ConversationDetector } from "../social-intelligence/conversation-detection/ConversationDetector";
 import type { SyncCoordinator } from "./SyncCoordinator";
 import { PostgreSQLManager } from "../../database/PostgreSQLManager";
 import { EmbeddingService } from "../social-intelligence/semantic-analysis/EmbeddingService";
@@ -19,7 +17,7 @@ import { EmbeddingService } from "../social-intelligence/semantic-analysis/Embed
  * Responsibilities:
  * - Listen to Discord events (messageCreate, memberUpdate, etc.)
  * - Immediately sync state to PostgreSQL
- * - Update relationship network and conversation manager
+ * - Conversations and closeness are derived from stored messages elsewhere (no state here)
  * - Manage watermarks for processed messages
  *
  * Priority: HIGH (real-time, user-facing)
@@ -28,8 +26,6 @@ import { EmbeddingService } from "../social-intelligence/semantic-analysis/Embed
 export class LiveEventSync {
 	private client: Client;
 	private db: PostgreSQLManager;
-	private relationshipMapper: RelationshipMapper;
-	private conversationDetector: ConversationDetector;
 	private coordinator: SyncCoordinator;
 	private verbose: boolean;
 	private embeddingService: EmbeddingService;
@@ -51,15 +47,11 @@ export class LiveEventSync {
 	constructor(
 		client: Client,
 		db: PostgreSQLManager,
-		relationshipMapper: RelationshipMapper,
-		conversationDetector: ConversationDetector,
 		coordinator: SyncCoordinator,
 		verbose: boolean = false
 	) {
 		this.client = client;
 		this.db = db;
-		this.relationshipMapper = relationshipMapper;
-		this.conversationDetector = conversationDetector;
 		this.coordinator = coordinator;
 		this.verbose = verbose;
 		this.embeddingService = EmbeddingService.getInstance();
@@ -138,7 +130,6 @@ export class LiveEventSync {
 		const guildId = message.guildId;
 		const authorId = message.author.id;
 		const timestamp = message.createdAt;
-		const isBot = message.author.bot;
 
 		try {
 			// Ensure guild exists (foreign key constraint protection)
@@ -230,115 +221,6 @@ export class LiveEventSync {
 			console.error(`🔸 LiveEventSync: Exception saving message ${message.id}:`, error);
 			throw error;
 		}
-
-		// Skip relationship/conversation tracking for bot messages
-		if (isBot) {
-			return;
-		}
-
-		// Extract mentions and record interactions
-		const mentionedUsers = Array.from(message.mentions.users.values())
-			.filter((u) => !u.bot && u.id !== authorId)
-			.map((u) => u.id);
-
-		// Add message to conversation stream
-		await this.conversationDetector.addMessageToStream({
-			id: message.id,
-			author_id: authorId,
-			content: message.content || "",
-			created_at: timestamp,
-			guild_id: guildId,
-			channel_id: message.channel.id,
-			referenced_message_id: message.reference?.messageId || undefined,
-			mentioned_user_ids: mentionedUsers,
-		});
-
-		// Record mention interactions
-		for (const mentionedId of mentionedUsers) {
-			await this.relationshipMapper.recordInteraction(
-				guildId,
-				authorId,
-				mentionedId,
-				"mention",
-				"a_to_b",
-				timestamp
-			);
-		}
-
-		// Handle reply interactions (2-level deep tracking)
-		if (message.reference?.messageId) {
-			try {
-				const referencedMessage = await message.channel.messages.fetch(
-					message.reference.messageId
-				);
-				const repliedToId = referencedMessage.author.id;
-
-				if (repliedToId !== authorId) {
-					await this.relationshipMapper.recordInteraction(
-						guildId,
-						authorId,
-						repliedToId,
-						"reply",
-						"a_to_b",
-						timestamp
-					);
-
-					// Second-level reply tracking (extended conversation threads)
-					if (
-						referencedMessage.reference?.messageId &&
-						referencedMessage.reference.messageId !== message.reference.messageId
-					) {
-						try {
-							const originalMessage = await message.channel.messages.fetch(
-								referencedMessage.reference.messageId
-							);
-							const originalAuthorId = originalMessage.author.id;
-
-							if (
-								originalAuthorId !== authorId &&
-								originalAuthorId !== repliedToId
-							) {
-								await this.relationshipMapper.recordInteraction(
-									guildId,
-									authorId,
-									originalAuthorId,
-									"message",
-									"a_to_b",
-									timestamp
-								);
-							}
-						} catch {
-							// Original message may not be accessible
-						}
-					}
-				}
-			} catch (err) {
-				// Referenced message may not exist
-			}
-		}
-
-		// Proximity-based interactions (same channel, 30s window)
-		const recentMessages = await this.getRecentChannelMessages(
-			guildId,
-			message.channel.id,
-			10
-		);
-
-		for (const otherMsg of recentMessages) {
-			if (
-				otherMsg.author_id !== authorId &&
-				Math.abs(timestamp.getTime() - otherMsg.created_at.getTime()) < 30000
-			) {
-				await this.relationshipMapper.recordInteraction(
-					guildId,
-					authorId,
-					otherMsg.author_id,
-					"message",
-					"a_to_b",
-					timestamp
-				);
-			}
-		}
 	}
 
 	/**
@@ -405,16 +287,12 @@ export class LiveEventSync {
 
 		if (!authorId || authorId === user.id) return;
 
-		const guildId = reaction.message.guildId;
-		const reactorId = user.id;
-
-		await this.relationshipMapper.recordInteraction(
-			guildId,
-			reactorId,
-			authorId,
-			"reaction",
-			"a_to_b",
-			new Date()
+		// Reactions are the one interaction messages don't carry; closeness counts them
+		await this.db.query(
+			`INSERT INTO message_reactions (guild_id, message_id, user_id, author_id, emoji, created_at)
+			 VALUES ($1, $2, $3, $4, $5, NOW())
+			 ON CONFLICT (message_id, user_id, emoji) DO NOTHING`,
+			[reaction.message.guildId, reaction.message.id, user.id, authorId, reaction.emoji.toString()],
 		);
 
 		this.stats.reactionsSynced++;
@@ -423,11 +301,12 @@ export class LiveEventSync {
 	/**
 	 * Handle reaction remove
 	 */
-	private async handleReactionRemove(
-		reaction: MessageReaction,
-		user: User
-	): Promise<void> {
-		// Reactions are additive, no need to decrement
+	private async handleReactionRemove(reaction: MessageReaction, user: User): Promise<void> {
+		if (!reaction.message.guildId) return;
+		await this.db.query(
+			"DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3",
+			[reaction.message.id, user.id, reaction.emoji.toString()],
+		);
 	}
 
 	/**
@@ -593,38 +472,6 @@ export class LiveEventSync {
 		}
 	}
 
-	/**
-	 * Handle voice state update (REMOVED - now handled in Bot.ts)
-	 *
-	 * Voice state handling has been moved to Bot.ts where VoiceStateCoordinator
-	 * is instantiated and manages all voice state events directly.
-	 */
-
-	/**
-	 * Get recent messages in channel for proximity detection
-	 */
-	private async getRecentChannelMessages(
-		guildId: string,
-		channelId: string,
-		limit: number
-	): Promise<Array<{ author_id: string; created_at: Date; id: string }>> {
-		const result = await this.db.query(
-			`SELECT author_id, created_at, id FROM messages
-			 WHERE guild_id = $1 AND channel_id = $2 AND active = true
-			 ORDER BY created_at DESC LIMIT $3`,
-			[guildId, channelId, limit]
-		);
-
-		if (result.success && result.data) {
-			return result.data.map((row: any) => ({
-				author_id: row.author_id,
-				created_at: new Date(row.created_at),
-				id: row.id,
-			}));
-		}
-
-		return [];
-	}
 
 	/**
 	 * Check if message was already processed (deduplication)
@@ -669,7 +516,6 @@ export class LiveEventSync {
 	 * Stop watching (cleanup)
 	 */
 	async stop(): Promise<void> {
-		await this.conversationDetector.finalizeAllSegments();
 		console.log("🔹 LiveEventSync stopped");
 	}
 

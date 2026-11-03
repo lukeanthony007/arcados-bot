@@ -1,7 +1,6 @@
 import { Pool, PoolClient, QueryResult } from "pg";
 import pgvector from "pgvector/pg";
 import { config } from "../config/index.js";
-import type { ConversationEntry } from "../features/social-intelligence/types";
 import type { MemberDossier } from "../features/social-intelligence/understanding/types";
 
 // Export pgvector for use in other modules
@@ -432,27 +431,19 @@ export class PostgreSQLManager {
         `);
       }
 
-      // Relationship edges - directed dyads for realtime updates
+      // Reactions: the one interaction messages don't carry (closeness counts them)
       await client.query(`
-				CREATE TABLE IF NOT EXISTS relationship_edges (
-					guild_id VARCHAR(20) NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
-					user_a VARCHAR(20) NOT NULL,
-					user_b VARCHAR(20) NOT NULL,
-					last_interaction TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					msg_a_to_b INTEGER DEFAULT 0,
-					msg_b_to_a INTEGER DEFAULT 0,
-					mentions INTEGER DEFAULT 0,
-					replies INTEGER DEFAULT 0,
-					reactions INTEGER DEFAULT 0,
-					rolling_7d INTEGER DEFAULT 0,
-					rolling_30d INTEGER DEFAULT 0,
-					total INTEGER DEFAULT 0,
-					created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					PRIMARY KEY (guild_id, user_a, user_b)
-				)
+				CREATE TABLE IF NOT EXISTS message_reactions (
+					guild_id VARCHAR(20) NOT NULL,
+					message_id VARCHAR(20) NOT NULL,
+					user_id VARCHAR(20) NOT NULL,
+					author_id VARCHAR(20) NOT NULL,
+					emoji TEXT NOT NULL,
+					created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+					PRIMARY KEY (message_id, user_id, emoji)
+				);
+				CREATE INDEX IF NOT EXISTS idx_message_reactions_guild ON message_reactions(guild_id, author_id);
 			`);
-
       // Conversation segments - multi-participant conversations
       await client.query(`
 				CREATE TABLE IF NOT EXISTS conversation_segments (
@@ -464,7 +455,6 @@ export class PostgreSQLManager {
 					end_time TIMESTAMP WITH TIME ZONE NOT NULL,
 					message_ids TEXT[] NOT NULL,
 					message_count INTEGER NOT NULL,
-					features JSONB DEFAULT '{}',
 					summary TEXT,
 					status VARCHAR(20) DEFAULT 'finalized',
 					last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -483,15 +473,11 @@ export class PostgreSQLManager {
 				ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 			`);
 
-      // Add topic drift detection columns (migration)
+      // Topic label written by the conversation summarizer
       await client.query(`
 				ALTER TABLE conversation_segments
-				ADD COLUMN IF NOT EXISTS topic_label TEXT,
-				ADD COLUMN IF NOT EXISTS topic_confidence FLOAT,
-				ADD COLUMN IF NOT EXISTS parent_segment_id VARCHAR(50),
-				ADD COLUMN IF NOT EXISTS split_reason TEXT
+				ADD COLUMN IF NOT EXISTS topic_label TEXT
 			`);
-
       // Add voice conversation columns (migration)
       await client.query(`
 				ALTER TABLE conversation_segments
@@ -517,20 +503,19 @@ export class PostgreSQLManager {
 				ALTER TABLE user_profiles DROP COLUMN IF EXISTS relationship_network;
 			`);
 
-      // Guild vocabulary - TF-IDF vocabulary for keyword extraction
+      // Conversations and closeness are derived from messages; drop the old caches
       await client.query(`
-				CREATE TABLE IF NOT EXISTS guild_vocabulary (
-					guild_id VARCHAR(20) NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
-					term VARCHAR(100) NOT NULL,
-					idf_score FLOAT NOT NULL,
-					document_frequency INTEGER NOT NULL,
-					total_documents INTEGER NOT NULL,
-					is_stopword BOOLEAN DEFAULT false,
-					last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-					PRIMARY KEY (guild_id, term)
-				)
+				DROP TABLE IF EXISTS guild_vocabulary;
+				DROP TABLE IF EXISTS relationship_edges;
+				DROP VIEW IF EXISTS conversations_unified;
+				DROP TABLE IF EXISTS streaming_conversations;
+				ALTER TABLE conversation_segments
+					DROP COLUMN IF EXISTS features,
+					DROP COLUMN IF EXISTS topic_confidence,
+					DROP COLUMN IF EXISTS parent_segment_id,
+					DROP COLUMN IF EXISTS split_reason,
+					DROP COLUMN IF EXISTS significance_score
 			`);
-
       // Add last_message_id to channels for watermark tracking
       await client.query(`
 				ALTER TABLE channels
@@ -743,10 +728,6 @@ export class PostgreSQLManager {
 				CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id);
 				CREATE INDEX IF NOT EXISTS idx_messages_author_id ON messages(author_id);
 				CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
-				CREATE INDEX IF NOT EXISTS idx_relationship_edges_guild ON relationship_edges(guild_id);
-				CREATE INDEX IF NOT EXISTS idx_relationship_edges_user_a ON relationship_edges(user_a);
-				CREATE INDEX IF NOT EXISTS idx_relationship_edges_user_b ON relationship_edges(user_b);
-				CREATE INDEX IF NOT EXISTS idx_relationship_edges_last_interaction ON relationship_edges(last_interaction);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_guild ON conversation_segments(guild_id);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_channel ON conversation_segments(channel_id);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_participants ON conversation_segments USING GIN(participants);
@@ -754,9 +735,6 @@ export class PostgreSQLManager {
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_status ON conversation_segments(status);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_last_activity ON conversation_segments(last_activity_at DESC);
 				CREATE INDEX IF NOT EXISTS idx_conversation_segments_active_users ON conversation_segments(guild_id, status) WHERE status = 'active';
-				CREATE INDEX IF NOT EXISTS idx_guild_vocabulary_guild ON guild_vocabulary(guild_id);
-				CREATE INDEX IF NOT EXISTS idx_guild_vocabulary_term ON guild_vocabulary(term);
-				CREATE INDEX IF NOT EXISTS idx_guild_vocabulary_idf ON guild_vocabulary(guild_id, idf_score DESC);
 				${this.vectorExtensionAvailable ? `
 				CREATE INDEX IF NOT EXISTS messages_embedding_idx
 					ON messages USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
@@ -1728,545 +1706,6 @@ export class PostgreSQLManager {
   }
 
   // ============================================================================
-  // Relationship Edges - Realtime Incremental Updates
-  // ============================================================================
-
-  /**
-   * Upsert relationship edge counters (O(1) update for realtime)
-   */
-  async upsertEdgeCounters(
-    guildId: string,
-    userA: string,
-    userB: string,
-    delta: {
-      msg_a_to_b?: number;
-      msg_b_to_a?: number;
-      mentions?: number;
-      replies?: number;
-      reactions?: number;
-      total?: number;
-    }
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        INSERT INTO relationship_edges (
-          guild_id, user_a, user_b, 
-          last_interaction, msg_a_to_b, msg_b_to_a, mentions, replies, reactions, total
-        )
-        VALUES ($1, $2, $3, NOW(), $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (guild_id, user_a, user_b) DO UPDATE SET
-          msg_a_to_b = relationship_edges.msg_a_to_b + EXCLUDED.msg_a_to_b,
-          msg_b_to_a = relationship_edges.msg_b_to_a + EXCLUDED.msg_b_to_a,
-          mentions = relationship_edges.mentions + EXCLUDED.mentions,
-          replies = relationship_edges.replies + EXCLUDED.replies,
-          reactions = relationship_edges.reactions + EXCLUDED.reactions,
-          total = relationship_edges.total + EXCLUDED.total,
-          last_interaction = GREATEST(relationship_edges.last_interaction, EXCLUDED.last_interaction),
-          updated_at = NOW()
-      `;
-
-      const values = [
-        guildId,
-        userA,
-        userB,
-        delta.msg_a_to_b || 0,
-        delta.msg_b_to_a || 0,
-        delta.mentions || 0,
-        delta.replies || 0,
-        delta.reactions || 0,
-        delta.total || 0,
-      ];
-
-      await client.query(query, values);
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to upsert edge counters:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get edge for a specific pair
-   */
-  async getEdgeForPair(
-    guildId: string,
-    userA: string,
-    userB: string
-  ): Promise<DatabaseResult<any>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM relationship_edges
-        WHERE guild_id = $1 AND user_a = $2 AND user_b = $3
-      `;
-      const result = await client.query(query, [guildId, userA, userB]);
-      return {
-        success: true,
-        data: result.rows[0] || null,
-      };
-    } catch (error) {
-      console.error("🔸 Failed to get edge:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Update rolling windows (7d, 30d) for edges
-   */
-  async updateEdgeRollingWindows(
-    guildId: string,
-    cutoff7d: Date,
-    cutoff30d: Date
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      // Reset rolling windows and recalculate from interactions in the windows
-      const query = `
-        UPDATE relationship_edges
-        SET 
-          rolling_7d = CASE 
-            WHEN last_interaction >= $2 THEN total
-            ELSE 0
-          END,
-          rolling_30d = CASE
-            WHEN last_interaction >= $3 THEN total
-            ELSE 0
-          END,
-          updated_at = NOW()
-        WHERE guild_id = $1
-      `;
-      await client.query(query, [guildId, cutoff7d, cutoff30d]);
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to update rolling windows:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  // ============================================================================
-  // Conversation Segments - Multi-participant Conversations
-  // ============================================================================
-
-  /**
-   * Upsert conversation segment
-   */
-  async upsertConversationSegment(segment: {
-    id: string;
-    guildId: string;
-    channelId: string;
-    participants: string[];
-    startTime: Date;
-    endTime: Date;
-    messageIds: string[];
-    messageCount: number;
-    features?: Record<string, any>;
-    summary?: string;
-    status?: "active" | "paused" | "finalized";
-  }): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        INSERT INTO conversation_segments (
-          id, guild_id, channel_id, participants, start_time, end_time,
-          message_ids, message_count, features, summary, status, last_activity_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (id) DO UPDATE SET
-          end_time = EXCLUDED.end_time,
-          message_ids = EXCLUDED.message_ids,
-          message_count = EXCLUDED.message_count,
-          features = EXCLUDED.features,
-          summary = EXCLUDED.summary,
-          status = EXCLUDED.status,
-          last_activity_at = EXCLUDED.last_activity_at
-      `;
-
-      const values = [
-        segment.id,
-        segment.guildId,
-        segment.channelId,
-        segment.participants,
-        segment.startTime,
-        segment.endTime,
-        segment.messageIds,
-        segment.messageCount,
-        JSON.stringify(segment.features || {}),
-        segment.summary || null,
-        segment.status || "finalized",
-        segment.endTime,
-      ];
-
-      await client.query(query, values);
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to upsert conversation segment:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Remove conversation segments that don't meet minimum participant requirements
-   */
-  async removeSingleParticipantSegments(
-    guildId: string
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      await client.query(
-        `DELETE FROM conversation_segments
-         WHERE guild_id = $1
-           AND (participants IS NULL OR array_length(participants, 1) <= 1)`,
-        [guildId]
-      );
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to remove single-participant segments:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get segments for participants (overlapping or exact match)
-   */
-  async getSegmentsForParticipants(
-    guildId: string,
-    participantIds: string[],
-    limit: number = 10,
-    since?: Date
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      // Find segments where participants array contains any of the given participant IDs
-      const query = `
-        SELECT * FROM conversation_segments
-        WHERE guild_id = $1
-          AND participants && $2::TEXT[]
-          ${since ? "AND start_time >= $4" : ""}
-        ORDER BY start_time DESC
-        LIMIT $3
-      `;
-      const params: any[] = [guildId, participantIds, limit];
-      if (since) params.push(since);
-
-      const result = await client.query(query, params);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get segments for participants:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get segments for a channel
-   */
-  async getSegmentsForChannel(
-    guildId: string,
-    channelId: string,
-    limit: number = 20
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM conversation_segments
-        WHERE guild_id = $1 AND channel_id = $2
-        ORDER BY start_time DESC
-        LIMIT $3
-      `;
-      const result = await client.query(query, [guildId, channelId, limit]);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get segments for channel:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get active conversations for a user (real-time)
-   */
-  async getActiveConversationsForUser(
-    userId: string,
-    guildId: string,
-    limit: number = 20
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM conversation_segments
-        WHERE guild_id = $1
-          AND participants @> $2::TEXT[]
-          AND status = 'active'
-        ORDER BY last_activity_at DESC
-        LIMIT $3
-      `;
-      const result = await client.query(query, [guildId, [userId], limit]);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get active conversations for user:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get active conversations in a channel (real-time)
-   */
-  async getActiveConversationsInChannel(
-    channelId: string,
-    guildId: string,
-    limit: number = 20
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM conversation_segments
-        WHERE guild_id = $1 AND channel_id = $2
-          AND status = 'active'
-        ORDER BY last_activity_at DESC
-        LIMIT $3
-      `;
-      const result = await client.query(query, [guildId, channelId, limit]);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get active conversations in channel:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Get conversation history for a user with pagination
-   */
-  async getUserConversationHistory(
-    userId: string,
-    guildId: string,
-    limit: number = 50,
-    offset: number = 0
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        SELECT * FROM conversation_segments
-        WHERE guild_id = $1
-          AND participants @> $2::TEXT[]
-        ORDER BY last_activity_at DESC
-        LIMIT $3 OFFSET $4
-      `;
-      const result = await client.query(query, [
-        guildId,
-        [userId],
-        limit,
-        offset,
-      ]);
-      return { success: true, data: result.rows };
-    } catch (error) {
-      console.error("🔸 Failed to get user conversation history:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Update conversation status (active/paused/finalized)
-   */
-  async updateConversationStatus(
-    segmentId: string,
-    status: "active" | "paused" | "finalized"
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const query = `
-        UPDATE conversation_segments
-        SET status = $1, last_activity_at = NOW()
-        WHERE id = $2
-      `;
-      await client.query(query, [status, segmentId]);
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to update conversation status:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Load active conversations from database (called on bot startup)
-   */
-  async loadActiveConversations(
-    guildId: string
-  ): Promise<DatabaseResult<any[]>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      // Always exclude embedding column to avoid vector extension errors
-      // Even if we don't select it, PostgreSQL may try to load the extension
-      // if the table has a vector column
-      const query = `
-        SELECT 
-          id, guild_id, channel_id, participants, start_time, end_time,
-          message_ids, message_count, features, summary, status, 
-          last_activity_at, created_at, is_voice_conversation, 
-          voice_channel_id, voice_participants, transcription_data,
-          topic_label, topic_confidence, parent_segment_id, split_reason
-        FROM conversation_segments
-        WHERE guild_id = $1 AND status = 'active'
-        ORDER BY last_activity_at DESC
-      `;
-      const result = await client.query(query, [guildId]);
-      return { success: true, data: result.rows };
-    } catch (error: any) {
-      // If error is related to vector extension, the table likely has a vector column
-      // but the extension isn't available. Try using a subquery or different approach.
-      if (error?.code === '58P01' || error?.message?.includes('vector')) {
-        // Mark extension as unavailable for future queries
-        this.vectorExtensionAvailable = false;
-
-        // Try using information_schema to get column list and exclude vector columns
-        try {
-          // Use a more defensive query that avoids vector type resolution
-          const query = `
-            SELECT 
-              id::text, guild_id::text, channel_id::text, 
-              participants, start_time, end_time,
-              message_ids, message_count, features, summary, status, 
-              last_activity_at, created_at, is_voice_conversation, 
-              voice_channel_id::text, voice_participants, transcription_data,
-              topic_label, topic_confidence, parent_segment_id::text, split_reason
-            FROM conversation_segments
-            WHERE guild_id = $1 AND status = 'active'
-            ORDER BY last_activity_at DESC
-          `;
-          const result = await client.query(query, [guildId]);
-          return { success: true, data: result.rows };
-        } catch (retryError: any) {
-          // If that still fails, try the simplest possible query
-          try {
-            const simpleQuery = `
-              SELECT id, guild_id, channel_id, participants, start_time, end_time,
-                     message_ids, message_count, features, summary, status, 
-                     last_activity_at, created_at
-              FROM conversation_segments
-              WHERE guild_id = $1 AND status = 'active'
-              ORDER BY last_activity_at DESC
-            `;
-            const result = await client.query(simpleQuery, [guildId]);
-            return { success: true, data: result.rows };
-          } catch (simpleError) {
-            // Last resort: return empty array with success
-            console.warn("⚠️  Could not load active conversations due to vector extension issues. Returning empty list.");
-            return { success: true, data: [] };
-          }
-        }
-      }
-      console.error("🔸 Failed to load active conversations:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  // ============================================================================
   // Channel Watermark Tracking
   // ============================================================================
 
@@ -2399,84 +1838,6 @@ export class PostgreSQLManager {
       };
     } catch (error) {
       console.error("🔸 Failed to get messages for embedding:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Update single message embedding
-   */
-  async updateMessageEmbedding(
-    messageId: string,
-    embedding: number[]
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      const embeddingStr = `[${embedding.join(",")}]`;
-      const query = `
-        UPDATE messages
-        SET embedding = $1::vector
-        WHERE id = $2
-      `;
-
-      await client.query(query, [embeddingStr, messageId]);
-      return { success: true };
-    } catch (error) {
-      console.error("🔸 Failed to update message embedding:", error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Batch update multiple message embeddings
-   */
-  async updateMessageEmbeddingsBatch(
-    updates: Array<{ messageId: string; embedding: number[] }>
-  ): Promise<DatabaseResult<void>> {
-    if (!this.isConnected()) {
-      return { success: false, error: "Database not connected" };
-    }
-
-    if (updates.length === 0) {
-      return { success: true };
-    }
-
-    const client = await this.pool!.connect();
-    try {
-      // Use a transaction for batch update
-      await client.query("BEGIN");
-
-      for (const update of updates) {
-        const embeddingStr = `[${update.embedding.join(",")}]`;
-        await client.query(
-          `
-          UPDATE messages
-          SET embedding = $1::vector
-          WHERE id = $2
-        `,
-          [embeddingStr, update.messageId]
-        );
-      }
-
-      await client.query("COMMIT");
-      return { success: true };
-    } catch (error) {
-      await client.query("ROLLBACK");
-      console.error("🔸 Failed to batch update message embeddings:", error);
       return {
         success: false,
         error: error instanceof Error ? error.message : "Unknown error",

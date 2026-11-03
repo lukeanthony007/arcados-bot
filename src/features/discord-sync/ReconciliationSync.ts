@@ -1,10 +1,6 @@
 import type { Client, Guild, Message } from "discord.js";
-import type { KeywordMessage } from "../social-intelligence/semantic-analysis/types";
-import { KeywordExtractor } from "../social-intelligence/semantic-analysis/KeywordExtractor";
 import { EmbeddingService } from "../social-intelligence/semantic-analysis/EmbeddingService";
-import { RelationshipMapper } from "../social-intelligence/relationship-mapping/RelationshipMapper";
-import type { ConversationDetector } from "../social-intelligence/conversation-detection/ConversationDetector";
-import { parseEmbedding } from "../social-intelligence/conversation-detection/messageUtils";
+import { resegmentChannelHistory } from "../social-intelligence/conversations/store";
 import { EnrichmentPipelineOrchestrator } from "../social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator";
 import { EnrichmentLayer } from "../social-intelligence/enrichment-pipeline/EnrichmentQueue";
 import { config } from "../../config/index.js";
@@ -41,14 +37,10 @@ type BackfilledMessage = {
 export class ReconciliationSync {
   private client: Client;
   private db: PostgreSQLManager;
-  private relationshipMapper: RelationshipMapper;
-  private conversationDetector?: ConversationDetector;
   private coordinator: SyncCoordinator;
   private verbose: boolean;
-  private keywordExtractor: KeywordExtractor;
   private embeddingService: EmbeddingService;
 
-  private readonly KEYWORD_HEAL_SEGMENT_LIMIT = 200;
 
   // Statistics
   private stats = {
@@ -65,18 +57,13 @@ export class ReconciliationSync {
   constructor(
     client: Client,
     db: PostgreSQLManager,
-    relationshipMapper: RelationshipMapper,
-    conversationDetector: ConversationDetector | undefined,
     coordinator: SyncCoordinator,
     verbose: boolean = false
   ) {
     this.client = client;
     this.db = db;
-    this.relationshipMapper = relationshipMapper;
-    this.conversationDetector = conversationDetector;
     this.coordinator = coordinator;
     this.verbose = verbose;
-    this.keywordExtractor = new KeywordExtractor(db);
     this.embeddingService = EmbeddingService.getInstance();
   }
 
@@ -158,7 +145,6 @@ export class ReconciliationSync {
     await this.reconcileMessageEmbeddings(guild);
 
     // 3. Reconcile conversation data
-    await this.reconcileConversationKeywords(guild);
     await this.reconcileConversationEmbeddings(guild);
     await this.reconcileConversationEnrichment(guild);
 
@@ -303,9 +289,6 @@ export class ReconciliationSync {
     channelsBackfilled = results.backfilled;
     channelsWithGaps = results.gapChecks;
 
-    if (this.conversationDetector) {
-      await this.conversationDetector.flushInactiveBuffers(0);
-    }
   }
 
   /**
@@ -607,8 +590,7 @@ export class ReconciliationSync {
           const conversationMessage = this.buildBackfilledMessage(
             msg,
             guildId,
-            channelId,
-            embedding
+            channelId
           );
           if (conversationMessage) {
             backfilledMessages.push(conversationMessage);
@@ -769,8 +751,7 @@ export class ReconciliationSync {
             const conversationMessage = this.buildBackfilledMessage(
               msg,
               guildId,
-              channelId,
-              embedding
+              channelId
             );
             if (conversationMessage) {
               backfilledMessages.push(conversationMessage);
@@ -928,8 +909,7 @@ export class ReconciliationSync {
           const conversationMessage = this.buildBackfilledMessage(
             msg,
             guildId,
-            channelId,
-            embedding
+            channelId
           );
           if (conversationMessage) {
             backfilledMessages.push(conversationMessage);
@@ -984,27 +964,11 @@ export class ReconciliationSync {
   private buildBackfilledMessage(
     msg: Message,
     guildId: string,
-    channelId: string,
-    embedding?: number[]
+    channelId: string
   ): BackfilledMessage | null {
-    if (!this.conversationDetector) {
+    if (msg.author.bot || !msg.content?.trim()) {
       return null;
     }
-
-    if (msg.author.bot) {
-      return null;
-    }
-
-    const trimmedContent = msg.content?.trim();
-    if (!trimmedContent) {
-      return null;
-    }
-
-    const mentionedUsers =
-      msg.mentions?.users && msg.mentions.users.size > 0
-        ? Array.from(msg.mentions.users.keys())
-        : undefined;
-
     return {
       id: msg.id,
       author_id: msg.author.id,
@@ -1013,32 +977,28 @@ export class ReconciliationSync {
       guild_id: guildId,
       channel_id: channelId,
       referenced_message_id: msg.reference?.messageId || undefined,
-      mentioned_user_ids: mentionedUsers,
-      embedding,
     };
   }
 
+  /**
+   * Backfilled messages may be older than the live segmenter's window, so re-segment the
+   * affected channels' history (idempotent; matching conversations keep their summaries)
+   */
   private async streamBackfilledMessages(
     messages: BackfilledMessage[]
   ): Promise<void> {
-    if (!this.conversationDetector || messages.length === 0) {
-      return;
+    const channels = new Map<string, string>();
+    for (const message of messages) {
+      channels.set(message.channel_id, message.guild_id);
     }
-
-    const ordered = [...messages].sort(
-      (a, b) => a.created_at.getTime() - b.created_at.getTime()
-    );
-
-    for (const message of ordered) {
+    for (const [channelId, guildId] of channels) {
       try {
-        await this.conversationDetector.addMessageToStream(message);
+        await resegmentChannelHistory(this.db, guildId, channelId);
       } catch (error) {
-        if (this.verbose) {
-          console.error(
-            `   🔸 ReconciliationSync: Failed to process backfilled message ${message.id} for conversations:`,
-            error
-          );
-        }
+        console.error(
+          `   🔸 ReconciliationSync: Failed to re-segment ${channelId} after backfill:`,
+          error
+        );
       }
     }
   }
@@ -1278,148 +1238,6 @@ export class ReconciliationSync {
   }
 
   /**
-   * Reconcile conversation keywords (backfill missing keywords)
-   */
-  private async reconcileConversationKeywords(guild: Guild): Promise<void> {
-    try {
-      const attemptedSegments = new Set<string>();
-      let totalUpdated = 0;
-      let batchNumber = 0;
-
-      while (true) {
-        const segmentsResult = await this.db.query(
-          `
-					SELECT id, message_ids, features
-					FROM conversation_segments
-					WHERE guild_id = $1
-						AND status = 'finalized'
-						AND (
-							features IS NULL
-							OR NOT (COALESCE(features, '{}'::jsonb) ? 'keywords')
-							OR jsonb_array_length(
-									COALESCE(features->'keywords'->'terms', '[]'::jsonb)
-								) = 0
-						)
-					ORDER BY end_time DESC
-					LIMIT $2
-					`,
-          [guild.id, this.KEYWORD_HEAL_SEGMENT_LIMIT]
-        );
-
-        if (!segmentsResult.success || !segmentsResult.data) {
-          break;
-        }
-
-        const segmentsNeedingKeywords = segmentsResult.data;
-        if (segmentsNeedingKeywords.length === 0) {
-          break;
-        }
-
-        batchNumber++;
-        if (this.verbose) {
-          console.log(
-            `   🧠 ReconciliationSync: [Batch ${batchNumber}] Extracting keywords for ${segmentsNeedingKeywords.length} segments...`
-          );
-        }
-
-        let updatedThisBatch = 0;
-
-        for (const segment of segmentsNeedingKeywords) {
-          if (attemptedSegments.has(segment.id)) {
-            continue;
-          }
-          attemptedSegments.add(segment.id);
-
-          if (
-            !Array.isArray(segment.message_ids) ||
-            segment.message_ids.length === 0
-          ) {
-            continue;
-          }
-
-          const messagesResult = await this.db.query(
-            `
-						SELECT id, content, author_id, embedding
-						FROM messages
-						WHERE id = ANY($1)
-							AND content IS NOT NULL
-							AND LENGTH(TRIM(content)) > 0
-						ORDER BY created_at ASC
-						`,
-            [segment.message_ids]
-          );
-
-          if (
-            !messagesResult.success ||
-            !messagesResult.data ||
-            messagesResult.data.length === 0
-          ) {
-            continue;
-          }
-
-          const keywordMessages: KeywordMessage[] = messagesResult.data.map(
-            (msg: {
-              id: string;
-              content: string;
-              author_id: string;
-              embedding: unknown;
-            }) => ({
-              id: msg.id,
-              content: msg.content,
-              author_id: msg.author_id,
-              embedding: parseEmbedding(msg.embedding),
-            })
-          );
-
-          try {
-            const keywords = await this.keywordExtractor.extractKeywords(
-              keywordMessages,
-              guild.id,
-              { topN: 10, method: "hybrid" }
-            );
-
-            const existingFeaturesRaw = segment.features ?? {};
-            const existingFeatures =
-              typeof existingFeaturesRaw === "string"
-                ? JSON.parse(existingFeaturesRaw)
-                : { ...(existingFeaturesRaw || {}) };
-
-            existingFeatures.keywords = keywords;
-
-            await this.db.query(
-              `UPDATE conversation_segments SET features = $1 WHERE id = $2`,
-              [JSON.stringify(existingFeatures), segment.id]
-            );
-
-            totalUpdated++;
-            updatedThisBatch++;
-          } catch (error) {
-            if (this.verbose) {
-              console.error(
-                `   🔸 ReconciliationSync: Failed to extract keywords for segment ${segment.id}:`,
-                error
-              );
-            }
-          }
-        }
-
-        if (segmentsNeedingKeywords.length < this.KEYWORD_HEAL_SEGMENT_LIMIT) {
-          break;
-        }
-
-        if (updatedThisBatch === 0) {
-          break;
-        }
-      }
-    } catch (error) {
-      console.error(
-        `   🔸 ReconciliationSync: Error reconciling conversation keywords for ${guild.name}:`,
-        error
-      );
-    }
-  }
-
-  /**
    * Reconcile the conversation enrichment backlog.
    *
    * The enrichment queue is in-memory and ConversationDetector only enqueues at
@@ -1561,183 +1379,7 @@ export class ReconciliationSync {
    * Run periodic maintenance tasks
    */
   async runMaintenance(): Promise<void> {
-    await this.updateRollingWindows();
-    await this.consolidateOverlappingSegments();
     await this.reconcileConversationEnrichmentBacklog();
-  }
-
-  /**
-   * Update rolling windows for relationship edges
-   */
-  private async updateRollingWindows(): Promise<void> {
-    const cutoff7d = new Date();
-    cutoff7d.setDate(cutoff7d.getDate() - 7);
-
-    const cutoff30d = new Date();
-    cutoff30d.setDate(cutoff30d.getDate() - 30);
-
-    if (config.guildId) {
-      const targetGuild = this.client.guilds.cache.get(config.guildId);
-      if (targetGuild) {
-        await this.db.updateEdgeRollingWindows(
-          targetGuild.id,
-          cutoff7d,
-          cutoff30d
-        );
-      }
-    } else {
-      for (const [, guild] of this.client.guilds.cache) {
-        await this.db.updateEdgeRollingWindows(guild.id, cutoff7d, cutoff30d);
-      }
-    }
-  }
-
-  /**
-   * Consolidate overlapping segments in the same channel
-   */
-  private async consolidateOverlappingSegments(): Promise<void> {
-    try {
-      const guildsToProcess = config.guildId
-        ? (() => {
-            const guild = this.client.guilds.cache.get(config.guildId!);
-            return guild ? [guild] : [];
-          })()
-        : Array.from(this.client.guilds.cache.values());
-
-      let consolidated = 0;
-
-      for (const guild of guildsToProcess) {
-        const segmentsResult = await this.db.query(
-          `SELECT id, channel_id, participants, start_time, end_time, message_ids, message_count
-					 FROM conversation_segments
-					 WHERE guild_id = $1
-					 ORDER BY channel_id, start_time ASC`,
-          [guild.id]
-        );
-
-        if (!segmentsResult.success || !segmentsResult.data) continue;
-
-        const segments = segmentsResult.data;
-        const processed = new Set<string>();
-        const toDelete = new Set<string>();
-
-        for (let i = 0; i < segments.length; i++) {
-          const seg1 = segments[i];
-          if (processed.has(seg1.id) || toDelete.has(seg1.id)) continue;
-
-          const seg1Participants = Array.isArray(seg1.participants)
-            ? new Set(seg1.participants)
-            : new Set();
-
-          const seg1Start = new Date(seg1.start_time).getTime();
-          const seg1End = new Date(seg1.end_time).getTime();
-          const mergeWindow = 30 * 60 * 1000; // 30 minutes
-
-          const toMerge: any[] = [seg1];
-
-          for (let j = i + 1; j < segments.length; j++) {
-            const seg2 = segments[j];
-            if (seg1.channel_id !== seg2.channel_id) break;
-
-            if (processed.has(seg2.id) || toDelete.has(seg2.id)) continue;
-
-            const seg2Start = new Date(seg2.start_time).getTime();
-            const seg2End = new Date(seg2.end_time).getTime();
-
-            const timeGap = Math.min(
-              Math.abs(seg2Start - seg1End),
-              Math.abs(seg2End - seg1Start)
-            );
-
-            if (timeGap > mergeWindow) continue;
-
-            const seg2Participants = Array.isArray(seg2.participants)
-              ? new Set(seg2.participants)
-              : new Set();
-
-            const hasOverlap = Array.from(seg1Participants).some((p) =>
-              seg2Participants.has(p)
-            );
-
-            if (hasOverlap) {
-              toMerge.push(seg2);
-            }
-          }
-
-          if (toMerge.length > 1) {
-            const allParticipants = new Set<string>();
-            const allMessageIds = new Set<string>();
-            let earliestStart = Infinity;
-            let latestEnd = -Infinity;
-
-            for (const seg of toMerge) {
-              const participants = Array.isArray(seg.participants)
-                ? seg.participants
-                : [];
-              participants.forEach((p: string) => allParticipants.add(p));
-
-              const msgIds = Array.isArray(seg.message_ids)
-                ? seg.message_ids
-                : [];
-              msgIds.forEach((id: string) => allMessageIds.add(id));
-
-              const start = new Date(seg.start_time).getTime();
-              const end = new Date(seg.end_time).getTime();
-              earliestStart = Math.min(earliestStart, start);
-              latestEnd = Math.max(latestEnd, end);
-            }
-
-            const mergedParticipants = Array.from(allParticipants).sort();
-            const mergedMessageIds = Array.from(allMessageIds);
-            const keepId = toMerge[0].id;
-
-            await this.db.query(
-              `UPDATE conversation_segments
-							 SET participants = $1::TEXT[],
-									 message_ids = $2::TEXT[],
-									 message_count = $3,
-									 start_time = $4,
-									 end_time = $5
-							 WHERE id = $6`,
-              [
-                mergedParticipants,
-                mergedMessageIds,
-                mergedMessageIds.length,
-                new Date(earliestStart),
-                new Date(latestEnd),
-                keepId,
-              ]
-            );
-
-            for (let k = 1; k < toMerge.length; k++) {
-              toDelete.add(toMerge[k].id);
-              processed.add(toMerge[k].id);
-            }
-
-            consolidated += toMerge.length - 1;
-            processed.add(keepId);
-          } else {
-            processed.add(seg1.id);
-          }
-        }
-
-        if (toDelete.size > 0) {
-          const deleteIds = Array.from(toDelete);
-          await this.db.query(
-            `DELETE FROM conversation_segments WHERE id = ANY($1::TEXT[])`,
-            [deleteIds]
-          );
-        }
-      }
-
-      if (consolidated > 0 && this.verbose) {
-        console.log(
-          `🔹 ReconciliationSync: Consolidated ${consolidated} overlapping segments`
-        );
-      }
-    } catch (error) {
-      // Silent failure - consolidation is optional
-    }
   }
 
   /**

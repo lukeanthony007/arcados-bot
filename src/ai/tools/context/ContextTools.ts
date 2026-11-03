@@ -122,23 +122,15 @@ export const getRecentGuildMessagesTool: DatabaseTool = {
 };
 
 /**
- * Fetch recent active user-to-user conversations within a window
+ * What is going on right now: active conversations across the guild
  */
 export const getActiveConversationsTool: DatabaseTool = {
   name: "getActiveConversations",
   description:
-    "Get recent active user-to-user conversations based on relationship edges and recent messages, optionally scoped to a channel.",
+    "Get what is going on in the server right now: conversations still in progress (channel, who is talking, last message time, opening lines). If nothing is active, returns the most recent conversations from the last 2 hours. Optionally scoped to a channel.",
   parameters: {
     type: "object",
     properties: {
-      lookbackHours: {
-        type: "number",
-        description: "Hours to look back from now (default: 72)",
-      },
-      lookbackDays: {
-        type: "number",
-        description: "Days to look back from now (alternative to hours)",
-      },
       channelId: {
         type: "string",
         description: "Optional channel to scope conversations",
@@ -149,15 +141,13 @@ export const getActiveConversationsTool: DatabaseTool = {
       },
       sampleMessages: {
         type: "number",
-        description: "Number of sample messages per conversation (default: 5)",
+        description: "Number of opening messages to show per conversation (default: 5)",
       },
     },
     required: [],
   },
   execute: async (
     params: {
-      lookbackHours?: number;
-      lookbackDays?: number;
       channelId?: string;
       limit?: number;
       sampleMessages?: number;
@@ -165,146 +155,153 @@ export const getActiveConversationsTool: DatabaseTool = {
     context: ToolContext
   ): Promise<string | DatabaseToolResult> => {
     try {
-      const hours = params.lookbackDays
-        ? params.lookbackDays * 24
-        : params.lookbackHours || 72;
-      const since = new Date(Date.now() - hours * 60 * 60 * 1000);
       const limit = Math.max(1, Math.min(params.limit || 10, 25));
       const samples = Math.max(1, Math.min(params.sampleMessages || 5, 10));
+      const channelFilter = params.channelId ? "AND cs.channel_id = $3" : "";
+      const baseParams: unknown[] = [context.guildId, limit];
+      if (params.channelId) baseParams.push(params.channelId);
 
-      // Find recent edges (active pairs) in the window
-      const edgesResult = await context.db.query(
-        `SELECT user_a, user_b, last_interaction, rolling_7d, total
-         FROM relationship_edges
-         WHERE guild_id = $1 AND last_interaction >= $2
-         ORDER BY rolling_7d DESC, total DESC
-         LIMIT $3`,
-        [context.guildId, since, limit * 3]
+      interface Row {
+        id: string;
+        channel_id: string;
+        channel_name: string | null;
+        participants: string[];
+        message_ids: string[] | null;
+        message_count: number;
+        start_time: Date;
+        end_time: Date;
+        topic_label: string | null;
+        summary: string | null;
+        status: string;
+      }
+      const select = `SELECT cs.id, cs.channel_id, c.name AS channel_name, cs.participants,
+                cs.message_ids, cs.message_count, cs.start_time, cs.end_time,
+                cs.topic_label, cs.summary, cs.status
+         FROM conversation_segments cs
+         LEFT JOIN channels c ON c.id = cs.channel_id AND c.guild_id = cs.guild_id`;
+
+      let rows: Row[] = [];
+      let mode: "active" | "recent" = "active";
+      const activeResult = await context.db.query(
+        `${select}
+         WHERE cs.guild_id = $1 AND cs.status = 'active' ${channelFilter}
+         ORDER BY cs.end_time DESC
+         LIMIT $2`,
+        baseParams
       );
+      if (activeResult.success && activeResult.data) rows = activeResult.data;
 
-      if (!edgesResult.success || !edgesResult.data || edgesResult.data.length === 0) {
+      if (rows.length === 0) {
+        mode = "recent";
+        const since = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const recentParams = [...baseParams, since];
+        const sinceIdx = recentParams.length;
+        const recentResult = await context.db.query(
+          `${select}
+           WHERE cs.guild_id = $1 AND cs.status = 'finalized' AND cs.end_time >= $${sinceIdx} ${channelFilter}
+           ORDER BY cs.end_time DESC
+           LIMIT $2`,
+          recentParams
+        );
+        if (recentResult.success && recentResult.data) rows = recentResult.data;
+      }
+
+      if (rows.length === 0) {
         return {
           success: true,
-          summary: `No active conversations in the last ${hours}h`,
-          data: { formatted: "No recent conversations", conversations: [], count: 0 },
+          summary: "Nothing is going on right now",
+          data: {
+            formatted: "No active conversations, and none in the last 2 hours.",
+            conversations: [],
+            count: 0,
+          },
         };
       }
 
-      const candidatePairs: Array<{ a: string; b: string }> = [];
-      const seen = new Set<string>();
-      for (const row of edgesResult.data) {
-        const a = row.user_a as string;
-        const b = row.user_b as string;
-        const key = a < b ? `${a}:${b}` : `${b}:${a}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          candidatePairs.push({ a, b });
-        }
-        if (candidatePairs.length >= limit) break;
+      const firstIds = rows.flatMap((r) => (r.message_ids ?? []).slice(0, samples));
+      const messagesResult =
+        firstIds.length > 0
+          ? await context.db.query(
+              `SELECT id, author_id, content, created_at
+               FROM messages
+               WHERE id = ANY($1::text[]) AND guild_id = $2 AND active = true
+               ORDER BY created_at ASC`,
+              [firstIds, context.guildId]
+            )
+          : null;
+      const messageById = new Map<
+        string,
+        { id: string; author_id: string; content: string | null; created_at: Date }
+      >();
+      if (messagesResult?.success && messagesResult.data) {
+        for (const m of messagesResult.data) messageById.set(m.id, m);
       }
 
-      if (candidatePairs.length === 0) {
-        return {
-          success: true,
-          summary: `No active conversations in the last ${hours}h`,
-          data: { formatted: "No recent conversations", conversations: [], count: 0 },
-        };
-      }
-
-      // Resolve names for users
-      const userIds = Array.from(
-        new Set(candidatePairs.flatMap((p) => [p.a, p.b]))
-      );
+      const userIds = [
+        ...new Set([
+          ...rows.flatMap((r) => r.participants),
+          ...[...messageById.values()].map((m) => m.author_id),
+        ]),
+      ];
       const namesResult = await context.db.query(
-        `SELECT user_id, display_name, username
+        `SELECT user_id, COALESCE(nick, display_name, global_name, username) AS name
          FROM members
-         WHERE guild_id = $1 AND active = true AND user_id = ANY($2::text[])`,
+         WHERE guild_id = $1 AND user_id = ANY($2::text[])`,
         [context.guildId, userIds]
       );
       const nameMap = new Map<string, string>();
       if (namesResult.success && namesResult.data) {
-        for (const r of namesResult.data) {
-          nameMap.set(r.user_id, r.display_name || r.username || r.user_id);
-        }
+        for (const r of namesResult.data) nameMap.set(r.user_id, r.name);
       }
 
-      const conversations: Array<{
-        users: { a: string; b: string; aName: string; bName: string };
-        samples: Array<{ when: string; channel: string; author: string; content: string }>;
-      }> = [];
+      const conversations = rows.map((r) => ({
+        id: r.id,
+        channel: r.channel_name || r.channel_id,
+        participants: r.participants.map((id) => nameMap.get(id) ?? id),
+        messageCount: r.message_count,
+        startedAt: r.start_time,
+        lastMessageAt: r.end_time,
+        ongoing: r.status === "active",
+        topic: r.topic_label,
+        summary: r.summary,
+        openingLines: (r.message_ids ?? [])
+          .slice(0, samples)
+          .map((id) => messageById.get(id))
+          .filter((m): m is NonNullable<typeof m> => m !== undefined)
+          .map((m) => {
+            const content = (m.content || "(no content)").replace(/\s+/g, " ").trim();
+            const snippet = content.length > 160 ? `${content.substring(0, 160)}...` : content;
+            return `[${new Date(m.created_at).toLocaleTimeString()}] ${
+              nameMap.get(m.author_id) ?? m.author_id
+            }: ${snippet}`;
+          }),
+      }));
 
-      for (const pair of candidatePairs) {
-        const between = await context.db.getMessagesBetweenUsers(
-          pair.a,
-          pair.b,
-          context.guildId
-        );
-        if (!between.success || !between.data) continue;
-
-        // Filter to window and optional channel, take last N chronologically
-        const filtered = (between.data as any[])
-          .filter((m) => new Date(m.created_at) >= since)
-          .filter((m) => (params.channelId ? m.channel_id === params.channelId : true))
-          .slice(-samples);
-
-        if (filtered.length === 0) continue;
-
-        // Resolve channel names in bulk per pair
-        const chIds = Array.from(new Set(filtered.map((m) => m.channel_id)));
-        const channelsResult = await context.db.query(
-          `SELECT id, name FROM channels WHERE guild_id = $1 AND id = ANY($2::text[])`,
-          [context.guildId, chIds]
-        );
-        const channelMap = new Map<string, string>();
-        if (channelsResult.success && channelsResult.data) {
-          for (const c of channelsResult.data) channelMap.set(c.id, c.name);
-        }
-
-        const aName = nameMap.get(pair.a) || pair.a;
-        const bName = nameMap.get(pair.b) || pair.b;
-
-        const samplesFmt = filtered.map((m) => {
-          const when = new Date(m.created_at).toLocaleString();
-          const channel = channelMap.get(m.channel_id) || m.channel_id;
-          const author = m.author_id === pair.a ? aName : m.author_id === pair.b ? bName : m.author_id;
-          const content = (m.content || "(no content)").replace(/\s+/g, " ").trim();
-          const snippet = content.length > 160 ? `${content.substring(0, 160)}...` : content;
-          return { when, channel, author, content: snippet };
-        });
-
-        conversations.push({
-          users: { a: pair.a, b: pair.b, aName, bName },
-          samples: samplesFmt,
-        });
-
-        if (conversations.length >= limit) break;
-      }
-
-      if (conversations.length === 0) {
-        return {
-          success: true,
-          summary: `No recent conversations found in the last ${hours}h`,
-          data: { formatted: "No recent conversations", conversations: [], count: 0 },
-        };
-      }
-
-      const formatted = conversations
-        .map((c) => {
-          const header = `${c.users.aName} ↔ ${c.users.bName}`;
-          const lines = c.samples.map(
-            (s) => `[${s.when}] #${s.channel} — ${s.author}: ${s.content}`
-          );
-          return `${header}\n${lines.join("\n")}`;
-        })
-        .join("\n\n");
+      const header =
+        mode === "active"
+          ? "Conversations happening right now:"
+          : "Nothing active right now. Most recent conversations (last 2 hours):";
+      const formatted = [
+        header,
+        ...conversations.map((c) => {
+          const lines = [
+            `#${c.channel}: ${c.participants.join(", ")} (${c.messageCount} messages, last message ${new Date(
+              c.lastMessageAt
+            ).toLocaleTimeString()})${c.topic ? ` — ${c.topic}` : ""}`,
+          ];
+          if (c.summary) lines.push(`  Summary: ${c.summary}`);
+          lines.push(...c.openingLines.map((l) => `  ${l}`));
+          return lines.join("\n");
+        }),
+      ].join("\n\n");
 
       return {
         success: true,
-        summary: `Found ${conversations.length} recent conversation(s) over ~${hours}h`,
-        data: { formatted, conversations, count: conversations.length },
+        summary: `${conversations.length} ${mode === "active" ? "active" : "recent"} conversation(s)`,
+        data: { formatted, conversations, count: conversations.length, mode },
       };
     } catch (error) {
-      console.error("🔸 Error in getRecentConversations:", error);
+      console.error("🔸 Error in getActiveConversations:", error);
       return {
         success: false,
         error:
@@ -428,7 +425,7 @@ export const getHolisticUserContextTool: DatabaseTool = {
 
       // Get recent conversation topics/keywords from conversation_segments
       const conversationSegmentsResult = await context.db.query(
-        `SELECT cs.id, cs.channel_id, cs.start_time, cs.end_time, cs.summary, cs.features, c.name as channel_name
+        `SELECT cs.id, cs.channel_id, cs.start_time, cs.end_time, cs.summary, cs.topic_label, c.name as channel_name
          FROM conversation_segments cs
          LEFT JOIN channels c ON cs.channel_id = c.id AND cs.guild_id = c.guild_id
          WHERE cs.guild_id = $1
@@ -450,25 +447,10 @@ export const getHolisticUserContextTool: DatabaseTool = {
           const channel = seg.channel_name || seg.channel_id;
           const date = new Date(seg.start_time).toLocaleDateString();
 
-          // Extract keywords from features.terms if available
-          let keywords: string[] = [];
-          if (seg.features && typeof seg.features === 'object') {
-            const featuresObj = seg.features as any;
-
-            // Check for both 'keywords' (old format) and 'terms' (new format)
-            if (Array.isArray(featuresObj.keywords)) {
-              keywords = featuresObj.keywords.slice(0, 5);
-            } else if (Array.isArray(featuresObj.terms)) {
-              // Extract words from terms array
-              keywords = featuresObj.terms
-                .slice(0, 5)
-                .map((term: any) => term.word)
-                .filter(Boolean);
-            }
-          }
-
-          const summary = seg.summary || (keywords.length > 0 ? keywords.join(", ") : "discussion");
-          topicsLines.push(`  • #${channel} (${date}): ${summary}`);
+          const summary = seg.summary || "discussion";
+          topicsLines.push(
+            `  • #${channel} (${date})${seg.topic_label ? ` [${seg.topic_label}]` : ""}: ${summary}`
+          );
         }
 
         if (topicsLines.length > 0) {

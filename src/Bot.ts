@@ -11,7 +11,7 @@ import type { Interaction, VoiceState, VoiceChannel } from "discord.js";
 import { config } from "./config";
 import type { Command } from "./types";
 import { CommandDeployer } from "./utils/CommandDeployer";
-import { ConversationWorkflowManager } from "./features/social-intelligence";
+import { ConversationSegmenter } from "./features/social-intelligence/conversations/ConversationSegmenter";
 import { MessageHandler } from "./handlers/chat";
 import { VoiceAssistantManager } from "./handlers/voice/VoiceAssistantManager";
 import { MediaPlayerManager } from "./features/media-player/MediaPlayerManager";
@@ -29,7 +29,7 @@ export class Bot {
   private db: PostgreSQLManager;
 
   // Feature coordinators
-  private conversationWorkflow?: ConversationWorkflowManager;
+  private conversationSegmenter?: ConversationSegmenter;
   private messageHandler?: MessageHandler;
   private commandDeployer?: CommandDeployer;
   private voiceAssistant?: VoiceAssistantManager;
@@ -198,16 +198,9 @@ export class Bot {
    * Initialize all feature services
    */
   private async initializeFeatures(): Promise<void> {
-    // Initialize conversation detection workflow
-    this.conversationWorkflow = new ConversationWorkflowManager(
-      this.client,
-      this.db,
-      {
-        guildId: config.guildId,
-        verbose: false,
-      }
-    );
-    await this.conversationWorkflow.start();
+    // Keep conversation_segments current from stored messages (no in-memory state)
+    this.conversationSegmenter = new ConversationSegmenter(this.db);
+    this.conversationSegmenter.start();
 
     // Initialize message handler
     this.messageHandler = new MessageHandler(this.client, this.db);
@@ -238,13 +231,7 @@ export class Bot {
 
     // Initialize state sync service
     // Handles real-time Discord state synchronization
-    this.stateSyncService = new StateSyncService(
-      this.client,
-      this.db,
-      this.conversationWorkflow.getRelationshipMapper()!,
-      this.conversationWorkflow.getConversationDetector()!,
-      false // Set to true for verbose logging
-    );
+    this.stateSyncService = new StateSyncService(this.client, this.db, false);
     await this.stateSyncService.start();
   }
 
@@ -429,9 +416,9 @@ export class Bot {
       await this.stateSyncService.stop();
     }
 
-    // Stop conversation workflow (handles conversation finalization + cleanup)
-    if (this.conversationWorkflow) {
-      await this.conversationWorkflow.stop();
+    // Stop segmentation (runs one last pass so open conversations are stored)
+    if (this.conversationSegmenter) {
+      await this.conversationSegmenter.stop();
     }
 
     // Shutdown stream player

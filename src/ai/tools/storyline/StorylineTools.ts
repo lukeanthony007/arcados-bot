@@ -46,7 +46,7 @@ export const getStorylineAggregation: DatabaseTool = {
           start_time,
           end_time,
           message_count,
-          features,
+          topic_label,
           summary,
           message_ids,
           status
@@ -127,77 +127,26 @@ export const getStorylineAggregation: DatabaseTool = {
 				}>
 			>();
 
-			// Simple keyword-based thematic clustering
-			// Extract keywords from summaries and features
+			// Cluster by the summarizer's topic label; segments without one fall back to the
+			// opening words of their summary
 			for (const seg of segments) {
-				const summary = (seg.summary || "").toLowerCase();
+				const summary = (seg.summary || "").trim();
 				const channelName = channelMap.get(seg.channel_id) || seg.channel_id;
 				const participantNames = (seg.participants || [])
 					.map((pid: string) => participantNameMap.get(pid) || pid)
 					.filter((name: string) => name !== "Unknown");
 
-				// Extract theme from summary or features
-				let theme = "general-chat";
-
-				// Check for common themes in summary
-				if (summary) {
-					if (
-						summary.includes("game") ||
-						summary.includes("playing") ||
-						summary.includes("match")
-					) {
-						theme = "gaming";
-					} else if (
-						summary.includes("help") ||
-						summary.includes("question") ||
-						summary.includes("how to")
-					) {
-						theme = "help-support";
-					} else if (
-						summary.includes("drama") ||
-						summary.includes("argument") ||
-						summary.includes("disagree")
-					) {
-						theme = "conflict-drama";
-					} else if (
-						summary.includes("meme") ||
-						summary.includes("funny") ||
-						summary.includes("lol") ||
-						summary.includes("joke")
-					) {
-						theme = "humor-memes";
-					} else if (
-						summary.includes("plan") ||
-						summary.includes("organize") ||
-						summary.includes("event")
-					) {
-						theme = "planning-events";
-					} else if (
-						summary.includes("tech") ||
-						summary.includes("code") ||
-						summary.includes("programming")
-					) {
-						theme = "tech-discussion";
-					} else if (summary.length > 20) {
-						// If we have a meaningful summary but no clear theme, create a theme from first few words
-						const words = summary
-							.split(/\s+/)
-							.filter((w: string) => w.length > 3)
-							.slice(0, 3);
-						if (words.length > 0) {
-							theme = words.join("-");
-						}
-					}
+				const label = typeof seg.topic_label === "string" ? seg.topic_label.trim().toLowerCase() : "";
+				let theme = label;
+				if (!theme && summary.length > 20) {
+					theme = summary
+						.toLowerCase()
+						.split(/\s+/)
+						.filter((w: string) => w.length > 3)
+						.slice(0, 3)
+						.join(" ");
 				}
-
-				// Check features for additional context
-				const interactionTypes = seg.features?.interaction_types || [];
-				if (interactionTypes.includes("mentions") && participantNames.length > 3) {
-					theme = "group-discussion";
-				}
-				if (interactionTypes.includes("reactions")) {
-					theme = theme === "general-chat" ? "reactive-chat" : theme;
-				}
+				if (!theme) theme = "unlabeled";
 
 				// Group by theme
 				if (!themeClusters.has(theme)) {

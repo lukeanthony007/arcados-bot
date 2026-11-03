@@ -408,7 +408,7 @@ export class JellyfinProvider extends BaseProvider {
 						}
 						throw error;
 					});
-				};
+				} as typeof window.fetch;
 			});
 		} catch (error) {
 			console.warn("[JellyfinProvider] Failed to set up error monitoring:", error);

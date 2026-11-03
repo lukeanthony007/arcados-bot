@@ -227,7 +227,7 @@ export const getUserInfoTool: DatabaseTool = {
       since.setDate(since.getDate() - 60);
       
       const conversationSegmentsResult = await context.db.query(
-        `SELECT cs.id, cs.channel_id, cs.start_time, cs.end_time, cs.summary, cs.message_ids, cs.features, cs.message_count, c.name as channel_name
+        `SELECT cs.id, cs.channel_id, cs.start_time, cs.end_time, cs.summary, cs.message_ids, cs.topic_label, cs.message_count, c.name as channel_name
          FROM conversation_segments cs
          LEFT JOIN channels c ON cs.channel_id = c.id AND cs.guild_id = c.guild_id
          WHERE cs.guild_id = $1
@@ -285,64 +285,8 @@ export const getUserInfoTool: DatabaseTool = {
             });
           }
           
-          // Extract keywords from features for topic context
-          let featuresObj: any = null;
-          if (seg.features) {
-            if (typeof seg.features === 'string') {
-              try {
-                featuresObj = JSON.parse(seg.features);
-              } catch {
-                featuresObj = null;
-              }
-            } else if (typeof seg.features === 'object') {
-              featuresObj = seg.features;
-            }
-          }
-          
-          if (featuresObj) {
-            let keywords: string[] = [];
-            
-            if (featuresObj.keywords && typeof featuresObj.keywords === 'object' && !Array.isArray(featuresObj.keywords)) {
-              if (Array.isArray(featuresObj.keywords.terms)) {
-                keywords = featuresObj.keywords.terms
-                  .map((term: any) => {
-                    if (typeof term === 'string') return term;
-                    if (term && typeof term === 'object' && term.word) return term.word;
-                    return null;
-                  })
-                  .filter(Boolean)
-                  .slice(0, 15);
-              }
-            } else if (Array.isArray(featuresObj.keywords)) {
-              keywords = featuresObj.keywords
-                .map((kw: any) => {
-                  if (typeof kw === 'string') return kw;
-                  if (kw && typeof kw === 'object' && kw.word) return kw.word;
-                  return null;
-                })
-                .filter(Boolean)
-                .slice(0, 15);
-            } else if (Array.isArray(featuresObj.terms)) {
-              keywords = featuresObj.terms
-                .map((term: any) => {
-                  if (typeof term === 'string') return term;
-                  if (term && typeof term === 'object') {
-                    return term.word || term.term || term.text || null;
-                  }
-                  return null;
-                })
-                .filter(Boolean)
-                .slice(0, 15);
-            }
-            
-            keywords.forEach(kw => {
-              if (kw && typeof kw === 'string' && kw.length > 2) {
-                const normalized = kw.toLowerCase().trim();
-                if (normalized.length > 2) {
-                  recentTopics.add(normalized);
-                }
-              }
-            });
+          if (seg.topic_label && seg.topic_label.trim().length > 2) {
+            recentTopics.add(seg.topic_label.trim().toLowerCase());
           }
         }
       }
@@ -428,17 +372,9 @@ export const getUserInfoTool: DatabaseTool = {
         }
       }
       
-      // Also add conversation topics if we found any (as additional context)
-      if (recentTopics.size > 0 && interestParts.length === 0) {
-        const topicArray = Array.from(recentTopics)
-          .filter(t => {
-            const commonWords = ['the', 'and', 'or', 'but', 'for', 'with', 'about', 'this', 'that', 'has', 'have', 'was', 'were', 'are', 'is', 'been'];
-            return !commonWords.includes(t) && t.length > 2;
-          })
-          .slice(0, 10);
-        if (topicArray.length > 0) {
-          narrativeParts.push(`\nRecently discussed: ${topicArray.join(", ")}`);
-        }
+      // Recent conversation topics (short labels written by the summarizer)
+      if (recentTopics.size > 0) {
+        narrativeParts.push(`\nRecently discussed: ${Array.from(recentTopics).slice(0, 8).join(", ")}`);
       }
 
       // Who they interact with (closeness is computed from replies, mentions and shared conversations)
