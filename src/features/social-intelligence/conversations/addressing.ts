@@ -26,44 +26,63 @@ export interface InferredTurn {
 	turns: number;
 }
 
+/** One message's addressee: explicit (reply/mention), inferred, or none (to the room) */
+export interface AddressedMessage {
+	id: string;
+	from: string;
+	to: string | null;
+	explicit: boolean;
+	created_at: Date;
+}
+
 /** Messages must be one conversation's, in time order */
-export function inferTurns(messages: AddressableMessage[]): InferredTurn[] {
+export function addressMessages(messages: AddressableMessage[]): AddressedMessage[] {
 	const participants = [...new Set(messages.map((m) => m.author_id))];
 	const authorOf = new Map(messages.map((m) => [m.id, m.author_id]));
-	const counts = new Map<string, number>();
 	const lastTarget = new Map<string, string>();
+	const out: AddressedMessage[] = [];
 	let previous: AddressableMessage | undefined;
 
 	for (const message of messages) {
 		let target: string | undefined;
-		const explicit =
-			(message.referenced_message_id &&
-				authorOf.get(message.referenced_message_id)) ||
+		let explicit = false;
+		const named =
+			(message.referenced_message_id && authorOf.get(message.referenced_message_id)) ||
 			message.mentions[0];
-		if (explicit && explicit !== message.author_id) {
-			// Explicit: remember it for continuations, but don't count it (closeness already does)
-			lastTarget.set(message.author_id, explicit);
+		if (named && named !== message.author_id) {
+			target = named;
+			explicit = true;
 		} else if (participants.length === 2) {
 			target = participants.find((p) => p !== message.author_id);
 		} else if (previous && previous.author_id !== message.author_id) {
-			if (
-				message.created_at.getTime() - previous.created_at.getTime() <=
-				TURN_GAP_MS
-			) {
+			if (message.created_at.getTime() - previous.created_at.getTime() <= TURN_GAP_MS) {
 				target = previous.author_id;
 			}
 		} else if (previous && previous.author_id === message.author_id) {
 			target = lastTarget.get(message.author_id);
 		}
-
-		if (target && target !== message.author_id) {
-			lastTarget.set(message.author_id, target);
-			const key = `${message.author_id}\u0000${target}`;
-			counts.set(key, (counts.get(key) ?? 0) + 1);
-		}
+		if (target === message.author_id) target = undefined;
+		if (target) lastTarget.set(message.author_id, target);
+		out.push({
+			id: message.id,
+			from: message.author_id,
+			to: target ?? null,
+			explicit,
+			created_at: message.created_at,
+		});
 		previous = message;
 	}
+	return out;
+}
 
+/** Inferred (non-explicit) addressed turns per direction; explicit ones closeness counts from messages */
+export function inferTurns(messages: AddressableMessage[]): InferredTurn[] {
+	const counts = new Map<string, number>();
+	for (const m of addressMessages(messages)) {
+		if (!m.to || m.explicit) continue;
+		const key = `${m.from}\u0000${m.to}`;
+		counts.set(key, (counts.get(key) ?? 0) + 1);
+	}
 	return [...counts].map(([key, turns]) => {
 		const [from, to] = key.split("\u0000") as [string, string];
 		return { from, to, turns };
