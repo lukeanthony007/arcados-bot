@@ -5,7 +5,8 @@
  * the transcript:
  *
  *   for each conversation   transcript · summary · topic · dynamics (note, roles, exchanges)
- *   for the day             who addressed whom (rule turns + model exchanges with tones),
+ *   for the day             who focused on whom (attention matrix with returned mass), bids per
+ *                           person, structures per person, model exchanges with tones,
  *                           roles per person, loose messages
  *
  *   bun run rnd:day 2025-10-15                # busiest channel, grouping only (free)
@@ -19,11 +20,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { config } from "../../../config/index.js";
 import { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { SLUR_PATTERN } from "../../user-personas/personaPrompt";
-import { inferTurns } from "../conversations/addressing";
+import { attributeAttention, focusMap } from "../conversations/attention";
 import {
 	type ConversationDynamics,
 	toStoredDynamics,
 } from "../conversations/dynamics";
+import { describeFocus, describeStructure } from "../conversations/focusText";
+import { loadAffinityPrior } from "../conversations/prior";
 import {
 	type Segment,
 	type SegmentMessage,
@@ -139,7 +142,15 @@ async function main() {
 		`${dayMessages.length} messages · ${conversations.length} conversations in ${new Set(conversations.map((s) => s.session_id)).size} sessions · ${dayMessages.filter((m) => !covered.has(m.id)).length} loose${useModel ? " · summarizer run" : ""}`,
 		"",
 	];
-	const turnTotals = new Map<string, number>();
+	const lastOfDay = dayMessages[dayMessages.length - 1]?.created_at;
+	const prior = await loadAffinityPrior(
+		db,
+		guildId,
+		lastOfDay ? new Date(lastOfDay.getTime() + 60_000) : new Date(),
+	);
+	const focusTotals = new Map<string, number>();
+	const bidTotals = new Map<string, { made: number; answered: number }>();
+	const structuresByPerson = new Map<string, string[]>();
 	const modelExchanges: Array<{
 		conv: Segment;
 		from: string;
@@ -196,14 +207,39 @@ async function main() {
 		}
 		out.push("");
 
-		const turns = inferTurns(conv.messages);
-		for (const t of turns)
-			turnTotals.set(
-				`${t.from}>${t.to}`,
-				(turnTotals.get(`${t.from}>${t.to}`) ?? 0) + t.turns,
-			);
+		const attention = attributeAttention(conv.messages, prior);
+		const focus = focusMap(conv.messages, attention);
+		for (const [from, row] of Object.entries(focus.matrix))
+			for (const [to, mass] of Object.entries(row))
+				focusTotals.set(
+					`${from}>${to}`,
+					(focusTotals.get(`${from}>${to}`) ?? 0) + mass,
+				);
+		for (const bid of focus.bids) {
+			if (!bid.to) continue;
+			const t = bidTotals.get(bid.from) ?? { made: 0, answered: 0 };
+			t.made++;
+			if (bid.answered_by) t.answered++;
+			bidTotals.set(bid.from, t);
+		}
+		for (const s of focus.structures) {
+			const people =
+				s.kind === "pair"
+					? [s.a, s.b]
+					: s.kind === "pursuit"
+						? [s.from, s.to]
+						: [s.user];
+			for (const id of people) {
+				const list = structuresByPerson.get(id) ?? [];
+				list.push(`E${episodeNumber}: ${describeStructure(s, nameOf)}`);
+				structuresByPerson.set(id, list);
+			}
+		}
+		const focusLines = describeFocus(focus, nameOf);
 		out.push(
-			`**Inferred turns:** ${turns.map((t) => `${nameOf(t.from)}→${nameOf(t.to)} ${t.turns}`).join(", ") || "none"}`,
+			"**Focus:**",
+			"",
+			...(focusLines.length ? focusLines.map((l) => `- ${l}`) : ["- none"]),
 			"",
 		);
 
@@ -220,7 +256,12 @@ async function main() {
 			const cacheKey = `${conv.id}:${conv.messages.length}`;
 			const generated =
 				cache.get(cacheKey) ??
-				(await pipeline.describe(previews, names, conv.participants.length));
+				(await pipeline.describe(
+					previews,
+					names,
+					conv.participants.length,
+					focusLines,
+				));
 			if (generated) cache.set(cacheKey, generated);
 			if (!generated) {
 				out.push("**Summarizer:** failed", "");
@@ -263,7 +304,7 @@ async function main() {
 			);
 			for (const x of d.exchanges) {
 				out.push(
-					`- ${nameOf(x.from)} → ${nameOf(x.to)} [${x.tone}]: ${clean(x.note)}`,
+					`- ${nameOf(x.from)} → ${nameOf(x.to)} [${x.tone}/${x.valence}]: ${clean(x.note)}`,
 				);
 				modelExchanges.push({
 					conv,
@@ -335,13 +376,27 @@ async function main() {
 			JSON.stringify(Object.fromEntries(cache), null, 1),
 		);
 	out.push("## Day map", "");
-	out.push("### Who addressed whom (inferred turns, all conversations)", "");
-	for (const [key, n] of [...turnTotals]
+	out.push("### Who focused on whom (attention mass, all conversations)", "");
+	for (const [key, mass] of [...focusTotals]
 		.sort((a, b) => b[1] - a[1])
 		.slice(0, 25)) {
 		const [from, to] = key.split(">") as [string, string];
-		out.push(`- ${nameOf(from)} → ${nameOf(to)}: ${n}`);
+		const returned = focusTotals.get(`${to}>${from}`) ?? 0;
+		out.push(
+			`- ${nameOf(from)} → ${nameOf(to)}: ${mass.toFixed(1)} (returned ${returned.toFixed(1)})`,
+		);
 	}
+	out.push("", "### Bids (to a person: made / answered)", "");
+	for (const [id, b] of [...bidTotals].sort((a, b) => b[1].made - a[1].made))
+		out.push(`- ${nameOf(id)}: ${b.made} / ${b.answered}`);
+	if (!bidTotals.size) out.push("- none");
+	out.push("", "### Structures by person", "");
+	for (const [id, lines] of [...structuresByPerson].sort(
+		(a, b) => b[1].length - a[1].length,
+	)) {
+		out.push(`- ${nameOf(id)}`, ...lines.map((l) => `    - ${l}`));
+	}
+	if (!structuresByPerson.size) out.push("- none");
 	if (useModel) {
 		out.push("", "### How they treated each other (summarizer exchanges)", "");
 		const byPair = new Map<string, Map<string, number>>();

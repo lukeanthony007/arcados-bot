@@ -481,8 +481,8 @@ export class PostgreSQLManager {
 				ADD COLUMN IF NOT EXISTS session_id VARCHAR(50)
 			`);
 
-      // Who addressed whom inside a conversation: 'rule' rows are inferred turns
-      // (conversations/addressing.ts, feed closeness); 'model' rows carry tone from the summarizer
+      // Who addressed whom inside a conversation: 'model' rows carry tone and valence from the
+      // summarizer. Rule rows (inferred turns) are retired; attention lives in episode_attention.
       await client.query(`
 				CREATE TABLE IF NOT EXISTS conversation_exchanges (
 					conversation_id VARCHAR(50) NOT NULL REFERENCES conversation_segments(id) ON DELETE CASCADE,
@@ -494,7 +494,25 @@ export class PostgreSQLManager {
 					note TEXT,
 					PRIMARY KEY (conversation_id, from_user, to_user, source)
 				);
+				ALTER TABLE conversation_exchanges ADD COLUMN IF NOT EXISTS valence TEXT;
+				DELETE FROM conversation_exchanges WHERE source = 'rule';
 				CREATE INDEX IF NOT EXISTS idx_conversation_exchanges_pair ON conversation_exchanges(from_user, to_user);
+			`);
+
+      // Attention network: each episode's focus (EpisodeFocus JSON) and its directed pair totals
+      await client.query(`
+				ALTER TABLE conversation_segments ADD COLUMN IF NOT EXISTS focus JSONB;
+				CREATE TABLE IF NOT EXISTS episode_attention (
+					conversation_id VARCHAR(50) NOT NULL REFERENCES conversation_segments(id) ON DELETE CASCADE,
+					from_user VARCHAR(20) NOT NULL,
+					to_user VARCHAR(20) NOT NULL,
+					mass REAL NOT NULL,
+					explicit_mass REAL NOT NULL,
+					bids INT NOT NULL DEFAULT 0,
+					bids_answered INT NOT NULL DEFAULT 0,
+					PRIMARY KEY (conversation_id, from_user, to_user)
+				);
+				CREATE INDEX IF NOT EXISTS idx_episode_attention_pair ON episode_attention(from_user, to_user);
 			`);
       // Add voice conversation columns (migration)
       await client.query(`

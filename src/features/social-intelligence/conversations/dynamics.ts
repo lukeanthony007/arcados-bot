@@ -24,11 +24,21 @@ export const TONES = [
 ] as const;
 export type Tone = (typeof TONES)[number];
 
+/** How an exchange lands on the receiver: affirming (warm) or undermining (cold) */
+export const VALENCES = ["warm", "neutral", "cold"] as const;
+export type Valence = (typeof VALENCES)[number];
+
 /** What the model submits (people by display name) */
 export interface WrittenDynamics {
 	note: string;
 	roles: { drivers: string[]; responders: string[]; ignored: string[] };
-	exchanges: Array<{ from: string; to: string; tone: string; note: string }>;
+	exchanges: Array<{
+		from: string;
+		to: string;
+		tone: string;
+		valence?: string;
+		note: string;
+	}>;
 	bits?: string[];
 	news?: string[];
 }
@@ -38,7 +48,13 @@ export interface ConversationDynamics {
 	/** One sentence: who it was between, who drove it, who got left out */
 	note: string;
 	roles: { drivers: string[]; responders: string[]; ignored: string[] };
-	exchanges: Array<{ from: string; to: string; tone: Tone; note: string }>;
+	exchanges: Array<{
+		from: string;
+		to: string;
+		tone: Tone;
+		valence: Valence;
+		note: string;
+	}>;
 	/** Running jokes, recurring phrases, memorable lines: "who: what" */
 	bits: string[];
 	/** Personal news people share about their own lives (plans, outcomes, updates): "who: what" */
@@ -81,7 +97,7 @@ export function resolveName(
 
 /**
  * Resolve the model's names to ids; unknown names and self-addressed exchanges are dropped,
- * unknown tones become "neutral".
+ * unknown tones and valences become "neutral".
  */
 export function toStoredDynamics(
 	written: WrittenDynamics,
@@ -103,13 +119,16 @@ export function toStoredDynamics(
 		const tone = (TONES as readonly string[]).includes(x.tone)
 			? (x.tone as Tone)
 			: "neutral";
+		const valence = (VALENCES as readonly string[]).includes(x.valence ?? "")
+			? (x.valence as Valence)
+			: "neutral";
 		const note = (x.note ?? "").trim();
 		const existing = byPair.get(`${from}>${to}`);
 		if (existing) {
 			if (note)
 				existing.note = existing.note ? `${existing.note}; ${note}` : note;
 		} else {
-			byPair.set(`${from}>${to}`, { from, to, tone, note });
+			byPair.set(`${from}>${to}`, { from, to, tone, valence, note });
 		}
 	}
 	const exchanges = [...byPair.values()];

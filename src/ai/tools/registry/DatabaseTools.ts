@@ -88,7 +88,7 @@ export function formatUserInfo(
  */
 export function formatConnection(conn: Connection): string {
   const lastSeen = new Date(conn.last_interaction).toLocaleDateString();
-  return `${conn.name}: ${describeStrength(conn)} (${(conn.share * 100).toFixed(0)}% of their interactions, ${(conn.reciprocity * 100).toFixed(0)}% reciprocal; ${conn.replies} replies, ${conn.mentions} mentions, ${conn.turns} inferred addressed turns, ${conn.shared_conversations} shared conversations; last ${lastSeen})`;
+  return `${conn.name}: ${describeStrength(conn)} (${(conn.share * 100).toFixed(0)}% of their interactions, ${(conn.reciprocity * 100).toFixed(0)}% reciprocal; ${conn.replies} replies, ${conn.mentions} mentions, ${conn.inferred_attention} inferred attention in conversations, ${conn.shared_conversations} shared conversations; last ${lastSeen})`;
 }
 
 /**

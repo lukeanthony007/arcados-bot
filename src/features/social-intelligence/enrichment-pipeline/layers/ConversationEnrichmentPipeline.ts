@@ -13,7 +13,9 @@ import { pgvector, type PostgreSQLManager } from "../../../../database/PostgreSQ
 import { type JsonObjectSchema, OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
 import { SLUR_PATTERN } from "../../../user-personas/personaPrompt";
 import { ENRICHMENT_SYSTEM_PROMPT } from "../enrichmentPrompt";
-import { TONES, type WrittenDynamics, toStoredDynamics } from "../../conversations/dynamics";
+import { TONES, VALENCES, type WrittenDynamics, toStoredDynamics } from "../../conversations/dynamics";
+import type { EpisodeFocus } from "../../conversations/attention";
+import { describeFocus } from "../../conversations/focusText";
 import { EmbeddingService } from "../../semantic-analysis/EmbeddingService.js";
 import { EnrichmentRateLimiter } from "../EnrichmentRateLimiter";
 
@@ -52,12 +54,13 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 							from: { type: "string", description: "Display name exactly as shown" },
 							to: { type: "string", description: "Display name exactly as shown" },
 							tone: { type: "string", enum: [...TONES] },
+							valence: { type: "string", enum: [...VALENCES] },
 							note: {
 								type: "string",
 								description: "What from did to/for to, short, quoting where useful",
 							},
 						},
-						required: ["from", "to", "tone", "note"],
+						required: ["from", "to", "tone", "valence", "note"],
 					},
 				},
 				note: {
@@ -134,10 +137,26 @@ export class ConversationEnrichmentPipeline {
 		messages: PreviewMessage[],
 		names: Map<string, string>,
 		participantCount: number,
+		focusHints?: string[],
 	): Promise<GeneratedSummary | null> {
 		const preview = this.buildMessagePreview(this.sampleMessages(messages), names);
-		return this.generateSummary(messages.length, participantCount, preview);
+		return this.generateSummary(messages.length, participantCount, preview, focusHints);
 	}
+
+	/** Measured-attention lines for a stored episode, empty when it has no focus yet */
+	private async loadFocusHints(
+		conversationId: string,
+		names: Map<string, string>,
+	): Promise<string[]> {
+		const result = await this.db.query(
+			"SELECT focus FROM conversation_segments WHERE id = $1",
+			[conversationId],
+		);
+		const focus = result.success ? (result.data?.[0]?.focus as EpisodeFocus | null) : null;
+		if (!focus) return [];
+		return describeFocus(focus, (id) => names.get(id) ?? "someone");
+	}
+
 	/**
 	 * Enrich a conversation segment
 	 */
@@ -235,7 +254,12 @@ export class ConversationEnrichmentPipeline {
 
 			// Sample messages for preview, attributed by author name
 			const names = await this.loadNames(guildId, messages, segment.participants);
-			const generated = await this.describe(messages, names, participantCount);
+			const generated = await this.describe(
+				messages,
+				names,
+				participantCount,
+				await this.loadFocusHints(conversationId, names),
+			);
 
 			if (!generated) {
 				return {
@@ -316,15 +340,16 @@ export class ConversationEnrichmentPipeline {
 			);
 			if (dynamics.exchanges.length) {
 				const rows = await this.db.query(
-					`INSERT INTO conversation_exchanges (conversation_id, from_user, to_user, source, turns, tone, note)
-					 SELECT $1, f, t, 'model', 1, tone, note
-					 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS x(f, t, tone, note)
+					`INSERT INTO conversation_exchanges (conversation_id, from_user, to_user, source, turns, tone, valence, note)
+					 SELECT $1, f, t, 'model', 1, tone, valence, note
+					 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) AS x(f, t, tone, valence, note)
 					 ON CONFLICT DO NOTHING`,
 					[
 						conversationId,
 						dynamics.exchanges.map((x) => x.from),
 						dynamics.exchanges.map((x) => x.to),
 						dynamics.exchanges.map((x) => x.tone),
+						dynamics.exchanges.map((x) => x.valence),
 						dynamics.exchanges.map((x) => x.note),
 					],
 				);
@@ -516,7 +541,11 @@ export class ConversationEnrichmentPipeline {
 		messageCount: number,
 		participantCount: number,
 		messagePreview: string,
+		focusHints?: string[],
 	): Promise<GeneratedSummary | null> {
+		const focusBlock = focusHints?.length
+			? `\nMeasured attention in this conversation (from who replied to, mentioned and answered whom):\n${focusHints.map((l) => `- ${l}`).join("\n")}\nUse it to ground the roles and exchanges, but correct it where the messages clearly show otherwise.\n`
+			: "";
 		const prompt = `Summarize this Discord conversation. Return a "summary" (1-2 concise sentences stating the key topics/actions directly) and a "topic_label" (2-5 words naming the subject, e.g. "A Plague Tale", "JOHNNY's work suspension").
 
 BAD EXAMPLES (DO NOT USE):
@@ -550,11 +579,11 @@ RULES:
 
 Then describe the DYNAMICS, which matter as much as the topics. Fill them in this order:
 - "roles": drivers (set the subject or kept it going), responders (mostly reacted), ignored (posted and got no uptake). Names exactly as shown before each line; a person goes in one list only.
-- "exchanges": one entry per direction for every pair that actually talked to each other, the MAIN thread first (e.g. "toast → lunchie venting about J", then "lunchie → toast advising her to move out"), then side exchanges; at most 8. Each has a tone (${TONES.join(", ")}) and a short note quoting or paraphrasing what the first person did to or for the second.
+- "exchanges": one entry per direction for every pair that actually talked to each other, the MAIN thread first (e.g. "toast → lunchie venting about J", then "lunchie → toast advising her to move out"), then side exchanges; at most 8. Each has a tone (${TONES.join(", ")}), a valence (${VALENCES.join(", ")}) and a short note quoting or paraphrasing what the first person did to or for the second. Valence is how it lands on the receiver: warm = affirming (agreeing, laughing with them, taking up what they said, praising, caring), cold = undermining (mocking at their expense, dismissing, ignoring a direct bid, hostility), neutral = neither. Teasing can be either: judge by how it lands.
 - "note": one sentence consistent with the roles and exchanges: who it was really between, who drove it, who was talking to the room unanswered.
 - "bits": running jokes, recurring phrases, nicknames, catchphrases or memorable lines in this conversation, each as "Name: what" with a short quote (e.g. "Sam: keeps calling everything \"goated\""); include side remarks, they are how this group bonds; at most 4, empty if none.
 - "news": personal news people share about their own lives, even in passing and even if nobody responds: plans, outcomes, status changes, events (e.g. "Sam: has a dentist appointment tomorrow", "Sam: got the apartment"); each as "Name: what", with the time if given; at most 4, empty if none.
-
+${focusBlock}
 Conversation (${messageCount} messages, ${participantCount} participants):
 ${messagePreview}
 

@@ -6,9 +6,10 @@ Turns the Discord message history in PostgreSQL into facts, conversations and wr
 
 Deterministic, always current, never stored.
 
-- **closeness.ts** is the one definition of how much two members interact. An interaction is a reply (3 points), a direct mention in a message pinging at most 3 people (2), or taking part in the same conversation (1). Each is weighted with a 180-day half-life. `getConnections` lists a member's closest people, `getPairFacts` describes one pair (strength, reciprocity, share of the member's interactions, raw counts), `getGuildGraph` returns every edge. Bots and group pings are excluded. Reactions are not counted; they are not recorded as events.
+- **closeness.ts** is the one definition of how much two members interact. An interaction is a reply (3 points), a direct mention in a message pinging at most 3 people (2), a unit of inferred attention inside a conversation (1, from `episode_attention`), a reaction (1) or taking part in the same conversation (1). Each is weighted with a 180-day half-life. `getConnections` lists a member's closest people, `getPairFacts` describes one pair (strength, reciprocity, share of the member's interactions, raw counts), `getGuildGraph` returns every edge. Bots and group pings are excluded.
+- **attention.ts** is the attention network: where each member's attention goes and comes from, inside conversations, aggregated with a 180-day half-life. `getAttentionProfile` (flows out and in, who they pursue and who pursues them, how often their bids for attention are answered and how often they answer others', their roles in groups, one-on-one vs group, warmth given and received), `getAttentionEdge` (one pair, both directions, with situations, channels, tones and valence) and `getSocialStructure` (standing: PageRank on directed attention, so attention flows toward standing; cliques: communities on reciprocal attention; periphery: people who reach out without much return). `describe*` functions render each as plain-language lines.
 - **memberFacts.ts** measures one member: volume, active hours (America/New_York), writing style, how others respond. `describeMemberFacts` renders it as prompt lines.
-- **graph.ts** summarizes the server network (hubs, strongest pairs, communities) from the closeness graph over active, non-bot members.
+- **graph.ts** summarizes the server network: hubs and communities from `getSocialStructure`, strongest pairs from the closeness graph.
 
 ## Conversations (`conversations/`)
 
@@ -26,9 +27,17 @@ A conversation is a run of human messages in one channel that:
 
 `bun run resegment:history [--channel <name>]` re-segments whole channel histories with the current rule. Existing conversations that share at least 80% of their messages with a new one keep their id, summary and embedding; the rest are replaced and queued. Safe to re-run.
 
+### Attention (`conversations/attention.ts`)
+
+Who focused on whom inside each conversation, computed deterministically on every segmentation pass.
+
+- Every message carries one unit of attention. Replies and mentions are explicit. An implicit message is attributed by recency, continuation and the author's **affinity prior** (`prior.ts`: their share of explicit replies and mentions to each member over the last year; built from explicit signals only so inferences never reinforce themselves). What the evidence doesn't support goes to the room. In a two-person conversation it all goes to the other person.
+- `focusMap` turns the attributions into the conversation's social shape: the attention matrix, **bids** (a turn aimed at someone who hadn't just addressed the author, or opened to the room) and whether they were answered within 4 turns or 20 minutes, and **structures**: reciprocal pairs, pursuits, a centre, people left unattended, people talking to the room. `focusText.ts` renders it in words.
+- `store.ts` writes `episode_attention` (per directed pair: mass, explicit part, bids, answered) and `conversation_segments.focus`.
+
 ## Summaries and topic labels (`enrichment-pipeline/layers/ConversationEnrichmentPipeline.ts`)
 
-One structured model call per significant conversation returns `{ summary, topic_label }`. The prompt shows sampled messages as `Name: content` (first, middle and last ten for long conversations) with slurs masked and mentions resolved to names. The `topic_label` is 2-5 words naming the subject, such as "A Plague Tale". The summary, label and an embedding of the summary (local, `semantic-analysis/EmbeddingService.ts`, used for semantic search) are written in one UPDATE with `ai_processing_status = 'completed'`.
+One structured model call per significant conversation returns `{ summary, topic_label, dynamics }`. `dynamics` holds roles (drivers, responders, ignored), up to 8 directed exchanges with a tone, a valence (warm = affirming, cold = undermining) and a note, running bits, and personal news (plans, outcomes, life updates people share). The prompt shows sampled messages as `Name: content` with slurs masked and mentions resolved to names, plus the conversation's measured attention as hints the model may correct. The summary, label, dynamics and an embedding of the summary (local, `semantic-analysis/EmbeddingService.ts`, used for semantic search) are written with `ai_processing_status = 'completed'`; exchanges also go to `conversation_exchanges` (`source='model'`).
 
 Segments with no messages left are marked `skipped`. A budget refusal leaves the segment `pending` for the backlog sweep. Rate-limit errors retry up to 3 times.
 
@@ -38,9 +47,9 @@ Topics come only from `topic_label` and `summary`; there is no keyword extractio
 
 Written once per subject from facts, conversation summaries and a sample of real messages, then regenerated whole when stale.
 
-- **memberDossier.ts**: identity, voice, interests, people, recent activity and Big Five. MBTI is derived from the Big Five relative to the server, never asked of the model. Needs 30 messages; stale after 25 new ones.
-- **pairDossier.ts**: how two members relate. Regenerated when enough new shared conversations accumulate.
-- **serverDossier.ts**: what the server is, stored in `guilds.server_summary` and prepended to the first turn of a chat.
+- **memberDossier.ts**: identity, voice, interests, people, social position (from the attention profile), recent activity and Big Five. MBTI is derived from the Big Five relative to the server, never asked of the model. Needs 30 messages; stale after 25 new ones.
+- **pairDossier.ts**: how two members relate, grounded in their attention edge (who seeks whom, asymmetry, warmth). Regenerated when enough new shared conversations accumulate.
+- **serverDossier.ts**: what the server is and its structure (where attention gathers, tight circles, people reaching out without much return), stored in `guilds.server_summary` and prepended to the first turn of a chat.
 
 `bun run dossier:stale|member|pair|server` writes them by hand.
 
@@ -50,7 +59,7 @@ Written once per subject from facts, conversation summaries and a sample of real
 
 ## Deliberately not stored
 
-- Closeness, relationship edges, interaction counts, member statistics: recomputed from `messages`.
+- Closeness, attention profiles and edges, social structure, member statistics: recomputed from `messages`, `episode_attention` and `conversation_segments` on demand.
 - Keywords, vocabularies, TF-IDF: not used.
 - In-progress conversation buffers: the segmenter recomputes from messages.
-- Reactions as relationship signal.
+- Reactions are not part of attention (they are counted only in closeness).

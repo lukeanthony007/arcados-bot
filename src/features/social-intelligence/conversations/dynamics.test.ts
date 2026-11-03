@@ -18,7 +18,13 @@ describe("toStoredDynamics", () => {
 					ignored: [],
 				},
 				exchanges: [
-					{ from: "Terra", to: "alex", tone: "teasing", note: "egged him on" },
+					{
+						from: "Terra",
+						to: "alex",
+						tone: "teasing",
+						valence: "warm",
+						note: "egged him on",
+					},
 					{ from: "alex", to: "alex", tone: "asking", note: "self" },
 					{ from: "Ghost", to: "alex", tone: "asking", note: "unknown" },
 				],
@@ -32,7 +38,13 @@ describe("toStoredDynamics", () => {
 			ignored: [],
 		});
 		expect(out.exchanges).toEqual([
-			{ from: "1", to: "2", tone: "teasing", note: "egged him on" },
+			{
+				from: "1",
+				to: "2",
+				tone: "teasing",
+				valence: "warm",
+				note: "egged him on",
+			},
 		]);
 	});
 
@@ -46,6 +58,7 @@ describe("toStoredDynamics", () => {
 						from: "Terra",
 						to: "alex",
 						tone: "escalating",
+						valence: "cold",
 						note: "cum monster bit",
 					},
 					{
@@ -58,6 +71,7 @@ describe("toStoredDynamics", () => {
 						from: "alex",
 						to: "Joe",
 						tone: "curious",
+						valence: "sparkly",
 						note: "asked about his day",
 					},
 				],
@@ -69,9 +83,16 @@ describe("toStoredDynamics", () => {
 				from: "1",
 				to: "2",
 				tone: "escalating",
+				valence: "cold",
 				note: "cum monster bit; bird-raft story",
 			},
-			{ from: "2", to: "3", tone: "neutral", note: "asked about his day" },
+			{
+				from: "2",
+				to: "3",
+				tone: "neutral",
+				valence: "neutral",
+				note: "asked about his day",
+			},
 		]);
 	});
 });

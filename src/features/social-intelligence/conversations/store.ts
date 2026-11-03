@@ -11,7 +11,7 @@
  */
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
-import { inferTurns } from "./addressing";
+import { type AffinityPrior, attributeAttention, focusMap } from "./attention";
 import {
 	GAP_MS,
 	MAX_SPAN_MS,
@@ -47,6 +47,8 @@ interface StoredSegment {
 	status: string;
 	summary: string | null;
 	session_id: string | null;
+	/** The stored episode has no focus yet */
+	focus_missing: boolean;
 }
 
 interface MessageRow {
@@ -104,7 +106,8 @@ async function loadStored(
 	since: Date | null,
 ): Promise<StoredSegment[]> {
 	const result = await db.query(
-		`SELECT id, message_ids, status, summary, session_id FROM conversation_segments
+		`SELECT id, message_ids, status, summary, session_id, focus IS NULL AS focus_missing
+		 FROM conversation_segments
 		 WHERE guild_id = $1 AND channel_id = $2 AND ($3::timestamptz IS NULL OR start_time >= $3)`,
 		[guildId, channelId, since],
 	);
@@ -117,34 +120,86 @@ function sameIds(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((id, i) => id === b[i]);
 }
 
-/** Replace the rule-inferred addressee counts for one conversation */
-async function writeInferredTurns(
+/** Compute an episode's attention and replace its per-pair rows and stored focus */
+async function writeAttention(
 	db: PostgreSQLManager,
 	conversationId: string,
 	seg: Segment,
+	prior: AffinityPrior,
 ): Promise<void> {
-	const turns = inferTurns(seg.messages);
+	const attention = attributeAttention(seg.messages, prior);
+	const focus = focusMap(seg.messages, attention);
+
+	const pairs = new Map<
+		string,
+		{
+			from: string;
+			to: string;
+			mass: number;
+			explicit: number;
+			bids: number;
+			answered: number;
+		}
+	>();
+	const pair = (from: string, to: string) => {
+		const key = `${from}>${to}`;
+		let p = pairs.get(key);
+		if (!p) {
+			p = { from, to, mass: 0, explicit: 0, bids: 0, answered: 0 };
+			pairs.set(key, p);
+		}
+		return p;
+	};
+	for (const a of attention)
+		for (const [to, mass] of Object.entries(a.to)) {
+			const p = pair(a.from, to);
+			p.mass += mass;
+			if (a.explicit) p.explicit += mass;
+		}
+	for (const bid of focus.bids) {
+		if (!bid.to) continue;
+		const p = pair(bid.from, bid.to);
+		p.bids++;
+		if (bid.answered_by) p.answered++;
+	}
+	const rows = [...pairs.values()];
+
 	const del = await db.query(
-		"DELETE FROM conversation_exchanges WHERE conversation_id = $1 AND source = 'rule'",
+		"DELETE FROM episode_attention WHERE conversation_id = $1",
 		[conversationId],
 	);
 	if (!del.success)
 		throw new Error(
-			`Clearing turns for ${conversationId} failed: ${del.error}`,
+			`Clearing attention for ${conversationId} failed: ${del.error}`,
 		);
-	if (!turns.length) return;
-	const ins = await db.query(
-		`INSERT INTO conversation_exchanges (conversation_id, from_user, to_user, source, turns)
-		 SELECT $1, f, t, 'rule', n FROM unnest($2::text[], $3::text[], $4::int[]) AS x(f, t, n)`,
-		[
-			conversationId,
-			turns.map((t) => t.from),
-			turns.map((t) => t.to),
-			turns.map((t) => t.turns),
-		],
+	if (rows.length) {
+		const ins = await db.query(
+			`INSERT INTO episode_attention
+				(conversation_id, from_user, to_user, mass, explicit_mass, bids, bids_answered)
+			 SELECT $1, f, t, m, e, b, a
+			 FROM unnest($2::text[], $3::text[], $4::real[], $5::real[], $6::int[], $7::int[])
+				AS x(f, t, m, e, b, a)`,
+			[
+				conversationId,
+				rows.map((r) => r.from),
+				rows.map((r) => r.to),
+				rows.map((r) => r.mass),
+				rows.map((r) => r.explicit),
+				rows.map((r) => r.bids),
+				rows.map((r) => r.answered),
+			],
+		);
+		if (!ins.success)
+			throw new Error(
+				`Writing attention for ${conversationId} failed: ${ins.error}`,
+			);
+	}
+	const set = await db.query(
+		"UPDATE conversation_segments SET focus = $2::jsonb WHERE id = $1",
+		[conversationId, JSON.stringify(focus)],
 	);
-	if (!ins.success)
-		throw new Error(`Writing turns for ${conversationId} failed: ${ins.error}`);
+	if (!set.success)
+		throw new Error(`Storing focus for ${conversationId} failed: ${set.error}`);
 }
 
 /**
@@ -155,6 +210,7 @@ async function writeInferredTurns(
 async function reconcile(
 	db: PostgreSQLManager,
 	guildId: string,
+	prior: AffinityPrior,
 	computed: Array<{
 		segment: Segment;
 		id: string;
@@ -182,6 +238,7 @@ async function reconcile(
 			previous.status === status &&
 			previous.session_id === seg.session_id;
 		if (unchanged) {
+			if (previous.focus_missing) await writeAttention(db, id, seg, prior);
 			if (status === "active") result.open.push(seg);
 			continue;
 		}
@@ -231,7 +288,7 @@ async function reconcile(
 		if (!upsert.success)
 			throw new Error(`Storing conversation ${id} failed: ${upsert.error}`);
 		result.upserted++;
-		await writeInferredTurns(db, id, seg);
+		await writeAttention(db, id, seg, prior);
 		if (status === "active") result.open.push(seg);
 		else if (previous?.status !== "finalized" || summaryStale)
 			result.finalized.push(seg);
@@ -255,6 +312,7 @@ export async function segmentChannelTail(
 	db: PostgreSQLManager,
 	guildId: string,
 	channelId: string,
+	prior: AffinityPrior,
 	now = new Date(),
 ): Promise<SegmentationResult> {
 	// Anything ending in the last stitch window could still change; include such conversations
@@ -284,7 +342,7 @@ export async function segmentChannelTail(
 		id: legacyIdByFirstMessage.get(seg.messages[0]?.id ?? "") ?? seg.id,
 		status: isOpen(seg, now) ? ("active" as const) : ("finalized" as const),
 	}));
-	return reconcile(db, guildId, computed, stored);
+	return reconcile(db, guildId, prior, computed, stored);
 }
 
 /**
@@ -295,6 +353,7 @@ export async function resegmentChannelHistory(
 	db: PostgreSQLManager,
 	guildId: string,
 	channelId: string,
+	prior: AffinityPrior,
 	now = new Date(),
 ): Promise<SegmentationResult & { kept: number }> {
 	const [messages, stored] = await Promise.all([
@@ -330,7 +389,10 @@ export async function resegmentChannelHistory(
 			status: isOpen(seg, now) ? ("active" as const) : ("finalized" as const),
 		};
 	});
-	return { ...(await reconcile(db, guildId, computed, stored, true)), kept };
+	return {
+		...(await reconcile(db, guildId, prior, computed, stored, true)),
+		kept,
+	};
 }
 
 /** Channels with messages newer than `since`, or with a conversation still marked open */

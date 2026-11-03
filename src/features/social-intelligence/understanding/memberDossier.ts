@@ -7,6 +7,7 @@
 import { OmpRuntime } from "../../../ai/runtime/OmpRuntime";
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { SLUR_PATTERN } from "../../user-personas/personaPrompt";
+import { describeProfile, getAttentionProfile } from "../facts/attention";
 import {
 	type Connection,
 	describeStrength,
@@ -105,10 +106,10 @@ const SCHEMA = {
 			description:
 				"What they have been up to lately, with rough dates: events in their life, things they did or said here. Prose, not a list of quotes.",
 		},
-		in_groups: {
+		social_position: {
 			type: "string",
 			description:
-				"How they behave in group conversations: whether they start and carry them or mostly respond, whether they get ignored, the tones they hand out and receive and from whom. Concrete, 2-4 sentences; if the group evidence is thin, say so.",
+				"Their place in the server's attention network, 3-5 sentences: who their attention goes to and who seeks them out, who they keep turning to without much return and who does that to them, whether their bids for attention get taken up, how they behave in groups (start and carry, respond, get left out), and whether what they give and receive is warm or cold. Concrete, name people; say so if the evidence is thin.",
 		},
 		personality: {
 			type: "object",
@@ -125,7 +126,7 @@ const SCHEMA = {
 		"interests",
 		"people",
 		"recent",
-		"in_groups",
+		"social_position",
 		"personality",
 	],
 };
@@ -136,7 +137,7 @@ interface WrittenSections {
 	interests: string[];
 	people: string;
 	recent: string;
-	in_groups?: string;
+	social_position?: string;
 	personality: Record<BigFiveTrait, TraitEstimate>;
 }
 
@@ -380,6 +381,7 @@ function buildPrompt(
 	summaries: SummaryRow[],
 	sample: string[],
 	groupLines: string[],
+	attentionLines: string[],
 ): string {
 	const sections = [
 		`Write the dossier for ${name}.`,
@@ -395,7 +397,8 @@ function buildPrompt(
 					)
 					.join("\n")}`
 			: "RECENT CONVERSATIONS: none summarized yet.",
-		`HOW THEY BEHAVE IN GROUP CONVERSATIONS (from conversation notes; base "in_groups" on this, and say so if the evidence is thin):\n${groupLines.join("\n")}`,
+		`MEASURED ATTENTION (who their attention goes to and comes from, who they pursue and who pursues them, how their bids land, warmth given and received; base "social_position" on this, and say so if the evidence is thin):\n${attentionLines.map((l) => `- ${l}`).join("\n") || "none measured yet"}`,
+		`HOW THEY BEHAVE IN GROUP CONVERSATIONS (from conversation notes; use for their role in groups):\n${groupLines.join("\n")}`,
 		`THEIR MESSAGES (oldest to newest; includes their most replied-to):\n${sample.join("\n")}`,
 	];
 	return sections.join("\n\n");
@@ -499,7 +502,7 @@ export function renderMemberDossier(d: MemberDossier): string {
 		`Interests\n${d.interests.map((interest) => `- ${interest}`).join("\n")}`,
 		`People\n${d.people}`,
 		`Recent\n${d.recent}`,
-		...(d.in_groups ? [`In groups\n${d.in_groups}`] : []),
+		`Social position\n${d.social_position}`,
 		`Personality\n${[...traits, mbti].join("\n")}`,
 		`Facts\n${describeMemberFacts(d.facts)
 			.map((line) => `- ${line}`)
@@ -515,6 +518,7 @@ export async function writeMemberDossier(
 	db: PostgreSQLManager,
 	guildId: string,
 	userId: string,
+	options: { store?: boolean } = {},
 ): Promise<MemberDossier | null> {
 	const facts = await getMemberFacts(db, guildId, userId);
 	if (!facts || facts.activity.messages < MIN_MESSAGES) return null;
@@ -527,6 +531,7 @@ export async function writeMemberDossier(
 	const sample = await getMessageSample(db, guildId, userId, names);
 
 	const groups = await getGroupEvidence(db, guildId, userId, names);
+	const attention = await getAttentionProfile(db, guildId, userId);
 	const prompt = buildPrompt(
 		facts.name,
 		describeMemberFacts(facts),
@@ -534,6 +539,7 @@ export async function writeMemberDossier(
 		summaries.rows.map((row) => ({ ...row, summary: scrub(row.summary) })),
 		sample,
 		groups.lines,
+		attention ? describeProfile(attention) : [],
 	);
 	const written = await OmpRuntime.get().generateStructured<WrittenSections>({
 		systemPrompt: SYSTEM_PROMPT,
@@ -557,7 +563,7 @@ export async function writeMemberDossier(
 			.filter(Boolean),
 		people: scrub(String(written.people).trim()),
 		recent: scrub(String(written.recent).trim()),
-		in_groups: scrub(String(written.in_groups ?? "").trim()),
+		social_position: scrub(String(written.social_position ?? "").trim()),
 		personality: { big_five: bigFive, mbti: deriveMbti(bigFive, stats) },
 		facts,
 		evidence: {
@@ -565,9 +571,11 @@ export async function writeMemberDossier(
 			conversations: summaries.total,
 			sampled_messages: sample.length,
 			roles: groups.roles,
+			attention,
 		},
 		written_at: new Date().toISOString(),
 	};
+	if (options.store === false) return dossier;
 
 	const stored = await db.query(
 		`INSERT INTO user_profiles

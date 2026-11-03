@@ -6,9 +6,10 @@
  *
  *   reply         a replied to b's message                          3 points, a → b
  *   mention       a mentioned b directly (message pings ≤ 3 people) 2 points, a → b
- *   turn          a's message was inferred to be addressed to b     1 point, a → b
- *                 (conversations/addressing.ts: two-person chats, answering the previous
- *                 speaker within 3 min, continuations)
+ *   turn          a's unaddressed messages were attended to b          1 point per unit of
+ *                 (episode_attention mass minus its explicit part, which   attention, a → b
+ *                 replies/mentions already count; conversations/attention.ts
+ *                 infers it from recent speakers, continuations, past affinity)
  *   conversation  a and b took part in the same conversation         1 point, both directions
  *   reaction      a reacted to b's message (recorded live from now on) 1 point, a → b
  *
@@ -49,16 +50,16 @@ export interface Connection {
 	/** Raw counts, all time */
 	replies: number;
 	mentions: number;
-	/** Messages inferred to be addressed to the other person (no reply/mention), all time */
-	turns: number;
+	/** Inferred attention mass from the subject to others' unaddressed messages (1 decimal), all time */
+	inferred_attention: number;
 	shared_conversations: number;
 	last_interaction: Date;
 }
 
 export interface PairFacts extends Connection {
 	/** Raw counts in each direction */
-	a_to_b: { replies: number; mentions: number; turns: number };
-	b_to_a: { replies: number; mentions: number; turns: number };
+	a_to_b: { replies: number; mentions: number; inferred_attention: number };
+	b_to_a: { replies: number; mentions: number; inferred_attention: number };
 }
 
 export interface GraphEdge {
@@ -116,10 +117,10 @@ function eventsCte(subjectFilter: boolean): string {
 				AND array_length(regexp_split_to_array(m.content, '<@'), 1) <= ${MAX_MENTIONS_PER_MESSAGE + 1}
 				AND t.target <> m.author_id
 				UNION ALL
-				SELECT x.from_user, x.to_user, 'turn', cs.start_time, x.turns
-				FROM conversation_exchanges x
+				SELECT x.from_user, x.to_user, 'turn', cs.start_time, x.mass - x.explicit_mass
+				FROM episode_attention x
 				JOIN conversation_segments cs ON cs.id = x.conversation_id
-				WHERE cs.guild_id = $1 AND x.source = 'rule'
+				WHERE cs.guild_id = $1 AND x.mass - x.explicit_mass > 0.001
 				UNION ALL
 				SELECT p1.id, p2.id, 'conversation', cs.start_time, 1
 				FROM conversation_segments cs
@@ -183,7 +184,7 @@ function toConnection(row: PairRow, totalStrength: number): Connection {
 		inbound,
 		replies: Number(row.replies),
 		mentions: Number(row.mentions),
-		turns: Number(row.turns),
+		inferred_attention: round1(Number(row.turns)),
 		shared_conversations: Number(row.shared_conversations),
 		last_interaction: new Date(row.last_interaction),
 	};
@@ -193,6 +194,8 @@ function reciprocity(outbound: number, inbound: number): number {
 	const max = Math.max(outbound, inbound);
 	return max > 0 ? Math.min(outbound, inbound) / max : 0;
 }
+
+const round1 = (n: number): number => Math.round(n * 10) / 10;
 
 /** A member's connections, strongest first */
 export async function getConnections(
@@ -233,12 +236,12 @@ export async function getPairFacts(
 		a_to_b: {
 			replies: Number(row.out_replies),
 			mentions: Number(row.out_mentions),
-			turns: Number(row.out_turns),
+			inferred_attention: round1(Number(row.out_turns)),
 		},
 		b_to_a: {
 			replies: Number(row.in_replies),
 			mentions: Number(row.in_mentions),
-			turns: Number(row.in_turns),
+			inferred_attention: round1(Number(row.in_turns)),
 		},
 	};
 }

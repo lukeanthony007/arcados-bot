@@ -7,6 +7,7 @@
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { EnrichmentPipelineOrchestrator } from "../enrichment-pipeline/EnrichmentPipelineOrchestrator";
+import { loadAffinityPrior } from "./prior";
 import { type Segment, isSignificant } from "./segmenter";
 import { channelsToSegment, segmentChannelTail } from "./store";
 
@@ -43,16 +44,21 @@ export class ConversationSegmenter {
 			for (const { id: guildId } of (guilds.data ?? []) as Array<{
 				id: string;
 			}>) {
-				for (const channelId of await channelsToSegment(
+				const channels = await channelsToSegment(
 					this.db,
 					guildId,
 					this.lastPass,
-				)) {
+				);
+				if (!channels.length) continue;
+				// Loaded once per guild per pass (~250ms), not per channel
+				const prior = await loadAffinityPrior(this.db, guildId, started);
+				for (const channelId of channels) {
 					try {
 						const result = await segmentChannelTail(
 							this.db,
 							guildId,
 							channelId,
+							prior,
 							started,
 						);
 						this.queueSummaries(guildId, result.finalized);

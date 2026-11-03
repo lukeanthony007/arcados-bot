@@ -1,5 +1,7 @@
 import type { Client, Guild, Message } from "discord.js";
 import { EmbeddingService } from "../social-intelligence/semantic-analysis/EmbeddingService";
+import type { AffinityPrior } from "../social-intelligence/conversations/attention";
+import { loadAffinityPrior } from "../social-intelligence/conversations/prior";
 import { resegmentChannelHistory } from "../social-intelligence/conversations/store";
 import { EnrichmentPipelineOrchestrator } from "../social-intelligence/enrichment-pipeline/EnrichmentPipelineOrchestrator";
 import { EnrichmentLayer } from "../social-intelligence/enrichment-pipeline/EnrichmentQueue";
@@ -991,9 +993,16 @@ export class ReconciliationSync {
     for (const message of messages) {
       channels.set(message.channel_id, message.guild_id);
     }
+    // One affinity prior per guild for the whole backfill
+    const priors = new Map<string, AffinityPrior>();
     for (const [channelId, guildId] of channels) {
       try {
-        await resegmentChannelHistory(this.db, guildId, channelId);
+        let prior = priors.get(guildId);
+        if (!prior) {
+          prior = await loadAffinityPrior(this.db, guildId);
+          priors.set(guildId, prior);
+        }
+        await resegmentChannelHistory(this.db, guildId, channelId, prior);
       } catch (error) {
         console.error(
           `   🔸 ReconciliationSync: Failed to re-segment ${channelId} after backfill:`,

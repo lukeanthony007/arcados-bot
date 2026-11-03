@@ -1,4 +1,10 @@
 import {
+	describeEdge,
+	describeProfile,
+	getAttentionEdge,
+	getAttentionProfile,
+} from "../../../features/social-intelligence/facts/attention";
+import {
 	type Connection,
 	describeStrength,
 	getConnections,
@@ -128,7 +134,7 @@ export const getUserConnectionsTool: DatabaseTool = {
  */
 export const getRelationshipTool: DatabaseTool = {
 	name: "getRelationship",
-	description: `Get the facts about how two specific users interact: closeness label, replies and mentions in each direction, shared conversations, reciprocity and last interaction. Says so plainly if they have never interacted. ${MEANING}`,
+	description: `Get the facts about how two specific users interact: closeness label, replies and mentions in each direction, shared conversations, reciprocity and last interaction, plus how they attend to each other inside conversations (who turns to whom, whether bids are answered, whether it is warm or cold). Says so plainly if they have never interacted. ${MEANING}`,
 	parameters: {
 		type: "object",
 		properties: {
@@ -171,14 +177,21 @@ export const getRelationshipTool: DatabaseTool = {
 			const subject = await memberName(context, pair.a);
 			const { a_to_b: out, b_to_a: back } = facts;
 
-			const [tallies, notes] = await Promise.all([
+			const [tallies, notes, edge] = await Promise.all([
 				getPairToneTallies(context.db, context.guildId, pair.a, pair.b),
-				getPairExchangeNotes(context.db, context.guildId, pair.a, pair.b, RECENT_NOTES),
+				getPairExchangeNotes(
+					context.db,
+					context.guildId,
+					pair.a,
+					pair.b,
+					RECENT_NOTES,
+				),
+				getAttentionEdge(context.db, context.guildId, pair.a, pair.b),
 			]);
 			const lines = [
 				`${subject} and ${a}: ${describeStrength(facts)} (${pct(facts.share)} of ${subject}'s interactions, ${pct(facts.reciprocity)} reciprocal)`,
-				`${subject} → ${a}: ${out.replies} replies, ${out.mentions} mentions, ${out.turns} inferred addressed turns`,
-				`${a} → ${subject}: ${back.replies} replies, ${back.mentions} mentions, ${back.turns} inferred addressed turns`,
+				`${subject} → ${a}: ${out.replies} replies, ${out.mentions} mentions, ${out.inferred_attention} inferred attention in conversations`,
+				`${a} → ${subject}: ${back.replies} replies, ${back.mentions} mentions, ${back.inferred_attention} inferred attention in conversations`,
 				`Shared conversations: ${facts.shared_conversations}`,
 				`Last interaction: ${new Date(facts.last_interaction).toLocaleDateString()}`,
 				"How they treat each other (from conversation notes):",
@@ -190,7 +203,10 @@ export const getRelationshipTool: DatabaseTool = {
 				for (const x of notes) {
 					const from = x.from_user === pair.a ? subject : a;
 					const to = x.from_user === pair.a ? a : subject;
-					const note = x.note.replace(new RegExp(SLUR_PATTERN.source, "gi"), "[slur]");
+					const note = x.note.replace(
+						new RegExp(SLUR_PATTERN.source, "gi"),
+						"[slur]",
+					);
 					lines.push(
 						`- ${new Date(x.start_time).toLocaleDateString()} ${from} → ${to} [${x.tone}] ${note}`,
 					);
@@ -208,10 +224,18 @@ export const getRelationshipTool: DatabaseTool = {
 				);
 			}
 
+			const edgeLines = edge ? describeEdge(edge) : [];
+			if (edgeLines.length) {
+				lines.push(
+					"Attention between them (inside conversations):",
+					...edgeLines,
+				);
+			}
+
 			return {
 				success: true,
 				summary: `${describeStrength(facts)} relationship`,
-				data: { interacted: true, facts },
+				data: { interacted: true, facts, attention: edge },
 				formatted: lines.join("\n"),
 			};
 		} catch (error) {
@@ -300,8 +324,64 @@ export const getMutualConnectionsTool: DatabaseTool = {
 	},
 };
 
+/**
+ * Where a member's attention goes, whether their bids are answered, who focuses on them
+ */
+export const getAttentionProfileTool: DatabaseTool = {
+	name: "getAttentionProfile",
+	description:
+		"Get a person's attention profile from how they behave inside conversations: who they pay the most attention to (and whether it is returned), who pays attention to them, whether they chase people who give little back, how often their bids for attention get answered, how often they are the centre of attention or left unattended in groups, and how warm the attention they give and receive is. Use this for 'who does X pay attention to', 'does anyone listen to X', 'who is X chasing', or any question about someone's social position in conversations.",
+	parameters: {
+		type: "object",
+		properties: {
+			userId: {
+				type: "string",
+				description: "Discord user ID or name of the person",
+			},
+		},
+		required: ["userId"],
+	},
+	execute: async (
+		params: Record<string, unknown>,
+		context: ToolContext,
+	): Promise<string | DatabaseToolResult> => {
+		const { userId } = params as { userId: string };
+		try {
+			const resolved = await resolveUserId(userId, context.guildId, context.db);
+			if (!resolved.success || !resolved.userId) {
+				return {
+					success: false,
+					error: resolved.error ?? `Unknown user "${userId}"`,
+				};
+			}
+			const profile = await getAttentionProfile(
+				context.db,
+				context.guildId,
+				resolved.userId,
+			);
+			if (!profile) {
+				return {
+					success: true,
+					summary: "No attention data for this user",
+					data: { found: false },
+					formatted: "No recorded conversation attention for this user.",
+				};
+			}
+			return {
+				success: true,
+				summary: `Attention profile for ${profile.name}`,
+				data: { found: true, profile },
+				formatted: describeProfile(profile).join("\n"),
+			};
+		} catch (error) {
+			return failure("getAttentionProfile", error);
+		}
+	},
+};
+
 export const relationshipTools: DatabaseTool[] = [
 	getUserConnectionsTool,
 	getRelationshipTool,
 	getMutualConnectionsTool,
+	getAttentionProfileTool,
 ];

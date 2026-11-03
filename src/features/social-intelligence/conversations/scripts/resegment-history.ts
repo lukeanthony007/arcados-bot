@@ -11,6 +11,7 @@
 
 import { config } from "../../../../config/index.js";
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
+import { loadAffinityPrior } from "../prior";
 import { resegmentChannelHistory } from "../store";
 
 async function main() {
@@ -33,12 +34,18 @@ async function main() {
 		"SELECT COUNT(*)::int AS n, COUNT(summary)::int AS summarized FROM conversation_segments WHERE guild_id = $1",
 		[guildId],
 	);
+	const prior = await loadAffinityPrior(db, guildId);
 	const totals = { upserted: 0, deleted: 0, kept: 0, finalized: 0 };
 	for (const { channel_id, name } of (channels.data ?? []) as Array<{
 		channel_id: string;
 		name: string | null;
 	}>) {
-		const result = await resegmentChannelHistory(db, guildId, channel_id);
+		const result = await resegmentChannelHistory(
+			db,
+			guildId,
+			channel_id,
+			prior,
+		);
 		totals.upserted += result.upserted;
 		totals.deleted += result.deleted;
 		totals.kept += result.kept;

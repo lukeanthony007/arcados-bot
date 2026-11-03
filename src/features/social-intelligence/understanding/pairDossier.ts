@@ -10,6 +10,7 @@ import {
 } from "../../../ai/runtime/OmpRuntime";
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { SLUR_PATTERN } from "../../user-personas/personaPrompt";
+import { describeEdge, getAttentionEdge } from "../facts/attention";
 import {
 	describeStrength,
 	getGuildGraph,
@@ -278,8 +279,8 @@ export async function writePairDossier(
 
 	const factLines = [
 		`${describeStrength(facts)}`,
-		`${nameA} → ${nameB}: ${facts.a_to_b.replies} replies, ${facts.a_to_b.mentions} mentions, ${facts.a_to_b.turns} inferred addressed turns`,
-		`${nameB} → ${nameA}: ${facts.b_to_a.replies} replies, ${facts.b_to_a.mentions} mentions, ${facts.b_to_a.turns} inferred addressed turns`,
+		`${nameA} → ${nameB}: ${facts.a_to_b.replies} replies, ${facts.a_to_b.mentions} mentions, ${facts.a_to_b.inferred_attention} inferred attention in conversations`,
+		`${nameB} → ${nameA}: ${facts.b_to_a.replies} replies, ${facts.b_to_a.mentions} mentions, ${facts.b_to_a.inferred_attention} inferred attention in conversations`,
 		`${shared} summarized shared conversations; last interaction ${formatDate(facts.last_interaction)}`,
 	];
 
@@ -295,6 +296,9 @@ ${nameB} → ${nameA}: ${formatTally(tallies.b_to_a)}
 Newest ${exchangeLines.length} notes:
 ${exchangeLines.join("\n") || "(none)"}`;
 
+	const edge = await getAttentionEdge(db, guildId, a, b);
+	const attentionLines = edge ? describeEdge(edge).map(maskSlurs) : [];
+
 	const prompt = `Write the notes on the relationship between ${nameA} and ${nameB}.
 
 Measured facts:
@@ -303,7 +307,10 @@ ${factLines.map((line) => `- ${line}`).join("\n")}
 How they treat each other (from conversation notes; who addresses whom and in what tone):
 ${exchangeBlock}
 
-Ground "dynamic" and "tone" in this: who initiates, who teases whom, who asks after whom, and any asymmetry between the two directions. If few notes exist, say the evidence is thin.
+Measured attention between them (from who replied to, mentioned and answered whom across their shared conversations):
+${attentionLines.map((line) => `- ${line}`).join("\n") || "(none measured)"}
+
+Ground "dynamic" and "tone" in this: who seeks whom out, whether it is answered, any asymmetry between the two directions, whether the attention is warm or cold, who teases whom, who asks after whom. If few notes exist, say the evidence is thin.
 
 Shared conversation summaries (${shared} in total, newest ${summaryLines.length} shown):
 ${summaryBlock || "(none)"}
@@ -336,6 +343,7 @@ ${messageBlock || "(none sampled)"}`;
 			shared_conversations: shared,
 			sampled_messages: messageLines.length,
 			exchanges: tallies,
+			attention: edge,
 		},
 		written_at: new Date().toISOString(),
 	};

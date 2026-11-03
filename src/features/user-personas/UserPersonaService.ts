@@ -373,6 +373,7 @@ export class UserPersonaService {
 			["INTERESTS", dossier.interests.join("; ")],
 			["PEOPLE", dossier.people],
 			["RECENT", dossier.recent],
+			["SOCIAL POSITION", dossier.social_position],
 		];
 		for (const [label, text] of sectionText) {
 			if (text) sections.push(`${label}:\n${text}`);

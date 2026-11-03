@@ -10,6 +10,10 @@ import {
 } from "../../../ai/runtime/OmpRuntime";
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { SLUR_PATTERN } from "../../user-personas/personaPrompt";
+import {
+	describeStructureOverview,
+	getSocialStructure,
+} from "../facts/attention";
 import { type GraphSummary, summarizeGraph } from "../facts/graph";
 import type { ServerDossier } from "./types";
 
@@ -131,17 +135,23 @@ export function renderServerDossier(d: ServerDossier): string {
 		}
 	}
 	const whos: string[] = [];
-	if (d.hubs.length > 0) {
+	const gathers = d.structure.ranking.slice(0, 6).map((r) => r.name);
+	if (gathers.length > 0) {
+		whos.push(`Attention gathers around ${gathers.join(", ")}.`);
+	}
+	if (d.structure.cliques.length > 0) {
 		whos.push(
-			`Most connected: ${d.hubs
-				.slice(0, 8)
-				.map((h) => `${h.name} (${h.strength})`)
-				.join(", ")}.`,
+			`Tight circles: ${d.structure.cliques
+				.slice(0, 4)
+				.map((c) => c.slice(0, 8).join(", "))
+				.join("; ")}.`,
 		);
 	}
-	d.communities.slice(0, 4).forEach((c, i) => {
-		whos.push(`Group ${i + 1}: ${c.slice(0, 8).join(", ")}.`);
-	});
+	if (d.structure.periphery.length > 0) {
+		whos.push(
+			`Often reaching out without much return: ${d.structure.periphery.slice(0, 6).join(", ")}.`,
+		);
+	}
 	if (whos.length > 0) lines.push(`Who's who: ${whos.join(" ")}`);
 	lines.push(`Recent: ${clip(d.recent, RENDER_LIMITS.recent)}`);
 	return lines.join("\n");
@@ -193,17 +203,10 @@ function day(date: Date): string {
 function describeGraph(graph: GraphSummary): string {
 	const lines = [
 		`${graph.members} active members, ${graph.connectedPairs} pairs who interact, ${graph.isolated} with no interactions.`,
-		`Most connected members (interaction strength): ${
-			graph.hubs.map((h) => `${h.name} (${h.strength})`).join(", ") || "none"
-		}`,
 		"Strongest pairs:",
 		...graph.strongestPairs.map(
 			(p) =>
 				`- ${p.a.name} & ${p.b.name}: ${p.strength}, ${(p.reciprocity * 100).toFixed(0)}% reciprocal`,
-		),
-		"Friend groups (clusters of members who mostly interact with each other):",
-		...graph.communities.map(
-			(c, i) => `${i + 1}. ${c.map((m) => m.name).join(", ")}`,
 		),
 	];
 	return lines.join("\n");
@@ -271,6 +274,7 @@ export async function writeServerDossier(
 	}
 
 	const graph = await summarizeGraph(db, guildId);
+	const structure = await getSocialStructure(db, guildId);
 
 	const recent: ConversationRow[] = recentResult.data ?? [];
 	const largest: ConversationRow[] = largestResult.data ?? [];
@@ -334,6 +338,9 @@ export async function writeServerDossier(
 		"Social graph (from real replies, mentions and shared conversations):",
 		describeGraph(graph),
 		"",
+		"Where attention flows (measured from who replies to, mentions and answers whom):",
+		describeStructureOverview(structure).join("\n"),
+		"",
 		"Channels by messages in the last 30 days:",
 		channelRows.map((c) => `#${c.name} (${c.n})`).join(", ") || "none",
 		"",
@@ -369,8 +376,14 @@ export async function writeServerDossier(
 		overview: maskSlurs(String(generated.overview ?? "").trim()),
 		culture: maskSlurs(String(generated.culture ?? "").trim()),
 		topics,
-		hubs: graph.hubs.map((h) => ({ name: h.name, strength: h.strength })),
-		communities: graph.communities.map((c) => c.map((m) => m.name)),
+		structure: {
+			ranking: structure.ranking.slice(0, 10).map((r) => ({
+				name: r.name,
+				standing: Number(r.standing.toFixed(4)),
+			})),
+			cliques: structure.cliques.map((c) => c.members.map((m) => m.name)),
+			periphery: structure.periphery.map((p) => p.name),
+		},
 		recent: maskSlurs(String(generated.recent ?? "").trim()),
 		evidence: { conversations: total, members: graph.members },
 		written_at: new Date().toISOString(),

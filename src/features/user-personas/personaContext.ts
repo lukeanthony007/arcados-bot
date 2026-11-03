@@ -9,6 +9,12 @@ import type {
 	UserPersonaData,
 } from "../../database/PostgreSQLManager";
 import {
+	describeEdge,
+	describeProfile,
+	getAttentionEdge,
+	getAttentionProfile,
+} from "../social-intelligence/facts/attention";
+import {
 	type Connection,
 	describeStrength,
 	getConnections,
@@ -88,16 +94,27 @@ async function describeTopInteractions(
 		persona.user_id,
 		TOP_CONNECTIONS,
 	);
-	if (connections.length === 0) return "";
+	const attention = await getAttentionProfile(db, guildId, persona.user_id);
+	if (connections.length === 0 && !attention) return "";
 
 	const self = persona.display_name;
-	return [
-		`Who you (${self}) actually interact with most (from your replies, direct mentions and shared conversations; this overrides the profile about who you're close to):`,
-		...connections.map(
-			(connection) =>
-				`- ${connection.name} (<@${connection.user_id}>): ${describeConnection(connection)}`,
-		),
-	].join("\n");
+	const lines: string[] = [];
+	if (connections.length > 0) {
+		lines.push(
+			`Who you (${self}) actually interact with most (from your replies, direct mentions and shared conversations; this overrides the profile about who you're close to):`,
+			...connections.map(
+				(connection) =>
+					`- ${connection.name} (<@${connection.user_id}>): ${describeConnection(connection)}`,
+			),
+		);
+	}
+	if (attention) {
+		lines.push(
+			"Where your attention goes and who seeks you out (measured from who replies to, mentions and answers whom):",
+			...describeProfile(attention).map((line) => `- ${maskSlurs(line)}`),
+		);
+	}
+	return lines.join("\n");
 }
 
 async function loadMemberNames(
@@ -156,9 +173,10 @@ async function describeHistory(
 	const other = byId.get(personId);
 	if (!other) return "";
 
-	const [pair, profile, conversations, own, theirs, exchangeNotes] =
+	const [pair, edge, profile, conversations, own, theirs, exchangeNotes] =
 		await Promise.all([
 			getPairFacts(db, guildId, persona.user_id, personId),
+			getAttentionEdge(db, guildId, persona.user_id, personId),
 			getPairDossier(db, guildId, persona.user_id, personId),
 			db.query(
 				`SELECT start_time, topic_label, summary FROM conversation_segments
@@ -192,14 +210,15 @@ async function describeHistory(
 	];
 
 	if (pair) {
-		const direction = (
-			who: string,
-			to: string,
-			d: { replies: number; mentions: number; turns: number },
-		) =>
-			`${who} → ${to} ${d.replies} ${d.replies === 1 ? "reply" : "replies"}, ${d.mentions} ${d.mentions === 1 ? "mention" : "mentions"}, ${d.turns} addressed ${d.turns === 1 ? "turn" : "turns"}`;
 		lines.push(
-			`- Closeness: ${describeStrength(pair)}; ${direction("you", "them", pair.a_to_b)}; ${direction("them", "you", pair.b_to_a)}; ${pair.shared_conversations} shared conversations; last ${formatDate(pair.last_interaction)}`,
+			`- Closeness: ${describeStrength(pair)}; ${pair.shared_conversations} shared conversations; last ${formatDate(pair.last_interaction)}`,
+		);
+	}
+
+	if (edge) {
+		lines.push(
+			"- Where attention goes between you two (measured from who replies to, mentions and answers whom):",
+			...describeEdge(edge).map((line) => `  - ${maskSlurs(line)}`),
 		);
 	}
 

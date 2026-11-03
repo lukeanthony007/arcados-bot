@@ -6,6 +6,7 @@
  * text, and regenerated whole when stale. Nothing is appended to.
  */
 
+import type { AttentionEdge, AttentionProfile } from "../facts/attention";
 import type { PairFacts } from "../facts/closeness";
 import type { MemberFacts } from "../facts/memberFacts";
 
@@ -46,8 +47,11 @@ export interface MemberDossier {
 	people: string;
 	/** What they've been up to lately, with rough dates */
 	recent: string;
-	/** How they behave in group conversations: drive, respond, get ignored, tones given/received */
-	in_groups: string;
+	/**
+	 * Where their attention goes and comes from, who they pursue and who pursues them, how often
+	 * their bids land, their part in groups, warmth given and received
+	 */
+	social_position: string;
 	personality: {
 		big_five: Record<BigFiveTrait, TraitEstimate>;
 		/** Derived from big_five relative to the server; null until enough dossiers exist */
@@ -61,6 +65,8 @@ export interface MemberDossier {
 		sampled_messages: number;
 		/** Summarized conversations where they drove, responded, or were ignored */
 		roles: { driver: number; responder: number; ignored: number };
+		/** Measured attention profile the social_position section was written from */
+		attention: AttentionProfile | null;
 	};
 	written_at: string;
 }
@@ -81,6 +87,8 @@ export interface PairDossier {
 			a_to_b: Record<string, number>;
 			b_to_a: Record<string, number>;
 		};
+		/** Measured attention between the two (null when they share no episodes) */
+		attention: AttentionEdge | null;
 	};
 	written_at: string;
 }
@@ -92,10 +100,15 @@ export interface ServerDossier {
 	culture: string;
 	/** Recurring subjects, each with a short detail line */
 	topics: Array<{ topic: string; detail: string }>;
-	/** Most socially central members, from the closeness graph */
-	hubs: Array<{ name: string; strength: number }>;
-	/** Groups of members who mostly interact with each other, from the graph */
-	communities: string[][];
+	/**
+	 * Who attention gathers around, tight circles and who reaches out without much return,
+	 * from the measured attention network
+	 */
+	structure: {
+		ranking: Array<{ name: string; standing: number }>;
+		cliques: string[][];
+		periphery: string[];
+	};
 	/** What has been happening in the last few weeks */
 	recent: string;
 	evidence: {

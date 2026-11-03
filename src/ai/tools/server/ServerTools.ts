@@ -4,6 +4,10 @@ import {
   type DatabaseToolResult,
 } from "../registry/DatabaseTools";
 import { summarizeGraph } from "../../../features/social-intelligence/facts/graph";
+import {
+  describeStructureOverview,
+  getSocialStructure,
+} from "../../../features/social-intelligence/facts/attention";
 
 /**
  * Get server/guild statistics
@@ -368,7 +372,7 @@ export const getTrendingTopicsTool: DatabaseTool = {
 export const getServerNetworkTool: DatabaseTool = {
   name: "getServerNetwork",
   description:
-    "Get the shape of the server's social network from real interactions (replies, mentions, shared conversations): the biggest hubs (members with the most total interaction strength), the strongest pairs, friend-group communities, and how many members have no interactions. Strength is a recency-weighted interaction score; reciprocity is 1 for balanced pairs and 0 for one-sided.",
+    "Get the shape of the server's social network from real interactions (replies, mentions, shared conversations): the biggest hubs (members who receive the most conversational attention), the strongest pairs, friend-group communities (cliques of mutual attention), and how many members have no interactions. Pair strength is a recency-weighted interaction score; reciprocity is 1 for balanced pairs and 0 for one-sided. For the full attention hierarchy, bids and periphery use getSocialStructure.",
   parameters: {
     type: "object",
     properties: {},
@@ -429,6 +433,43 @@ export const getServerNetworkTool: DatabaseTool = {
 };
 
 /**
+ * Who attention flows toward, the cliques that form, and who is left at the edge
+ */
+export const getSocialStructureTool: DatabaseTool = {
+  name: "getSocialStructure",
+  description:
+    "Get the server's social hierarchy from how people attend to each other inside conversations: the ranking of who attention flows toward (standing, how many people give them attention, how often their bids for attention are answered), the cliques that form from mutual attention (with the tone inside each), and the periphery (people who keep bidding for attention and rarely get it). Use this for 'who is the most popular / central / listened to', 'who runs with whom', 'who gets ignored', or the server's overall pecking order.",
+  parameters: {
+    type: "object",
+    properties: {},
+    required: [],
+  },
+  execute: async (
+    params: {},
+    context: ToolContext
+  ): Promise<string | DatabaseToolResult> => {
+    try {
+      const structure = await getSocialStructure(context.db, context.guildId);
+      const lines = describeStructureOverview(structure);
+      return {
+        success: true,
+        summary: `${structure.ranking.length} ranked members, ${structure.cliques.length} cliques`,
+        data: { structure },
+        formatted: lines.length ? lines.join("\n") : "No attention data recorded yet.",
+      };
+    } catch (error) {
+      console.error("🔸 Error in getSocialStructure:", error);
+      return {
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to get social structure",
+      };
+    }
+  },
+};
+/**
  * Export all server tools for registration
  */
 export const serverTools: DatabaseTool[] = [
@@ -436,4 +477,5 @@ export const serverTools: DatabaseTool[] = [
   getActiveMembersTool,
   getTrendingTopicsTool,
   getServerNetworkTool,
+  getSocialStructureTool,
 ];

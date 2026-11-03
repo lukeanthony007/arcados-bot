@@ -23,11 +23,13 @@ export const RECENT_SPEAKERS = 4;
 export const ANSWER_WINDOW_MS = 5 * 60_000;
 /** How much the room competes for an implicit message's attention in a group */
 export const ROOM_WEIGHT = 0.45;
-/** A bid is answered when the target gives the bidder ≥ this mass within the window */
+/** A bid is answered when the target turns ≥ this share of a turn's attention to the bidder */
 export const ANSWER_MASS = 0.5;
-/** …within this many later messages or this much time */
-export const BID_WINDOW_MESSAGES = 8;
-export const BID_WINDOW_MS = 5 * 60_000;
+/** …within this many later turns (runs of messages by one author), and as long as a session gap */
+export const BID_WINDOW_TURNS = 4;
+export const BID_WINDOW_MS = 20 * 60_000;
+/** In groups, share of an implicit turn's attention that must go to one person to count as a bid */
+export const IMPLICIT_GROUP_BID_SHARE = 0.7;
 
 export interface AttentionMessage {
 	id: string;
@@ -184,9 +186,10 @@ export function focusMap(
 ): EpisodeFocus {
 	const matrix: EpisodeFocus["matrix"] = {};
 	const people: EpisodeFocus["people"] = {};
-	const person = (id: string) =>
-		people[id] ??
-		(people[id] = { given: 0, room: 0, received: 0, messages: 0 });
+	const person = (id: string) => {
+		people[id] ??= { given: 0, room: 0, received: 0, messages: 0 };
+		return people[id];
+	};
 	for (const m of messages) person(m.author_id);
 
 	for (const a of attention) {
@@ -196,7 +199,8 @@ export function focusMap(
 		for (const [to, mass] of Object.entries(a.to)) {
 			p.given += mass;
 			person(to).received += mass;
-			const row = matrix[a.from] ?? (matrix[a.from] = {});
+			matrix[a.from] ??= {};
+			const row = matrix[a.from] as Record<string, number>;
 			row[to] = (row[to] ?? 0) + mass;
 		}
 	}
@@ -210,51 +214,82 @@ export function focusMap(
 	};
 }
 
+/** A run of consecutive messages by one author: the unit of an attempt to get attention */
+interface Turn {
+	from: string;
+	first: AttentionMessage;
+	start: number;
+	end: number;
+	/** Share of the turn's attention per person (sums with `room` to 1) */
+	to: Record<string, number>;
+	room: number;
+	explicit: boolean;
+}
+
+function toTurns(
+	messages: AttentionMessage[],
+	attention: MessageAttention[],
+): Turn[] {
+	const turns: Turn[] = [];
+	for (const [i, a] of attention.entries()) {
+		const m = messages[i] as AttentionMessage;
+		const at = m.created_at.getTime();
+		const last = turns.at(-1);
+		if (last && last.from === a.from && at - last.end <= BID_WINDOW_MS) {
+			last.end = at;
+			last.room += a.room;
+			last.explicit ||= a.explicit;
+			for (const [to, mass] of Object.entries(a.to))
+				last.to[to] = (last.to[to] ?? 0) + mass;
+			continue;
+		}
+		turns.push({
+			from: a.from,
+			first: m,
+			start: at,
+			end: at,
+			to: { ...a.to },
+			room: a.room,
+			explicit: a.explicit,
+		});
+	}
+	return turns;
+}
+
 function findBids(
 	messages: AttentionMessage[],
 	attention: MessageAttention[],
 ): Bid[] {
+	const turns = toTurns(messages, attention);
 	const bids: Bid[] = [];
-	for (const [i, a] of attention.entries()) {
-		const m = messages[i] as AttentionMessage;
-		const [target, mass] = Object.entries(a.to).sort(
+	const group = new Set(messages.map((m) => m.author_id)).size > 2;
+	for (const [i, turn] of turns.entries()) {
+		const total = Object.values(turn.to).reduce((s, v) => s + v, 0) + turn.room;
+		const [target, mass] = Object.entries(turn.to).sort(
 			(x, y) => y[1] - x[1],
 		)[0] ?? [null, 0];
-		// Responding to someone who just addressed you is not a bid
-		const responding =
-			target !== null &&
-			attention
-				.slice(Math.max(0, i - 3), i)
-				.some(
-					(prev) =>
-						prev.from === target && (prev.to[a.from] ?? 0) >= ANSWER_MASS,
-				);
-		const toPerson = target !== null && mass >= 0.5 && !responding;
-		// A room bid opens fresh: first message, or the author's previous one is outside the window
-		const previous = i > 0 ? (messages[i - 1] as AttentionMessage) : undefined;
+		const share = total > 0 ? mass / total : 0;
+		// Answering someone who just turned to you is a response, not a bid
+		const responding = turns
+			.slice(Math.max(0, i - BID_WINDOW_TURNS), i)
+			.some(
+				(prev) =>
+					prev.from !== turn.from && turnShare(prev, turn.from) >= ANSWER_MASS,
+			);
+		// In a group, an implicit turn is only a bid when the attribution is strong; a reaction to
+		// someone's remark to the room is attention (counted in the matrix), not a bid for theirs
+		const needed = turn.explicit || !group ? 0.5 : IMPLICIT_GROUP_BID_SHARE;
+		const toPerson = target !== null && share >= needed && !responding;
 		const toRoom =
-			a.room >= 0.7 &&
-			(!previous ||
-				previous.author_id !== a.from ||
-				m.created_at.getTime() - previous.created_at.getTime() > BID_WINDOW_MS);
+			!toPerson && !responding && total > 0 && turn.room / total >= 0.7;
 		if (!toPerson && !toRoom) continue;
 
 		let answeredBy: string | null = null;
-		for (
-			let j = i + 1;
-			j < Math.min(attention.length, i + 1 + BID_WINDOW_MESSAGES);
-			j++
-		) {
-			const later = attention[j] as MessageAttention;
-			const laterMsg = messages[j] as AttentionMessage;
+		for (const later of turns.slice(i + 1, i + 1 + BID_WINDOW_TURNS)) {
+			if (later.start - turn.end > BID_WINDOW_MS) break;
+			if (later.from === turn.from) continue;
 			if (
-				laterMsg.created_at.getTime() - m.created_at.getTime() >
-				BID_WINDOW_MS
-			)
-				break;
-			if (later.from === a.from) continue;
-			if (
-				(later.to[a.from] ?? 0) >= ANSWER_MASS &&
+				turnShare(later, turn.from) >= ANSWER_MASS &&
 				(!toPerson || later.from === target)
 			) {
 				answeredBy = later.from;
@@ -262,15 +297,21 @@ function findBids(
 			}
 		}
 		bids.push({
-			message_id: a.id,
-			from: a.from,
+			message_id: turn.first.id,
+			from: turn.from,
 			to: toPerson ? target : null,
-			at: m.created_at,
-			explicit: a.explicit,
+			at: turn.first.created_at,
+			explicit: turn.explicit,
 			answered_by: answeredBy,
 		});
 	}
 	return bids;
+}
+
+/** Share of a turn's attention that went to one person */
+function turnShare(turn: Turn, to: string): number {
+	const total = Object.values(turn.to).reduce((s, v) => s + v, 0) + turn.room;
+	return total > 0 ? (turn.to[to] ?? 0) / total : 0;
 }
 
 function findStructures(

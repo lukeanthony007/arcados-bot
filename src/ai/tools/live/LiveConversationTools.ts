@@ -2,6 +2,8 @@ import {
 	describeStrength,
 	getPairFacts,
 } from "../../../features/social-intelligence/facts/closeness";
+import type { EpisodeFocus } from "../../../features/social-intelligence/conversations/attention";
+import { describeFocus } from "../../../features/social-intelligence/conversations/focusText";
 import type { DatabaseTool, ToolContext } from "../registry/DatabaseTools";
 
 interface SegmentRow {
@@ -53,6 +55,19 @@ async function loadNames(
 	}
 	return names;
 }
+
+interface FocusRow {
+	id: string;
+	participants: string[];
+	start_time: Date;
+	end_time: Date;
+	topic_label: string | null;
+	status: string;
+	focus: EpisodeFocus | null;
+}
+
+const FOCUS_SELECT = `SELECT id, participants, start_time, end_time, topic_label, status, focus
+	FROM conversation_segments`;
 
 async function getActiveSegments(
 	context: ToolContext,
@@ -646,9 +661,111 @@ Server-wide: ${enrichedChannels.reduce((sum, ch) => sum + ch.conversationCount, 
 	},
 };
 
+/**
+ * Social shape of a conversation: who is focused on whom, bids, centre, unattended
+ */
+export const getConversationFocus: DatabaseTool = {
+	name: "getConversationFocus",
+	description:
+		"Get what is happening socially in a conversation: who is paying attention to whom, which pairs are talking to each other, who is the centre of attention, who keeps turning to someone who gives little back, whose bids for attention go unanswered. Reads the channel's active conversation, or its most recent finished one; pass conversationId for a specific one. Use this when asked about the dynamics, vibe or social situation of a conversation (as opposed to what it is about).",
+	parameters: {
+		type: "object",
+		properties: {
+			channel: {
+				type: "string",
+				description:
+					"Channel ID or name (default: the current channel). Ignored when conversationId is given",
+			},
+			conversationId: {
+				type: "string",
+				description: "A specific conversation (segment) ID",
+			},
+		},
+		required: [],
+	},
+	execute: async (params: Record<string, unknown>, context: ToolContext) => {
+		try {
+			const conversationId =
+				typeof params.conversationId === "string" ? params.conversationId.trim() : "";
+			let row: FocusRow | undefined;
+			if (conversationId) {
+				const result = await context.db.query(
+					`${FOCUS_SELECT} WHERE guild_id = $1 AND id = $2`,
+					[context.guildId, conversationId],
+				);
+				row = result.success ? result.data?.[0] : undefined;
+			} else {
+				const channelId = await resolveChannelId(params.channel, context);
+				if (!channelId) return { success: false, error: "Channel not found" };
+				const result = await context.db.query(
+					`${FOCUS_SELECT}
+					 WHERE guild_id = $1 AND channel_id = $2 AND focus IS NOT NULL
+					 ORDER BY (status = 'active') DESC, end_time DESC LIMIT 1`,
+					[context.guildId, channelId],
+				);
+				row = result.success ? result.data?.[0] : undefined;
+			}
+			if (!row) {
+				return {
+					success: true,
+					summary: "No conversation found",
+					data: { found: false },
+					formatted: "No conversation with attention data found.",
+				};
+			}
+			const focus = row.focus;
+			if (!focus) {
+				return {
+					success: true,
+					summary: "Conversation has no attention data yet",
+					data: { found: true, hasFocus: false, conversationId: row.id },
+					formatted: "This conversation has no attention data yet.",
+				};
+			}
+			const focusIds = [
+				...Object.keys(focus.matrix),
+				...Object.values(focus.matrix).flatMap((r) => Object.keys(r)),
+				...focus.bids.flatMap((b) => (b.to ? [b.from, b.to] : [b.from])),
+			];
+			const names = await loadNames(context, [...row.participants, ...focusIds]);
+			const nameOf = (id: string) => names.get(id) ?? "Unknown User";
+			const lines = describeFocus(focus, nameOf);
+			const state = row.status === "active" ? "ongoing" : "finished";
+			const formatted = [
+				`Conversation (${state}, ${new Date(row.start_time).toLocaleString()} – ${new Date(row.end_time).toLocaleString()})${row.topic_label ? `: ${row.topic_label}` : ""}`,
+				`Participants: ${row.participants.map(nameOf).join(", ")}`,
+				...(lines.length ? lines : ["Nothing socially distinctive: no clear pairs, pursuits or unanswered bids."]),
+			].join("\n");
+			return {
+				success: true,
+				summary: `Social shape of a ${state} conversation with ${row.participants.length} participants`,
+				data: {
+					found: true,
+					hasFocus: true,
+					conversationId: row.id,
+					status: row.status,
+					participants: row.participants.map((userId) => ({
+						userId,
+						displayName: nameOf(userId),
+					})),
+					focus,
+				},
+				formatted,
+			};
+		} catch (error) {
+			console.error("🔸 Error in getConversationFocus:", error);
+			return {
+				success: false,
+				error: "Unable to retrieve conversation focus",
+			};
+		}
+	},
+};
+
 export const liveConversationTools = [
 	getLiveConversationContext,
 	getConversationParticipantRelationships,
+	getConversationFocus,
 	getRecentChannelTopics,
 	getServerActivitySummary,
 ];

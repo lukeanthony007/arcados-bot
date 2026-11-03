@@ -75,7 +75,8 @@ describe("attributeAttention", () => {
 			]),
 			none,
 		);
-		const last = out[2]!;
+		const last = out[2];
+		if (!last) throw new Error("expected three attributions");
 		expect(last.to.b).toBeGreaterThan(last.to.a ?? 0);
 		expect(last.room).toBeGreaterThan(0);
 	});
@@ -90,8 +91,9 @@ describe("attributeAttention", () => {
 			[9, "c"],
 			[12, "d"],
 		];
-		const without = attributeAttention(msgs(spec), none)[3]!;
-		const withPrior = attributeAttention(msgs(spec), prior)[3]!;
+		const without = attributeAttention(msgs(spec), none)[3];
+		const withPrior = attributeAttention(msgs(spec), prior)[3];
+		if (!without || !withPrior) throw new Error("expected four attributions");
 		expect(without.to.c).toBeGreaterThan(without.to.a ?? 0);
 		expect(withPrior.to.a).toBeGreaterThan(withPrior.to.c ?? 0);
 	});
@@ -116,14 +118,15 @@ describe("focusMap", () => {
 		const spec: Array<
 			[number, string, { replyTo?: string; mentions?: string[] }?]
 		> = [];
-		let t = 0;
 		for (let i = 0; i < 4; i++) {
-			spec.push([(t += 5), "a", { mentions: ["b"] }]);
-			spec.push([(t += 5), "b", { mentions: ["a"] }]);
-			spec.push([(t += 5), "c", { mentions: ["a"] }]);
+			const t = i * 15;
+			spec.push([t + 5, "a", { mentions: ["b"] }]);
+			spec.push([t + 10, "b", { mentions: ["a"] }]);
+			spec.push([t + 15, "c", { mentions: ["a"] }]);
 		}
-		spec.push([(t += 400), "e"]);
-		spec.push([(t += 400), "e"]);
+		// Two separate attempts: more than a session gap apart, so they are separate turns
+		spec.push([460, "e"]);
+		spec.push([1960, "e"]);
 		const m = msgs(spec);
 		const focus = focusMap(m, attributeAttention(m, none));
 		const kinds = focus.structures.map((s) => s.kind);
