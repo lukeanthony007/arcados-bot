@@ -15,7 +15,7 @@
  * re-run, diff.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { config } from "../../../config/index.js";
 import { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { SLUR_PATTERN } from "../../user-personas/personaPrompt";
@@ -29,7 +29,14 @@ import {
 	type SegmentMessage,
 	segment,
 } from "../conversations/segmenter";
-import { ConversationEnrichmentPipeline } from "../enrichment-pipeline/layers/ConversationEnrichmentPipeline";
+import {
+	type StorylineEpisode,
+	buildStorylines,
+} from "../conversations/storylines";
+import {
+	ConversationEnrichmentPipeline,
+	type GeneratedSummary,
+} from "../enrichment-pipeline/layers/ConversationEnrichmentPipeline";
 import { FACTS_TIME_ZONE } from "../facts/memberFacts";
 
 interface Row {
@@ -48,7 +55,7 @@ const SLURS = new RegExp(SLUR_PATTERN.source, "gi");
 async function main() {
 	const [day, channelArg, ...flags] = process.argv.slice(2);
 	if (!day) throw new Error("Usage: rnd:day <YYYY-MM-DD> [channel] [--model]");
-	const useModel = flags.includes("--model");
+	const useModel = flags.includes("--model") || flags.includes("--reuse");
 	const guildId = config.guildId;
 	if (!guildId) throw new Error("GUILD_ID is not configured");
 	const db = new PostgreSQLManager();
@@ -149,13 +156,29 @@ async function main() {
 		roleCounts.set(id, { driver: 0, responder: 0, ignored: 0 }).get(id)!;
 
 	let session = "";
+	let episodeNumber = 0;
+	const storylineInput: StorylineEpisode[] = [];
+	// Summaries from a previous run, so iterating on later steps doesn't re-run the summarizer
+	const cacheFile = `rnd/out/${day}-${channel.name.replace(/[^\w-]+/g, "_")}.describe.json`;
+	const cache = new Map<string, GeneratedSummary>(
+		flags.includes("--reuse") && existsSync(cacheFile)
+			? Object.entries(
+					JSON.parse(readFileSync(cacheFile, "utf8")) as Record<
+						string,
+						GeneratedSummary
+					>,
+				)
+			: [],
+	);
+	mkdirSync("rnd/out", { recursive: true });
 	for (const conv of conversations) {
+		episodeNumber++;
 		if (conv.session_id !== session) {
 			session = conv.session_id;
 			out.push(`## Session ${clock(conv.start)}`, "");
 		}
 		out.push(
-			`### ${clock(conv.start)}–${clock(conv.end)} · ${conv.messages.length} messages · ${conv.participants.map(nameOf).join(", ")}`,
+			`### E${episodeNumber} · ${clock(conv.start)}–${clock(conv.end)} · ${conv.messages.length} messages · ${conv.participants.map(nameOf).join(", ")}`,
 			"",
 		);
 		for (const m of conv.messages) {
@@ -192,11 +215,11 @@ async function main() {
 					embeds: row.embeds,
 				};
 			});
-			const generated = await pipeline.describe(
-				previews,
-				names,
-				conv.participants.length,
-			);
+			const cacheKey = `${conv.id}:${conv.messages.length}`;
+			const generated =
+				cache.get(cacheKey) ??
+				(await pipeline.describe(previews, names, conv.participants.length));
+			if (generated) cache.set(cacheKey, generated);
 			if (!generated) {
 				out.push("**Summarizer:** failed", "");
 				continue;
@@ -212,7 +235,23 @@ async function main() {
 				"",
 				`**Dynamics:** ${clean(d.note)}`,
 				"",
+				`**Bits:** ${d.bits.map(clean).join(" · ") || "none"}`,
+				"",
 			);
+			storylineInput.push({
+				index: episodeNumber,
+				start: conv.start,
+				end: conv.end,
+				participants: conv.participants.map(nameOf),
+				topic: generated.topicLabel,
+				summary: clean(generated.summary),
+				dynamics: clean(d.note),
+				exchanges: d.exchanges.map(
+					(x) =>
+						`${nameOf(x.from)} → ${nameOf(x.to)} [${x.tone}]: ${clean(x.note)}`,
+				),
+				bits: d.bits.map(clean),
+			});
 			out.push(
 				`- drivers: ${d.roles.drivers.map(nameOf).join(", ") || "—"} · responders: ${d.roles.responders.map(nameOf).join(", ") || "—"} · ignored: ${d.roles.ignored.map(nameOf).join(", ") || "—"}`,
 			);
@@ -235,6 +274,51 @@ async function main() {
 		}
 	}
 
+	if (useModel && storylineInput.length >= 2) {
+		out.push("## Storylines", "");
+		const built = await buildStorylines(
+			storylineInput,
+			idByName,
+			FACTS_TIME_ZONE,
+		);
+		if (!built) out.push("Storyline linker failed.", "");
+		else if (!built.storylines.length)
+			out.push("None: every conversation stood alone.", "");
+		if (built?.links.length) {
+			out.push(
+				`Agreed pairs: ${built.links.length}; weakest: ${built.links
+					.sort((a, b) => a.from - b.from)
+					.filter((l) => l.agreement < 1)
+					.map(
+						(l) =>
+							`E${l.to}+E${l.from} ${l.kind} ${Math.round(l.agreement * 100)}%`,
+					)
+					.join(", ")}`,
+				"",
+			);
+		}
+		for (const s of built?.storylines ?? []) {
+			const spans = s.episodes
+				.map((i) => storylineInput.find((e) => e.index === i))
+				.filter((e): e is StorylineEpisode => !!e)
+				.map((e) => `E${e.index} ${clock(e.start)}`);
+			out.push(
+				`### ${s.kind === "bit" ? "Bit" : "Thread"}: ${s.title}${s.open ? " (open)" : ""}`,
+				"",
+				`${spans.join(" → ")}`,
+				"",
+				clean(s.arc),
+				"",
+				...s.people.map((p) => `- ${nameOf(p.user_id)}: ${clean(p.part)}`),
+				"",
+			);
+		}
+	}
+	if (useModel)
+		writeFileSync(
+			cacheFile,
+			JSON.stringify(Object.fromEntries(cache), null, 1),
+		);
 	out.push("## Day map", "");
 	out.push("### Who addressed whom (inferred turns, all conversations)", "");
 	for (const [key, n] of [...turnTotals]

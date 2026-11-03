@@ -29,6 +29,7 @@ export interface WrittenDynamics {
 	note: string;
 	roles: { drivers: string[]; responders: string[]; ignored: string[] };
 	exchanges: Array<{ from: string; to: string; tone: string; note: string }>;
+	bits?: string[];
 }
 
 /** What is stored (people by user id) */
@@ -37,6 +38,8 @@ export interface ConversationDynamics {
 	note: string;
 	roles: { drivers: string[]; responders: string[]; ignored: string[] };
 	exchanges: Array<{ from: string; to: string; tone: Tone; note: string }>;
+	/** Running jokes, recurring phrases, memorable lines: "who: what" */
+	bits: string[];
 }
 
 /**
@@ -109,6 +112,7 @@ export function toStoredDynamics(
 	const exchanges = [...byPair.values()];
 	return {
 		note: (written.note ?? "").trim(),
+		bits: (written.bits ?? []).map((b) => b.trim()).filter(Boolean),
 		roles: {
 			drivers: resolve(written.roles?.drivers ?? []),
 			responders: resolve(written.roles?.responders ?? []),

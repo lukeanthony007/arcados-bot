@@ -65,8 +65,14 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 					description:
 						"One sentence consistent with roles and exchanges: who it was between, who drove it, who was talking to the room unanswered",
 				},
+				bits: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Running jokes, recurring phrases, nicknames, memorable lines: "Name: what" with a short quote; at most 4',
+				},
 			},
-			required: ["roles", "exchanges", "note"],
+			required: ["roles", "exchanges", "note", "bits"],
 		},
 	},
 	required: ["summary", "topic_label", "dynamics"],
@@ -540,6 +546,7 @@ Then describe the DYNAMICS, which matter as much as the topics. Fill them in thi
 - "roles": drivers (set the subject or kept it going), responders (mostly reacted), ignored (posted and got no uptake). Names exactly as shown before each line; a person goes in one list only.
 - "exchanges": one entry per direction for every pair that actually talked to each other, the MAIN thread first (e.g. "toast → lunchie venting about J", then "lunchie → toast advising her to move out"), then side exchanges; at most 8. Each has a tone (${TONES.join(", ")}) and a short note quoting or paraphrasing what the first person did to or for the second.
 - "note": one sentence consistent with the roles and exchanges: who it was really between, who drove it, who was talking to the room unanswered.
+- "bits": running jokes, recurring phrases, nicknames, catchphrases or memorable lines in this conversation, each as "Name: what" with a short quote (e.g. "Sam: keeps calling everything \"goated\""); include side remarks, they are how this group bonds; at most 4, empty if none.
 
 Conversation (${messageCount} messages, ${participantCount} participants):
 ${messagePreview}
