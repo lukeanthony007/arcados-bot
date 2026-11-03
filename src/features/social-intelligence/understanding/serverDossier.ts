@@ -325,7 +325,9 @@ export async function writeServerDossier(
 	const largestBlock = takeWithin(largestLines, EVIDENCE_BUDGET * 0.4);
 
 	const messages30d = Number(activityResult.data?.[0]?.messages ?? 0);
-	const since = activityResult.data?.[0]?.since ? day(activityResult.data[0].since) : "unknown";
+	const since = activityResult.data?.[0]?.since
+		? day(activityResult.data[0].since)
+		: "unknown";
 	const prompt = [
 		`Write the server notes. Active since ${since}. Members: ${graph.members} active. Messages in the last 30 days: ${messages30d}. Summarized conversations on record: ${total}. Today: ${day(new Date())}.`,
 		"",

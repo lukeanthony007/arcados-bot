@@ -11,6 +11,7 @@
  */
 
 import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
+import { inferTurns } from "./addressing";
 import {
 	GAP_MS,
 	MAX_SPAN_MS,
@@ -24,6 +25,9 @@ import {
 
 /** Messages that are commands to other bots are not conversation */
 const BOT_COMMAND = /^\s*(m!|!|\$|\/)[a-z]/i;
+const MENTION = /<@!?(\d+)>/g;
+/** A message pinging more people than this is a group ping, not an address */
+const MAX_MENTIONS = 3;
 
 /** Jaccard overlap above which a re-segmented conversation keeps an old one's id and summary */
 const KEEP_SUMMARY_OVERLAP = 0.8;
@@ -69,14 +73,27 @@ async function loadMessages(
 	);
 	if (!result.success)
 		throw new Error(`Loading messages failed: ${result.error}`);
-	return ((result.data ?? []) as MessageRow[])
+	const rows = (result.data ?? []) as MessageRow[];
+	const authors = new Set(rows.map((row) => row.author_id));
+	return rows
 		.filter((row) => !BOT_COMMAND.test(row.content))
-		.map((row) => ({
-			id: row.id,
-			author_id: row.author_id,
-			created_at: new Date(row.created_at),
-			referenced_message_id: row.referenced_message_id,
-		}));
+		.map((row) => {
+			const mentioned = [...row.content.matchAll(MENTION)].map(
+				(m) => m[1] as string,
+			);
+			return {
+				id: row.id,
+				author_id: row.author_id,
+				created_at: new Date(row.created_at),
+				referenced_message_id: row.referenced_message_id,
+				mentions:
+					mentioned.length > MAX_MENTIONS
+						? []
+						: [...new Set(mentioned)].filter(
+								(id) => id !== row.author_id && authors.has(id),
+							),
+			};
+		});
 }
 
 async function loadStored(
@@ -97,6 +114,36 @@ async function loadStored(
 
 function sameIds(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
+/** Replace the rule-inferred addressee counts for one conversation */
+async function writeInferredTurns(
+	db: PostgreSQLManager,
+	conversationId: string,
+	seg: Segment,
+): Promise<void> {
+	const turns = inferTurns(seg.messages);
+	const del = await db.query(
+		"DELETE FROM conversation_exchanges WHERE conversation_id = $1 AND source = 'rule'",
+		[conversationId],
+	);
+	if (!del.success)
+		throw new Error(
+			`Clearing turns for ${conversationId} failed: ${del.error}`,
+		);
+	if (!turns.length) return;
+	const ins = await db.query(
+		`INSERT INTO conversation_exchanges (conversation_id, from_user, to_user, source, turns)
+		 SELECT $1, f, t, 'rule', n FROM unnest($2::text[], $3::text[], $4::int[]) AS x(f, t, n)`,
+		[
+			conversationId,
+			turns.map((t) => t.from),
+			turns.map((t) => t.to),
+			turns.map((t) => t.turns),
+		],
+	);
+	if (!ins.success)
+		throw new Error(`Writing turns for ${conversationId} failed: ${ins.error}`);
 }
 
 /**
@@ -180,6 +227,7 @@ async function reconcile(
 		if (!upsert.success)
 			throw new Error(`Storing conversation ${id} failed: ${upsert.error}`);
 		result.upserted++;
+		await writeInferredTurns(db, id, seg);
 		if (status === "active") result.open.push(seg);
 		else if (previous?.status !== "finalized" || summaryStale)
 			result.finalized.push(seg);

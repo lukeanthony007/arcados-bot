@@ -473,10 +473,27 @@ export class PostgreSQLManager {
 				ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 			`);
 
-      // Topic label written by the conversation summarizer
+      // Written by the conversation summarizer: topic label and directional dynamics
       await client.query(`
 				ALTER TABLE conversation_segments
-				ADD COLUMN IF NOT EXISTS topic_label TEXT
+				ADD COLUMN IF NOT EXISTS topic_label TEXT,
+				ADD COLUMN IF NOT EXISTS dynamics JSONB
+			`);
+
+      // Who addressed whom inside a conversation: 'rule' rows are inferred turns
+      // (conversations/addressing.ts, feed closeness); 'model' rows carry tone from the summarizer
+      await client.query(`
+				CREATE TABLE IF NOT EXISTS conversation_exchanges (
+					conversation_id VARCHAR(50) NOT NULL REFERENCES conversation_segments(id) ON DELETE CASCADE,
+					from_user VARCHAR(20) NOT NULL,
+					to_user VARCHAR(20) NOT NULL,
+					source VARCHAR(10) NOT NULL,
+					turns INTEGER NOT NULL DEFAULT 1,
+					tone TEXT,
+					note TEXT,
+					PRIMARY KEY (conversation_id, from_user, to_user, source)
+				);
+				CREATE INDEX IF NOT EXISTS idx_conversation_exchanges_pair ON conversation_exchanges(from_user, to_user);
 			`);
       // Add voice conversation columns (migration)
       await client.query(`

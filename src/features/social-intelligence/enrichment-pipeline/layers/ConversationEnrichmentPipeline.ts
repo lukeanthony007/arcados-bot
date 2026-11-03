@@ -13,10 +13,13 @@ import { pgvector, type PostgreSQLManager } from "../../../../database/PostgreSQ
 import { type JsonObjectSchema, OmpRuntime } from "../../../../ai/runtime/OmpRuntime";
 import { SLUR_PATTERN } from "../../../user-personas/personaPrompt";
 import { ENRICHMENT_SYSTEM_PROMPT } from "../enrichmentPrompt";
+import { TONES, type WrittenDynamics, toStoredDynamics } from "../../conversations/dynamics";
 import { EmbeddingService } from "../../semantic-analysis/EmbeddingService.js";
 import { EnrichmentRateLimiter } from "../EnrichmentRateLimiter";
 
 const SLUR_MASK = new RegExp(SLUR_PATTERN.source, "gi");
+
+const NAME_LIST = { type: "array", items: { type: "string" } };
 
 const SUMMARY_SCHEMA: JsonObjectSchema = {
 	type: "object",
@@ -30,18 +33,54 @@ const SUMMARY_SCHEMA: JsonObjectSchema = {
 			description:
 				"2-5 words naming the subject, e.g. 'A Plague Tale' or \"JOHNNY's work suspension\"",
 		},
+		dynamics: {
+			type: "object",
+			description: "Who the conversation was really between and how they treated each other",
+			properties: {
+				note: {
+					type: "string",
+					description:
+						"One sentence: who it was between, who drove it, who was talking to the room unanswered",
+				},
+				roles: {
+					type: "object",
+					properties: { drivers: NAME_LIST, responders: NAME_LIST, ignored: NAME_LIST },
+					required: ["drivers", "responders", "ignored"],
+				},
+				exchanges: {
+					type: "array",
+					description: "Directed relationships that showed in this conversation, at most 6",
+					items: {
+						type: "object",
+						properties: {
+							from: { type: "string", description: "Display name exactly as shown" },
+							to: { type: "string", description: "Display name exactly as shown" },
+							tone: { type: "string", enum: [...TONES] },
+							note: {
+								type: "string",
+								description: "What from did to/for to, short, quoting where useful",
+							},
+						},
+						required: ["from", "to", "tone", "note"],
+					},
+				},
+			},
+			required: ["note", "roles", "exchanges"],
+		},
 	},
-	required: ["summary", "topic_label"],
+	required: ["summary", "topic_label", "dynamics"],
 };
 
 interface WrittenSummary {
 	summary: string;
 	topic_label: string;
+	dynamics: WrittenDynamics;
 }
 
 interface GeneratedSummary {
 	summary: string;
 	topicLabel: string;
+	dynamics: WrittenDynamics;
 }
 
 interface PreviewMessage {
@@ -208,11 +247,15 @@ export class ConversationEnrichmentPipeline {
 			// Update database with enrichment metadata
 			const enrichmentVersion = (segment.enrichment_version || 0) + 1;
 
+			const idByName = new Map([...names].map(([id, name]) => [name, id]));
+			const dynamics = toStoredDynamics(generated.dynamics, idByName);
+
 			const updateResult = await this.db.query(
 				`
 				UPDATE conversation_segments
 				SET summary = $2,
 					topic_label = $3,
+					dynamics = $7,
 					embedding = COALESCE($4::vector, embedding),
 					enrichment_version = $5,
 					last_enriched_at = NOW(),
@@ -229,6 +272,7 @@ export class ConversationEnrichmentPipeline {
 					embedding ? pgvector.toSql(embedding) : null,
 					enrichmentVersion,
 					confidence,
+					JSON.stringify(dynamics),
 				],
 			);
 
@@ -244,6 +288,28 @@ export class ConversationEnrichmentPipeline {
 					error: "Conversation segment disappeared before save",
 					skipped: true,
 				};
+			}
+
+			// Directed exchanges as rows, so pair dossiers and tools can query them across conversations
+			await this.db.query(
+				"DELETE FROM conversation_exchanges WHERE conversation_id = $1 AND source = 'model'",
+				[conversationId],
+			);
+			if (dynamics.exchanges.length) {
+				const rows = await this.db.query(
+					`INSERT INTO conversation_exchanges (conversation_id, from_user, to_user, source, turns, tone, note)
+					 SELECT $1, f, t, 'model', 1, tone, note
+					 FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS x(f, t, tone, note)
+					 ON CONFLICT DO NOTHING`,
+					[
+						conversationId,
+						dynamics.exchanges.map((x) => x.from),
+						dynamics.exchanges.map((x) => x.to),
+						dynamics.exchanges.map((x) => x.tone),
+						dynamics.exchanges.map((x) => x.note),
+					],
+				);
+				if (!rows.success) throw new Error(`failed to save exchanges: ${rows.error}`);
 			}
 
 			// Track actual cost (approximate)
@@ -331,15 +397,15 @@ export class ConversationEnrichmentPipeline {
 	 * Sample messages for preview (beginning, middle, end)
 	 */
 	private sampleMessages(messages: PreviewMessage[]): PreviewMessage[] {
-		if (messages.length <= 30) {
+		if (messages.length <= 60) {
 			return messages;
 		}
 
-		// Take first 10, middle 10, last 10
-		const start = messages.slice(0, 10);
-		const middleIndex = Math.floor(messages.length / 2) - 5;
-		const middle = messages.slice(middleIndex, middleIndex + 10);
-		const end = messages.slice(-10);
+		// Take first 20, middle 20, last 20
+		const start = messages.slice(0, 20);
+		const middleIndex = Math.floor(messages.length / 2) - 10;
+		const middle = messages.slice(middleIndex, middleIndex + 20);
+		const end = messages.slice(-20);
 		return [...start, ...middle, ...end];
 	}
 
@@ -421,7 +487,7 @@ export class ConversationEnrichmentPipeline {
 				return `${author}: ${scrub(fullContent)}`;
 			})
 			.join("\n")
-			.substring(0, 3000);
+			.substring(0, 6000);
 	}
 
 	/**
@@ -463,6 +529,11 @@ RULES:
 9. When multiple topics appear, emphasize the ones that span the most messages or have emotional weight (arguments, complaints, requests)
 10. The topic_label names the dominant subject (a game, event, person's situation), not a generic activity like "chatting" or "banter"
 
+Then describe the DYNAMICS, which matter as much as the topics:
+- "note": one sentence on who this conversation was really between, who drove it, and who (if anyone) was talking to the room and getting no response.
+- "roles": drivers (set the subject or kept it going), responders (mostly reacted), ignored (posted and got no uptake). Names only; a person can be in one list.
+- "exchanges": the directed relationships that showed in THIS conversation, at most 6, each from one named person to another with a tone (${TONES.join(", ")}) and a short note quoting or paraphrasing what they did to or for the other person (e.g. "kept egging alex on with the alien bit", "asked if he was at work"). Skip pairs that didn't really interact.
+
 Conversation (${messageCount} messages, ${participantCount} participants):
 ${messagePreview}
 
@@ -487,8 +558,8 @@ Each line is "Name: message".`;
 				});
 				const summary = written?.summary?.trim();
 				const topicLabel = written?.topic_label?.trim();
-				if (summary && topicLabel) {
-					return { summary, topicLabel };
+				if (summary && topicLabel && written?.dynamics) {
+					return { summary, topicLabel, dynamics: written.dynamics };
 				}
 				failure = "no structured summary submitted";
 			} catch (error) {

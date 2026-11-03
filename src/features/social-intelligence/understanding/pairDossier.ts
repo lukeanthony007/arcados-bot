@@ -15,12 +15,18 @@ import {
 	getGuildGraph,
 	getPairFacts,
 } from "../facts/closeness";
+import {
+	formatTally,
+	getPairExchangeNotes,
+	getPairToneTallies,
+} from "../facts/exchanges";
 import type { PairDossier } from "./types";
 
 export const MIN_SHARED_CONVERSATIONS = 3;
 export const STALE_AFTER_CONVERSATIONS = 3;
 
 const MAX_SUMMARIES = 20;
+const MAX_EXCHANGES = 25;
 const MAX_MESSAGES = 40;
 /** Candidate rows fetched before filtering noise down to MAX_MESSAGES */
 const MESSAGE_FETCH = 160;
@@ -224,9 +230,11 @@ export async function writePairDossier(
 	const shared = await countShared(db, guildId, a, b);
 	if (shared < MIN_SHARED_CONVERSATIONS) return null;
 
-	const [summaries, candidates] = await Promise.all([
+	const [summaries, candidates, exchangeNotes, tallies] = await Promise.all([
 		loadSharedSummaries(db, guildId, a, b),
 		loadMessages(db, guildId, a, b),
+		getPairExchangeNotes(db, guildId, a, b, MAX_EXCHANGES),
+		getPairToneTallies(db, guildId, a, b),
 	]);
 
 	// Names for the pair plus anyone @mentioned in the sampled messages
@@ -270,15 +278,32 @@ export async function writePairDossier(
 
 	const factLines = [
 		`${describeStrength(facts)}`,
-		`${nameA} → ${nameB}: ${facts.a_to_b.replies} replies, ${facts.a_to_b.mentions} mentions`,
-		`${nameB} → ${nameA}: ${facts.b_to_a.replies} replies, ${facts.b_to_a.mentions} mentions`,
+		`${nameA} → ${nameB}: ${facts.a_to_b.replies} replies, ${facts.a_to_b.mentions} mentions, ${facts.a_to_b.turns} inferred addressed turns`,
+		`${nameB} → ${nameA}: ${facts.b_to_a.replies} replies, ${facts.b_to_a.mentions} mentions, ${facts.b_to_a.turns} inferred addressed turns`,
 		`${shared} summarized shared conversations; last interaction ${formatDate(facts.last_interaction)}`,
 	];
+
+	const exchangeLines = exchangeNotes.map((x) => {
+		const from = names.get(x.from_user) ?? "someone";
+		const to = names.get(x.to_user) ?? "someone";
+		return `${formatDate(x.start_time)} ${from} → ${to} [${x.tone}] ${maskSlurs(x.note)}`;
+	});
+	const exchangeBlock = `Tone tallies over all summarized conversations:
+${nameA} → ${nameB}: ${formatTally(tallies.a_to_b)}
+${nameB} → ${nameA}: ${formatTally(tallies.b_to_a)}
+
+Newest ${exchangeLines.length} notes:
+${exchangeLines.join("\n") || "(none)"}`;
 
 	const prompt = `Write the notes on the relationship between ${nameA} and ${nameB}.
 
 Measured facts:
 ${factLines.map((line) => `- ${line}`).join("\n")}
+
+How they treat each other (from conversation notes; who addresses whom and in what tone):
+${exchangeBlock}
+
+Ground "dynamic" and "tone" in this: who initiates, who teases whom, who asks after whom, and any asymmetry between the two directions. If few notes exist, say the evidence is thin.
 
 Shared conversation summaries (${shared} in total, newest ${summaryLines.length} shown):
 ${summaryBlock || "(none)"}
@@ -310,6 +335,7 @@ ${messageBlock || "(none sampled)"}`;
 		evidence: {
 			shared_conversations: shared,
 			sampled_messages: messageLines.length,
+			exchanges: tallies,
 		},
 		written_at: new Date().toISOString(),
 	};
@@ -343,12 +369,18 @@ export function renderPairDossier(
 	nameB: string,
 ): string {
 	const balance = d.facts.reciprocity >= 0.67 ? ", both reach out" : "";
-	return [
+	const lines = [
 		`${nameA} & ${nameB}: ${describeStrength(d.facts)}${balance}`,
 		`Dynamic: ${d.dynamic}`,
 		`History: ${d.history}`,
 		`Tone: ${d.tone}`,
-	].join("\n");
+	];
+	if (d.evidence.exchanges) {
+		lines.push(
+			`Tone tallies from conversation notes: ${nameA} → ${nameB}: ${formatTally(d.evidence.exchanges.a_to_b)}; ${nameB} → ${nameA}: ${formatTally(d.evidence.exchanges.b_to_a)}`,
+		);
+	}
+	return lines.join("\n");
 }
 
 /** Closest pairs whose dossier is missing or has fallen behind their shared conversations */

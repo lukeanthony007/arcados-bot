@@ -46,6 +46,8 @@ export interface MemberDossier {
 	people: string;
 	/** What they've been up to lately, with rough dates */
 	recent: string;
+	/** How they behave in group conversations: drive, respond, get ignored, tones given/received */
+	in_groups: string;
 	personality: {
 		big_five: Record<BigFiveTrait, TraitEstimate>;
 		/** Derived from big_five relative to the server; null until enough dossiers exist */
@@ -57,6 +59,8 @@ export interface MemberDossier {
 		messages: number;
 		conversations: number;
 		sampled_messages: number;
+		/** Summarized conversations where they drove, responded, or were ignored */
+		roles: { driver: number; responder: number; ignored: number };
 	};
 	written_at: string;
 }
@@ -72,6 +76,11 @@ export interface PairDossier {
 	evidence: {
 		shared_conversations: number;
 		sampled_messages: number;
+		/** Tone counts from the summarizer's directed exchanges, per direction (a = lower id) */
+		exchanges: {
+			a_to_b: Record<string, number>;
+			b_to_a: Record<string, number>;
+		};
 	};
 	written_at: string;
 }

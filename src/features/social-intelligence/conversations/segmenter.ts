@@ -23,6 +23,8 @@ export interface SegmentMessage {
 	author_id: string;
 	created_at: Date;
 	referenced_message_id: string | null;
+	/** Members directly mentioned (bots and self excluded, group pings dropped) */
+	mentions: string[];
 }
 
 export interface Segment {

@@ -102,7 +102,13 @@ const SCHEMA = {
 		},
 		recent: {
 			type: "string",
-			description: "What they have been up to lately, with rough dates: events in their life, things they did or said here. Prose, not a list of quotes.",
+			description:
+				"What they have been up to lately, with rough dates: events in their life, things they did or said here. Prose, not a list of quotes.",
+		},
+		in_groups: {
+			type: "string",
+			description:
+				"How they behave in group conversations: whether they start and carry them or mostly respond, whether they get ignored, the tones they hand out and receive and from whom. Concrete, 2-4 sentences; if the group evidence is thin, say so.",
 		},
 		personality: {
 			type: "object",
@@ -119,6 +125,7 @@ const SCHEMA = {
 		"interests",
 		"people",
 		"recent",
+		"in_groups",
 		"personality",
 	],
 };
@@ -129,6 +136,7 @@ interface WrittenSections {
 	interests: string[];
 	people: string;
 	recent: string;
+	in_groups?: string;
 	personality: Record<BigFiveTrait, TraitEstimate>;
 }
 
@@ -186,6 +194,113 @@ async function getSummaries(
 	const rows: SummaryRow[] = recent.success && recent.data ? recent.data : [];
 	const count = total.success && total.data ? Number(total.data[0]?.n ?? 0) : 0;
 	return { rows, total: count };
+}
+
+interface GroupEvidence {
+	roles: { driver: number; responder: number; ignored: number };
+	lines: string[];
+}
+
+const GROUP_NOTE_LIMIT = 10;
+const GROUP_TONES_SHOWN = 3;
+const GROUP_COUNTERPARTS = 3;
+
+/** Role counts, tones given/received and recent conversation notes from stored dynamics */
+async function getGroupEvidence(
+	db: PostgreSQLManager,
+	guildId: string,
+	userId: string,
+	names: Map<string, string>,
+): Promise<GroupEvidence> {
+	const [rolesResult, exchangesResult, notesResult] = await Promise.all([
+		db.query(
+			`SELECT COUNT(*)::int AS total,
+				COUNT(*) FILTER (WHERE dynamics->'roles'->'drivers' @> to_jsonb($2::text))::int AS driver,
+				COUNT(*) FILTER (WHERE dynamics->'roles'->'responders' @> to_jsonb($2::text))::int AS responder,
+				COUNT(*) FILTER (WHERE dynamics->'roles'->'ignored' @> to_jsonb($2::text))::int AS ignored
+			FROM conversation_segments
+			WHERE guild_id = $1 AND dynamics IS NOT NULL AND $2 = ANY(participants)`,
+			[guildId, userId],
+		),
+		db.query(
+			`SELECT x.from_user, x.to_user, x.tone, COUNT(*)::int AS n
+			FROM conversation_exchanges x
+			JOIN conversation_segments s ON s.id = x.conversation_id
+			WHERE s.guild_id = $1 AND x.source = 'model' AND (x.from_user = $2 OR x.to_user = $2)
+			GROUP BY x.from_user, x.to_user, x.tone`,
+			[guildId, userId],
+		),
+		db.query(
+			`SELECT start_time, dynamics->>'note' AS note
+			FROM conversation_segments
+			WHERE guild_id = $1 AND dynamics IS NOT NULL AND $2 = ANY(participants)
+				AND COALESCE(dynamics->>'note', '') <> ''
+			ORDER BY start_time DESC LIMIT $3`,
+			[guildId, userId, GROUP_NOTE_LIMIT],
+		),
+	]);
+
+	const roleRow:
+		| { total: number; driver: number; responder: number; ignored: number }
+		| undefined =
+		rolesResult.success && rolesResult.data ? rolesResult.data[0] : undefined;
+	const roles = {
+		driver: Number(roleRow?.driver ?? 0),
+		responder: Number(roleRow?.responder ?? 0),
+		ignored: Number(roleRow?.ignored ?? 0),
+	};
+	const total = Number(roleRow?.total ?? 0);
+
+	const exchangeRows: Array<{
+		from_user: string;
+		to_user: string;
+		tone: string;
+		n: number;
+	}> =
+		exchangesResult.success && exchangesResult.data ? exchangesResult.data : [];
+	const describeDirection = (given: boolean): string => {
+		const tones = new Map<string, number>();
+		const others = new Map<string, number>();
+		for (const r of exchangeRows) {
+			if ((r.from_user === userId) !== given) continue;
+			const other = given ? r.to_user : r.from_user;
+			tones.set(r.tone, (tones.get(r.tone) ?? 0) + r.n);
+			others.set(other, (others.get(other) ?? 0) + r.n);
+		}
+		if (!tones.size) return "none recorded";
+		const top = (
+			m: Map<string, number>,
+			k: number,
+			label: (key: string) => string,
+		) =>
+			[...m.entries()]
+				.sort((x, y) => y[1] - x[1])
+				.slice(0, k)
+				.map(([key, n]) => `${label(key)} ${n}`)
+				.join(", ");
+		const counterparts = top(
+			others,
+			GROUP_COUNTERPARTS,
+			(id) => names.get(id) ?? "someone",
+		);
+		return `${top(tones, GROUP_TONES_SHOWN, (t) => t)}; ${given ? "mostly to" : "mostly from"}: ${counterparts}`;
+	};
+
+	const noteRows: Array<{ start_time: Date; note: string }> =
+		notesResult.success && notesResult.data ? notesResult.data : [];
+	const lines = [
+		total
+			? `Roles over ${total} summarized conversations: driver ${roles.driver}, responder ${roles.responder}, ignored ${roles.ignored}`
+			: "Roles: no conversations with recorded dynamics yet",
+		`Tones they give: ${describeDirection(true)}`,
+		`Tones they receive: ${describeDirection(false)}`,
+		noteRows.length
+			? `Notes on their ${noteRows.length} most recent conversations:\n${noteRows
+					.map((r) => `- ${date(r.start_time)} ${scrub(r.note)}`)
+					.join("\n")}`
+			: "Conversation notes: none yet",
+	];
+	return { roles, lines };
 }
 
 const SUBSTANTIVE = `length(trim(m.content)) > 0
@@ -264,6 +379,7 @@ function buildPrompt(
 	connections: Connection[],
 	summaries: SummaryRow[],
 	sample: string[],
+	groupLines: string[],
 ): string {
 	const sections = [
 		`Write the dossier for ${name}.`,
@@ -279,6 +395,7 @@ function buildPrompt(
 					)
 					.join("\n")}`
 			: "RECENT CONVERSATIONS: none summarized yet.",
+		`HOW THEY BEHAVE IN GROUP CONVERSATIONS (from conversation notes; base "in_groups" on this, and say so if the evidence is thin):\n${groupLines.join("\n")}`,
 		`THEIR MESSAGES (oldest to newest; includes their most replied-to):\n${sample.join("\n")}`,
 	];
 	return sections.join("\n\n");
@@ -382,6 +499,7 @@ export function renderMemberDossier(d: MemberDossier): string {
 		`Interests\n${d.interests.map((interest) => `- ${interest}`).join("\n")}`,
 		`People\n${d.people}`,
 		`Recent\n${d.recent}`,
+		...(d.in_groups ? [`In groups\n${d.in_groups}`] : []),
 		`Personality\n${[...traits, mbti].join("\n")}`,
 		`Facts\n${describeMemberFacts(d.facts)
 			.map((line) => `- ${line}`)
@@ -408,12 +526,14 @@ export async function writeMemberDossier(
 	]);
 	const sample = await getMessageSample(db, guildId, userId, names);
 
+	const groups = await getGroupEvidence(db, guildId, userId, names);
 	const prompt = buildPrompt(
 		facts.name,
 		describeMemberFacts(facts),
 		connections,
 		summaries.rows.map((row) => ({ ...row, summary: scrub(row.summary) })),
 		sample,
+		groups.lines,
 	);
 	const written = await OmpRuntime.get().generateStructured<WrittenSections>({
 		systemPrompt: SYSTEM_PROMPT,
@@ -437,12 +557,14 @@ export async function writeMemberDossier(
 			.filter(Boolean),
 		people: scrub(String(written.people).trim()),
 		recent: scrub(String(written.recent).trim()),
+		in_groups: scrub(String(written.in_groups ?? "").trim()),
 		personality: { big_five: bigFive, mbti: deriveMbti(bigFive, stats) },
 		facts,
 		evidence: {
 			messages: facts.activity.messages,
 			conversations: summaries.total,
 			sampled_messages: sample.length,
+			roles: groups.roles,
 		},
 		written_at: new Date().toISOString(),
 	};

@@ -19,6 +19,7 @@ function msgs(spec: Array<[number, string, string?]>): SegmentMessage[] {
 		author_id: author,
 		created_at: new Date(T0 + minutes * MIN),
 		referenced_message_id: replyTo ?? null,
+		mentions: [],
 	}));
 }
 

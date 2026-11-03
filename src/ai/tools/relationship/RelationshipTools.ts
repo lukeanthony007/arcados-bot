@@ -5,6 +5,12 @@ import {
 	getPairFacts,
 } from "../../../features/social-intelligence/facts/closeness";
 import {
+	formatTally,
+	getPairExchangeNotes,
+	getPairToneTallies,
+} from "../../../features/social-intelligence/facts/exchanges";
+import { SLUR_PATTERN } from "../../../features/user-personas/personaPrompt";
+import {
 	type DatabaseTool,
 	type DatabaseToolResult,
 	type ToolContext,
@@ -12,6 +18,7 @@ import {
 	resolveUserId,
 } from "../registry/DatabaseTools";
 
+const RECENT_NOTES = 5;
 const MEANING =
 	"share = fraction of the person's own interactions that go to this connection; reciprocity = how balanced it is (1 = both sides engage equally, 0 = one-sided).";
 
@@ -164,13 +171,31 @@ export const getRelationshipTool: DatabaseTool = {
 			const subject = await memberName(context, pair.a);
 			const { a_to_b: out, b_to_a: back } = facts;
 
+			const [tallies, notes] = await Promise.all([
+				getPairToneTallies(context.db, context.guildId, pair.a, pair.b),
+				getPairExchangeNotes(context.db, context.guildId, pair.a, pair.b, RECENT_NOTES),
+			]);
 			const lines = [
 				`${subject} and ${a}: ${describeStrength(facts)} (${pct(facts.share)} of ${subject}'s interactions, ${pct(facts.reciprocity)} reciprocal)`,
-				`${subject} → ${a}: ${out.replies} replies, ${out.mentions} mentions`,
-				`${a} → ${subject}: ${back.replies} replies, ${back.mentions} mentions`,
+				`${subject} → ${a}: ${out.replies} replies, ${out.mentions} mentions, ${out.turns} inferred addressed turns`,
+				`${a} → ${subject}: ${back.replies} replies, ${back.mentions} mentions, ${back.turns} inferred addressed turns`,
 				`Shared conversations: ${facts.shared_conversations}`,
 				`Last interaction: ${new Date(facts.last_interaction).toLocaleDateString()}`,
+				"How they treat each other (from conversation notes):",
+				`${subject} → ${a}: ${formatTally(tallies.a_to_b)}`,
+				`${a} → ${subject}: ${formatTally(tallies.b_to_a)}`,
 			];
+			if (notes.length) {
+				lines.push(`Most recent ${notes.length} notes:`);
+				for (const x of notes) {
+					const from = x.from_user === pair.a ? subject : a;
+					const to = x.from_user === pair.a ? a : subject;
+					const note = x.note.replace(new RegExp(SLUR_PATTERN.source, "gi"), "[slur]");
+					lines.push(
+						`- ${new Date(x.start_time).toLocaleDateString()} ${from} → ${to} [${x.tone}] ${note}`,
+					);
+				}
+			}
 			const outTotal = out.replies + out.mentions;
 			const backTotal = back.replies + back.mentions;
 			if (outTotal > backTotal * 2 && outTotal > 0) {

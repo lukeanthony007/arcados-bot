@@ -14,11 +14,14 @@ import {
 	getConnections,
 	getPairFacts,
 } from "../social-intelligence/facts/closeness";
+import { getPairExchangeNotes } from "../social-intelligence/facts/exchanges";
 import { getPairDossier } from "../social-intelligence/understanding/pairDossier";
 import { SLUR_PATTERN } from "./personaPrompt";
 
 /** People to add history for per turn */
 const MAX_PEOPLE = 3;
+/** Recent model exchange notes per person */
+const MAX_EXCHANGE_NOTES = 6;
 const MAX_CONVERSATIONS = 5;
 const MAX_OWN_MESSAGES = 10;
 const MAX_THEIR_MESSAGES = 5;
@@ -153,28 +156,36 @@ async function describeHistory(
 	const other = byId.get(personId);
 	if (!other) return "";
 
-	const [pair, profile, conversations, own, theirs] = await Promise.all([
-		getPairFacts(db, guildId, persona.user_id, personId),
-		getPairDossier(db, guildId, persona.user_id, personId),
-		db.query(
-			`SELECT start_time, topic_label, summary FROM conversation_segments
+	const [pair, profile, conversations, own, theirs, exchangeNotes] =
+		await Promise.all([
+			getPairFacts(db, guildId, persona.user_id, personId),
+			getPairDossier(db, guildId, persona.user_id, personId),
+			db.query(
+				`SELECT start_time, topic_label, summary FROM conversation_segments
 			WHERE guild_id = $1 AND $2 = ANY(participants) AND $3 = ANY(participants) AND summary IS NOT NULL
 			ORDER BY start_time DESC LIMIT $4`,
-			[guildId, persona.user_id, personId, MAX_CONVERSATIONS],
-		),
-		messagesAbout(db, guildId, persona.user_id, other, MAX_OWN_MESSAGES),
-		messagesAbout(
-			db,
-			guildId,
-			personId,
-			byId.get(persona.user_id) ?? {
-				user_id: persona.user_id,
-				name: self,
-				aliases: [self],
-			},
-			MAX_THEIR_MESSAGES,
-		),
-	]);
+				[guildId, persona.user_id, personId, MAX_CONVERSATIONS],
+			),
+			messagesAbout(db, guildId, persona.user_id, other, MAX_OWN_MESSAGES),
+			messagesAbout(
+				db,
+				guildId,
+				personId,
+				byId.get(persona.user_id) ?? {
+					user_id: persona.user_id,
+					name: self,
+					aliases: [self],
+				},
+				MAX_THEIR_MESSAGES,
+			),
+			getPairExchangeNotes(
+				db,
+				guildId,
+				persona.user_id,
+				personId,
+				MAX_EXCHANGE_NOTES,
+			),
+		]);
 
 	const lines: string[] = [
 		`What you (${self}) actually have with ${other.name} (<@${personId}>):`,
@@ -184,15 +195,31 @@ async function describeHistory(
 		const direction = (
 			who: string,
 			to: string,
-			d: { replies: number; mentions: number },
+			d: { replies: number; mentions: number; turns: number },
 		) =>
-			`${who} → ${to} ${d.replies} ${d.replies === 1 ? "reply" : "replies"}, ${d.mentions} ${d.mentions === 1 ? "mention" : "mentions"}`;
+			`${who} → ${to} ${d.replies} ${d.replies === 1 ? "reply" : "replies"}, ${d.mentions} ${d.mentions === 1 ? "mention" : "mentions"}, ${d.turns} addressed ${d.turns === 1 ? "turn" : "turns"}`;
 		lines.push(
 			`- Closeness: ${describeStrength(pair)}; ${direction("you", "them", pair.a_to_b)}; ${direction("them", "you", pair.b_to_a)}; ${pair.shared_conversations} shared conversations; last ${formatDate(pair.last_interaction)}`,
 		);
 	}
 
-	if (profile) lines.push(`- Relationship summary: ${maskSlurs(profile.summary)}`);
+	if (exchangeNotes.length) {
+		lines.push(
+			"- How you two actually treat each other (from conversation notes, newest first):",
+		);
+		for (const x of exchangeNotes) {
+			const who =
+				x.from_user === persona.user_id
+					? `you → ${other.name}`
+					: `${other.name} → you`;
+			lines.push(
+				`  - ${formatDate(x.start_time)} ${who} [${x.tone}] ${maskSlurs(x.note)}`,
+			);
+		}
+	}
+
+	if (profile)
+		lines.push(`- Relationship summary: ${maskSlurs(profile.summary)}`);
 
 	const conversationRows: ConversationRow[] =
 		conversations.success && conversations.data ? conversations.data : [];

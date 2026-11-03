@@ -6,6 +6,9 @@
  *
  *   reply         a replied to b's message                          3 points, a → b
  *   mention       a mentioned b directly (message pings ≤ 3 people) 2 points, a → b
+ *   turn          a's message was inferred to be addressed to b     1 point, a → b
+ *                 (conversations/addressing.ts: two-person chats, answering the previous
+ *                 speaker within 3 min, continuations)
  *   conversation  a and b took part in the same conversation         1 point, both directions
  *   reaction      a reacted to b's message (recorded live from now on) 1 point, a → b
  *
@@ -23,7 +26,13 @@ import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 
 export const HALF_LIFE_DAYS = 180;
 const MAX_MENTIONS_PER_MESSAGE = 3;
-const WEIGHTS = { reply: 3, mention: 2, reaction: 1, conversation: 1 } as const;
+const WEIGHTS = {
+	reply: 3,
+	mention: 2,
+	turn: 1,
+	reaction: 1,
+	conversation: 1,
+} as const;
 
 export interface Connection {
 	user_id: string;
@@ -40,14 +49,16 @@ export interface Connection {
 	/** Raw counts, all time */
 	replies: number;
 	mentions: number;
+	/** Messages inferred to be addressed to the other person (no reply/mention), all time */
+	turns: number;
 	shared_conversations: number;
 	last_interaction: Date;
 }
 
 export interface PairFacts extends Connection {
 	/** Raw counts in each direction */
-	a_to_b: { replies: number; mentions: number };
-	b_to_a: { replies: number; mentions: number };
+	a_to_b: { replies: number; mentions: number; turns: number };
+	b_to_a: { replies: number; mentions: number; turns: number };
 }
 
 export interface GraphEdge {
@@ -65,11 +76,14 @@ interface PairRow {
 	inbound: string;
 	replies: string;
 	mentions: string;
+	turns: string;
 	shared_conversations: string;
 	out_replies: string;
 	out_mentions: string;
+	out_turns: string;
 	in_replies: string;
 	in_mentions: string;
+	in_turns: string;
 	last_interaction: Date;
 }
 
@@ -88,11 +102,11 @@ function eventsCte(subjectFilter: boolean): string {
 		),
 		events AS (
 			SELECT * FROM (
-				SELECT m.author_id AS a, p.author_id AS b, 'reply' AS kind, m.created_at AS ts
+				SELECT m.author_id AS a, p.author_id AS b, 'reply' AS kind, m.created_at AS ts, 1 AS n
 				FROM msgs m JOIN msgs p ON p.id = m.referenced_message_id
 				WHERE p.author_id <> m.author_id
 				UNION ALL
-				SELECT m.author_id, t.target, 'mention', m.created_at
+				SELECT m.author_id, t.target, 'mention', m.created_at, 1
 				FROM msgs m
 				CROSS JOIN LATERAL (
 					SELECT DISTINCT (regexp_matches(m.content, '<@!?(\\d+)>', 'g'))[1] AS target
@@ -102,13 +116,18 @@ function eventsCte(subjectFilter: boolean): string {
 				AND array_length(regexp_split_to_array(m.content, '<@'), 1) <= ${MAX_MENTIONS_PER_MESSAGE + 1}
 				AND t.target <> m.author_id
 				UNION ALL
-				SELECT p1.id, p2.id, 'conversation', cs.start_time
+				SELECT x.from_user, x.to_user, 'turn', cs.start_time, x.turns
+				FROM conversation_exchanges x
+				JOIN conversation_segments cs ON cs.id = x.conversation_id
+				WHERE cs.guild_id = $1 AND x.source = 'rule'
+				UNION ALL
+				SELECT p1.id, p2.id, 'conversation', cs.start_time, 1
 				FROM conversation_segments cs
 				CROSS JOIN LATERAL unnest(cs.participants) AS p1(id)
 				CROSS JOIN LATERAL unnest(cs.participants) AS p2(id)
 				WHERE cs.guild_id = $1 AND p1.id <> p2.id
 				UNION ALL
-				SELECT r.user_id, r.author_id, 'reaction', r.created_at
+				SELECT r.user_id, r.author_id, 'reaction', r.created_at, 1
 				FROM message_reactions r
 				JOIN members rm ON rm.guild_id = r.guild_id AND rm.user_id = r.user_id AND rm.bot = false
 				WHERE r.guild_id = $1 AND r.user_id <> r.author_id
@@ -116,8 +135,13 @@ function eventsCte(subjectFilter: boolean): string {
 			WHERE true ${involves}
 		),
 		weighted AS (
-			SELECT a, b, kind, ts,
-				CASE kind WHEN 'reply' THEN ${WEIGHTS.reply} WHEN 'mention' THEN ${WEIGHTS.mention} WHEN 'reaction' THEN ${WEIGHTS.reaction} ELSE ${WEIGHTS.conversation} END
+			SELECT a, b, kind, ts, n,
+				n * CASE kind
+					WHEN 'reply' THEN ${WEIGHTS.reply}
+					WHEN 'mention' THEN ${WEIGHTS.mention}
+					WHEN 'turn' THEN ${WEIGHTS.turn}
+					WHEN 'reaction' THEN ${WEIGHTS.reaction}
+					ELSE ${WEIGHTS.conversation} END
 					* exp(-ln(2) * EXTRACT(EPOCH FROM (NOW() - ts)) / (${HALF_LIFE_DAYS} * 86400)) AS w
 			FROM events
 		)`;
@@ -132,11 +156,14 @@ const PAIR_SELECT = `
 		SUM(w.w) FILTER (WHERE w.b = $2) AS inbound,
 		COUNT(*) FILTER (WHERE w.kind = 'reply') AS replies,
 		COUNT(*) FILTER (WHERE w.kind = 'mention') AS mentions,
+		COALESCE(SUM(w.n) FILTER (WHERE w.kind = 'turn'), 0) AS turns,
 		COUNT(*) FILTER (WHERE w.kind = 'conversation' AND w.a = $2) AS shared_conversations,
 		COUNT(*) FILTER (WHERE w.kind = 'reply' AND w.a = $2) AS out_replies,
 		COUNT(*) FILTER (WHERE w.kind = 'mention' AND w.a = $2) AS out_mentions,
+		COALESCE(SUM(w.n) FILTER (WHERE w.kind = 'turn' AND w.a = $2), 0) AS out_turns,
 		COUNT(*) FILTER (WHERE w.kind = 'reply' AND w.b = $2) AS in_replies,
 		COUNT(*) FILTER (WHERE w.kind = 'mention' AND w.b = $2) AS in_mentions,
+		COALESCE(SUM(w.n) FILTER (WHERE w.kind = 'turn' AND w.b = $2), 0) AS in_turns,
 		MAX(w.ts) AS last_interaction
 	FROM weighted w
 	CROSS JOIN LATERAL (SELECT CASE WHEN w.a = $2 THEN w.b ELSE w.a END AS user_id) o
@@ -156,6 +183,7 @@ function toConnection(row: PairRow, totalStrength: number): Connection {
 		inbound,
 		replies: Number(row.replies),
 		mentions: Number(row.mentions),
+		turns: Number(row.turns),
 		shared_conversations: Number(row.shared_conversations),
 		last_interaction: new Date(row.last_interaction),
 	};
@@ -205,10 +233,12 @@ export async function getPairFacts(
 		a_to_b: {
 			replies: Number(row.out_replies),
 			mentions: Number(row.out_mentions),
+			turns: Number(row.out_turns),
 		},
 		b_to_a: {
 			replies: Number(row.in_replies),
 			mentions: Number(row.in_mentions),
+			turns: Number(row.in_turns),
 		},
 	};
 }

@@ -13,7 +13,7 @@ import type { PostgreSQLManager } from "../../../database/PostgreSQLManager";
 import { EnrichmentPipelineOrchestrator } from "./EnrichmentPipelineOrchestrator";
 
 /** Jobs processed per tick */
-const BATCH_SIZE = 5;
+const BATCH_SIZE = 20;
 
 export class EnrichmentScheduler {
 	private static instance: EnrichmentScheduler;
