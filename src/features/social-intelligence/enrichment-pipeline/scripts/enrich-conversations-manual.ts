@@ -3,24 +3,27 @@
  * Manual Conversation Enrichment Script
  *
  * Usage:
- *   npx tsx enrich-conversations-manual.ts 24        # Enrich conversations from last 24 hours
- *   npx tsx enrich-conversations-manual.ts 168       # Enrich conversations from last 7 days
- *   npx tsx enrich-conversations-manual.ts --force    # Force enrich all conversations
+ *   bun run enrich-conversations-manual.ts 24        # Unsummarized conversations from the last 24 hours
+ *   bun run enrich-conversations-manual.ts 168       # …from the last 7 days
+ *   bun run enrich-conversations-manual.ts --force   # All unsummarized conversations
+ *   bun run enrich-conversations-manual.ts --from 2025-10-13 --to 2025-10-20
+ *                                                    # Re-describe every significant conversation in the range
  */
 
+import { config } from "../../../../config/index.js";
 import { PostgreSQLManager } from "../../../../database/PostgreSQLManager";
 import { EnrichmentPipelineOrchestrator } from "../EnrichmentPipelineOrchestrator";
-import { config } from "../../../../config/index.js";
 
 const db = new PostgreSQLManager();
 
 async function main() {
 	const args = process.argv.slice(2);
-	const hoursBack = args.includes("--force")
-		? null
-		: args[0]
-			? parseInt(args[0], 10)
-			: 24;
+	const hoursBack =
+		args.includes("--force") || args.includes("--from")
+			? null
+			: args[0]
+				? Number.parseInt(args[0], 10)
+				: 24;
 
 	console.log("🤖 Manual Conversation Enrichment");
 	console.log("=".repeat(80));
@@ -53,26 +56,47 @@ async function main() {
 		? new Date(Date.now() - hoursBack * 60 * 60 * 1000)
 		: null;
 
-	const query = hoursBack
-		? `
-			SELECT id, guild_id, participants, message_count
-			FROM conversation_segments
-			WHERE guild_id = $1
-			AND status = 'finalized'
-			AND start_time >= $2
-			AND (summary IS NULL OR summary = '' OR enrichment_version IS NULL)
-			ORDER BY start_time DESC
-		`
-		: `
-			SELECT id, guild_id, participants, message_count
-			FROM conversation_segments
-			WHERE guild_id = $1
-			AND status = 'finalized'
-			AND (summary IS NULL OR summary = '' OR enrichment_version IS NULL)
-			ORDER BY start_time DESC
-		`;
+	// --from/--to: re-describe every significant conversation in the range with the current
+	// summarizer, including ones summarized before (their model exchanges are replaced)
+	const rangeArg = (flag: string) => {
+		const i = args.indexOf(flag);
+		return i >= 0 && args[i + 1] ? new Date(args[i + 1] as string) : null;
+	};
+	const from = rangeArg("--from");
+	const to = rangeArg("--to");
 
-	const result = await db.query(query, hoursBack ? [guildId, since] : [guildId]);
+	const [query, params] =
+		from && to
+			? [
+					`SELECT id, guild_id, participants, message_count
+				FROM conversation_segments
+				WHERE guild_id = $1 AND status = 'finalized' AND ai_processing_status <> 'skipped'
+				AND start_time >= $2 AND start_time < $3
+				ORDER BY start_time`,
+					[guildId, from, to],
+				]
+			: hoursBack
+				? [
+						`SELECT id, guild_id, participants, message_count
+				FROM conversation_segments
+				WHERE guild_id = $1
+				AND status = 'finalized'
+				AND start_time >= $2
+				AND (summary IS NULL OR summary = '' OR enrichment_version IS NULL)
+				ORDER BY start_time DESC`,
+						[guildId, since],
+					]
+				: [
+						`SELECT id, guild_id, participants, message_count
+				FROM conversation_segments
+				WHERE guild_id = $1
+				AND status = 'finalized'
+				AND (summary IS NULL OR summary = '' OR enrichment_version IS NULL)
+				ORDER BY start_time DESC`,
+						[guildId],
+					];
+
+	const result = await db.query(query, params);
 
 	if (!result.success || !result.data || result.data.length === 0) {
 		console.log("ℹ️  No conversations found to enrich");
@@ -111,10 +135,10 @@ async function main() {
 	}
 
 	// Process queue
-	console.log(`\n🔄 Processing enrichment queue...\n`);
+	console.log("\n🔄 Processing enrichment queue...\n");
 	await orchestrator.processPendingEnrichments(conversations.length);
 
-	console.log(`\n🔹 Enrichment complete!`);
+	console.log("\n🔹 Enrichment complete!");
 	console.log(`   Enqueued: ${enriched}`);
 	console.log(`   Failed: ${failed}`);
 
@@ -125,4 +149,3 @@ main().catch((error) => {
 	console.error("❌ Fatal error:", error);
 	process.exit(1);
 });
-

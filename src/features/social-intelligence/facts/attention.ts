@@ -39,6 +39,8 @@ type StructureKey =
 export interface AttentionProfile {
 	user_id: string;
 	name: string;
+	/** End of the window: their last conversation unless asked otherwise */
+	as_of: Date;
 	episodes: number;
 	given: number;
 	received: number;
@@ -61,6 +63,8 @@ export interface AttentionEdge {
 	b: string;
 	a_name: string;
 	b_name: string;
+	/** End of the window: their last shared conversation unless asked otherwise */
+	as_of: Date;
 	a_to_b: number;
 	b_to_a: number;
 	reciprocity: number;
@@ -594,8 +598,28 @@ const nameIn = (members: Map<string, MemberInfo>, id: string) =>
 const isHuman = (members: Map<string, MemberInfo>, id: string) =>
 	members.get(id)?.bot !== true;
 
-function windowStart(sinceDays: number): Date {
-	return new Date(Date.now() - sinceDays * DAY_MS);
+export interface WindowOptions {
+	sinceDays?: number;
+	/**
+	 * End of the window. Defaults to the subject's last conversation, so someone who has been
+	 * away is described as they were when they were around, not as an empty profile
+	 */
+	asOf?: Date;
+}
+
+/** When the given members were last in a conversation together (or `now` if never) */
+async function lastTogether(
+	db: PostgreSQLManager,
+	guildId: string,
+	userIds: string[],
+): Promise<Date> {
+	const [row] = await select<{ last: Date | null }>(
+		db,
+		`SELECT MAX(start_time) AS last FROM conversation_segments
+		 WHERE guild_id = $1 AND participants @> $2::text[]`,
+		[guildId, userIds],
+	);
+	return row?.last ? new Date(row.last) : new Date();
 }
 
 interface AttentionRow {
@@ -632,18 +656,18 @@ export async function getAttentionProfile(
 	db: PostgreSQLManager,
 	guildId: string,
 	userId: string,
-	sinceDays = 365,
+	{ sinceDays = 365, asOf }: WindowOptions = {},
 ): Promise<AttentionProfile | null> {
-	const since = windowStart(sinceDays);
-	const now = new Date();
+	const now = asOf ?? (await lastTogether(db, guildId, [userId]));
+	const since = new Date(now.getTime() - sinceDays * DAY_MS);
 	const [members, rows, episodes, valenceRows] = await Promise.all([
 		loadMembers(db, guildId),
 		select<AttentionRow>(
 			db,
 			`${ATTENTION_SELECT}
-			 WHERE cs.guild_id = $1 AND cs.start_time >= $3
+			 WHERE cs.guild_id = $1 AND cs.start_time >= $3 AND cs.start_time <= $4
 				AND (ea.from_user = $2 OR ea.to_user = $2)`,
-			[guildId, userId, since],
+			[guildId, userId, since, now],
 		),
 		select<{
 			size: number | null;
@@ -653,8 +677,8 @@ export async function getAttentionProfile(
 			db,
 			`SELECT array_length(participants, 1) AS size, focus, start_time
 			 FROM conversation_segments
-			 WHERE guild_id = $1 AND $2 = ANY(participants) AND start_time >= $3`,
-			[guildId, userId, since],
+			 WHERE guild_id = $1 AND $2 = ANY(participants) AND start_time >= $3 AND start_time <= $4`,
+			[guildId, userId, since, now],
 		),
 		select<{ dir: "given" | "received"; valence: string | null; n: number }>(
 			db,
@@ -662,10 +686,10 @@ export async function getAttentionProfile(
 				x.valence, COUNT(*)::int AS n
 			 FROM conversation_exchanges x
 			 JOIN conversation_segments cs ON cs.id = x.conversation_id
-			 WHERE cs.guild_id = $1 AND x.source = 'model' AND cs.start_time >= $3
+			 WHERE cs.guild_id = $1 AND x.source = 'model' AND cs.start_time >= $3 AND cs.start_time <= $4
 				AND (x.from_user = $2 OR x.to_user = $2)
 			 GROUP BY 1, 2`,
-			[guildId, userId, since],
+			[guildId, userId, since, now],
 		),
 	]);
 	if (rows.length === 0 && episodes.length === 0) return null;
@@ -744,6 +768,7 @@ export async function getAttentionProfile(
 	return {
 		user_id: userId,
 		name: nameIn(members, userId),
+		as_of: now,
 		episodes: episodes.length,
 		given: round(sum(out)),
 		received: round(sum(inn)),
@@ -780,10 +805,10 @@ export async function getAttentionEdge(
 	guildId: string,
 	a: string,
 	b: string,
-	sinceDays = 365,
+	{ sinceDays = 365, asOf }: WindowOptions = {},
 ): Promise<AttentionEdge | null> {
-	const since = windowStart(sinceDays);
-	const now = new Date();
+	const now = asOf ?? (await lastTogether(db, guildId, [a, b]));
+	const since = new Date(now.getTime() - sinceDays * DAY_MS);
 	const [members, rows, exchanges] = await Promise.all([
 		loadMembers(db, guildId),
 		select<AttentionRow & { channel_name: string | null }>(
@@ -794,9 +819,9 @@ export async function getAttentionEdge(
 			 FROM episode_attention ea
 			 JOIN conversation_segments cs ON cs.id = ea.conversation_id
 			 LEFT JOIN channels ch ON ch.id = cs.channel_id AND ch.guild_id = cs.guild_id
-			 WHERE cs.guild_id = $1 AND cs.start_time >= $4
+			 WHERE cs.guild_id = $1 AND cs.start_time >= $4 AND cs.start_time <= $5
 				AND ((ea.from_user = $2 AND ea.to_user = $3) OR (ea.from_user = $3 AND ea.to_user = $2))`,
-			[guildId, a, b, since],
+			[guildId, a, b, since, now],
 		),
 		select<{
 			from_user: string;
@@ -810,10 +835,10 @@ export async function getAttentionEdge(
 			`SELECT x.from_user, x.to_user, x.tone, x.valence, x.note, cs.start_time
 			 FROM conversation_exchanges x
 			 JOIN conversation_segments cs ON cs.id = x.conversation_id
-			 WHERE cs.guild_id = $1 AND x.source = 'model' AND cs.start_time >= $4
+			 WHERE cs.guild_id = $1 AND x.source = 'model' AND cs.start_time >= $4 AND cs.start_time <= $5
 				AND ((x.from_user = $2 AND x.to_user = $3) OR (x.from_user = $3 AND x.to_user = $2))
 			 ORDER BY cs.start_time DESC`,
-			[guildId, a, b, since],
+			[guildId, a, b, since, now],
 		),
 	]);
 	if (rows.length === 0 && exchanges.length === 0) return null;
@@ -871,6 +896,7 @@ export async function getAttentionEdge(
 		b,
 		a_name: nameIn(members, a),
 		b_name: nameIn(members, b),
+		as_of: now,
 		a_to_b: round(aToB),
 		b_to_a: round(bToA),
 		reciprocity: round(ratio(Math.min(aToB, bToA), Math.max(aToB, bToA)), 2),
@@ -1154,13 +1180,18 @@ function balanceBand(reciprocity: number): string {
 	return "unevenly";
 }
 
+/** Warm/cold read from the summarizer's exchanges; nothing from fewer than 3 */
 function warmthText(v: Record<Valence, number>): string {
 	const total = v.warm + v.neutral + v.cold;
-	if (total === 0) return "";
-	if (v.cold / total >= 0.3)
-		return v.warm / total >= 0.3 ? "mixed, warm and cold" : "often cold";
-	if (v.warm / total >= 0.5) return "mostly warm";
-	return "mostly neutral";
+	if (total < 3) return "";
+	const warm = v.warm / total;
+	const cold = v.cold / total;
+	if (cold >= 0.3) return warm >= 0.3 ? "mixed, warm and cold" : "often cold";
+	if (warm >= 0.5)
+		return cold >= 0.15 ? "mostly warm, sometimes cold" : "mostly warm";
+	if (warm >= 0.3)
+		return cold >= 0.15 ? "often warm, sometimes cold" : "often warm";
+	return cold >= 0.15 ? "mostly neutral, sometimes cold" : "mostly neutral";
 }
 
 function tonesText(tones: Record<string, number>): string {
@@ -1177,9 +1208,18 @@ const names = (list: string[]) =>
 		? list.join(" and ")
 		: `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 
+/** A window ending this long ago describes the past, and the text says so */
+const STALE_MS = 30 * DAY_MS;
+const monthYear = (d: Date) =>
+	d.toLocaleDateString("en-US", {
+		month: "long",
+		year: "numeric",
+		timeZone: "America/New_York",
+	});
+
 export function describeProfile(p: AttentionProfile): string[] {
 	const lines: string[] = [
-		`${p.name}: ${plural(p.episodes, "conversation")} in the window.`,
+		`${p.name}: ${plural(p.episodes, "conversation")} in the year up to ${p.as_of.getTime() < Date.now() - STALE_MS ? `${monthYear(p.as_of)}, when they were last active` : "now"}.`,
 	];
 	const draw = (p.received + SMOOTHING) / (p.given + SMOOTHING);
 	if (draw >= 1.15) lines.push("Receives more attention than they give.");
@@ -1267,7 +1307,7 @@ export function describeProfile(p: AttentionProfile): string[] {
 
 export function describeEdge(e: AttentionEdge): string[] {
 	const lines: string[] = [
-		`${e.a_name} and ${e.b_name}: attention flows ${balanceBand(e.reciprocity)} between them across ${plural(e.episodes_together, "conversation")}.`,
+		`${e.a_name} and ${e.b_name}: attention flows ${balanceBand(e.reciprocity)} between them across ${plural(e.episodes_together, "conversation")}${e.as_of.getTime() < Date.now() - STALE_MS ? `, up to ${monthYear(e.as_of)} when they last talked` : ""}.`,
 	];
 	const big = Math.max(e.a_to_b, e.b_to_a);
 	if (big >= PURSUIT_MIN_MASS && e.reciprocity < PURSUIT_RETURN_RATIO) {
@@ -1277,7 +1317,9 @@ export function describeEdge(e: AttentionEdge): string[] {
 	} else if (e.reciprocity < 0.85 && big > 0) {
 		const [from, to] =
 			e.a_to_b >= e.b_to_a ? [e.a_name, e.b_name] : [e.b_name, e.a_name];
-		lines.push(`${from} gives a bit more than ${to} returns.`);
+		lines.push(
+			`${from} gives ${e.reciprocity < 0.6 ? "clearly" : "a bit"} more than ${to} returns.`,
+		);
 	}
 	for (const [from, to, bids] of [
 		[e.a_name, e.b_name, e.bids_a_to_b],
