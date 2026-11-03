@@ -157,6 +157,7 @@ async function main() {
 
 	let session = "";
 	let episodeNumber = 0;
+	let sessionNumber = 0;
 	const storylineInput: StorylineEpisode[] = [];
 	// Summaries from a previous run, so iterating on later steps doesn't re-run the summarizer
 	const cacheFile = `rnd/out/${day}-${channel.name.replace(/[^\w-]+/g, "_")}.describe.json`;
@@ -175,6 +176,7 @@ async function main() {
 		episodeNumber++;
 		if (conv.session_id !== session) {
 			session = conv.session_id;
+			sessionNumber++;
 			out.push(`## Session ${clock(conv.start)}`, "");
 		}
 		out.push(
@@ -240,6 +242,7 @@ async function main() {
 			);
 			storylineInput.push({
 				index: episodeNumber,
+				session: sessionNumber,
 				start: conv.start,
 				end: conv.end,
 				participants: conv.participants.map(nameOf),
@@ -284,6 +287,15 @@ async function main() {
 		if (!built) out.push("Storyline linker failed.", "");
 		else if (!built.storylines.length)
 			out.push("None: every conversation stood alone.", "");
+		if (built?.continuations.length) {
+			out.push(
+				`Continuations across episode cuts (likely one conversation): ${built.continuations
+					.sort((a, b) => a.from - b.from)
+					.map((c) => `E${c.to}+E${c.from} ${Math.round(c.agreement * 100)}%`)
+					.join(", ")}`,
+				"",
+			);
+		}
 		if (built?.links.length) {
 			out.push(
 				`Agreed pairs: ${built.links.length}; weakest: ${built.links

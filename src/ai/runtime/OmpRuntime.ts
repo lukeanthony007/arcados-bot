@@ -29,9 +29,15 @@ import { getToolCatalog } from "../tools";
 import type { ToolContext } from "../tools/registry/DatabaseTools";
 import { adaptTool } from "./toolAdapter";
 
-/** Model used for every request (chat, voice and background jobs): Cursor's default "Auto" route */
-const MODEL_PROVIDER = "cursor";
-const MODEL_ID = "default";
+/**
+ * Model used for every request (chat, voice and background jobs): Cursor's default "Auto"
+ * route, unless `AI_MODEL=<provider>/<id>` pins another (R&D runs pin one model so prompt
+ * changes aren't confounded with whichever model happened to answer)
+ */
+const [MODEL_PROVIDER, MODEL_ID] = ((): [string, string] => {
+	const pinned = process.env.AI_MODEL?.split("/");
+	return pinned?.length === 2 && pinned[0] && pinned[1] ? [pinned[0], pinned[1]] : ["cursor", "default"];
+})();
 /** omp retries a failed request (usage limit, outage, missing login) on these models, in order */
 const FALLBACK_MODELS = ["xai/grok-4-1-fast-non-reasoning"];
 

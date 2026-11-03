@@ -23,7 +23,7 @@
     "enrich:conversations:force": "bun run src/features/social-intelligence/enrichment-pipeline/scripts/enrich-conversations-manual.ts --force",
     "migrate:voice-state": "bun run src/scripts/migrate-voice-state.ts",
     "conversations:day": "bun run src/features/social-intelligence/conversations/scripts/show-day.ts",
-    "rnd:day": "bun run src/features/social-intelligence/rnd/day-report.ts"
+    "rnd:day": "AI_MODEL=${AI_MODEL:-xai/grok-4-1-fast-non-reasoning} bun run src/features/social-intelligence/rnd/day-report.ts"
   },
   "keywords": [
     "discord",

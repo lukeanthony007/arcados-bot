@@ -20,6 +20,8 @@ import { resolveName } from "./dynamics";
 export interface StorylineEpisode {
 	/** 1-based position in the day, shown to the model as E1, E2, … */
 	index: number;
+	/** Sessions number the continuous hangouts of the day (no 20-minute silence); 1-based */
+	session: number;
 	start: Date;
 	end: Date;
 	participants: string[];
@@ -56,10 +58,10 @@ export interface Storyline {
 const LINK_PROMPT = `You map how conversations in a Discord channel connect over a day, for the server's assistant bot. You read short records of each conversation (E1, E2, … in time order) and say which later conversations CONTINUE an earlier one.
 
 Two kinds of continuation:
-- thread: the same person's situation, debate, plan or story picked up again, including a follow-up hours later ("how did that go?");
-- bit: the same running joke, phrase or persona brought back, even as a side remark.
+- thread: one specific situation picked up again: the same person's problem or news, the same debate, the same plan, including a follow-up hours later ("how did that go?"). The same person being talked about in a different way is NOT the same thread;
+- bit: one specific running joke, phrase or persona brought back, even as a side remark. A person joking a lot, or the general mood of an evening, is NOT a bit.
 
-Only link when the later conversation clearly carries on the same specific thing (same situation, same joke), not merely a similar topic or the same people. Link each later conversation to the most recent earlier conversation it continues. Many conversations continue nothing; that is normal.`;
+Each conversation shows its session: conversations in the same session were one continuous hangout, cut where the topic or the people changed. Being in the same session is already known and is not a link by itself; link only when a specific situation or joke carries over. Link each later conversation to the most recent earlier conversation it continues. Many conversations continue nothing; that is normal.`;
 
 const LINK_SCHEMA: JsonObjectSchema = {
 	type: "object",
@@ -78,12 +80,13 @@ const LINK_SCHEMA: JsonObjectSchema = {
 						description: "The earlier conversation it continues",
 					},
 					kind: { type: "string", enum: ["thread", "bit"] },
-					what: {
+					storyline: {
 						type: "string",
-						description: "What carries over, a few words",
+						description:
+							"A few words naming the storyline this link belongs to; use the SAME words for every link of the same storyline, different words for different storylines",
 					},
 				},
-				required: ["from", "to", "kind", "what"],
+				required: ["from", "to", "kind", "storyline"],
 			},
 		},
 	},
@@ -141,7 +144,7 @@ function describeEpisode(e: StorylineEpisode, timeZone: string): string {
 			minute: "2-digit",
 		});
 	return [
-		`E${e.index} ${clock(e.start)}–${clock(e.end)} [${e.participants.join(", ")}] ${e.topic}`,
+		`E${e.index} (session ${e.session}) ${clock(e.start)}–${clock(e.end)} [${e.participants.join(", ")}] ${e.topic}`,
 		`   ${e.summary}`,
 		`   Dynamics: ${e.dynamics}`,
 		...e.exchanges.map((x) => `   - ${x}`),
@@ -149,14 +152,26 @@ function describeEpisode(e: StorylineEpisode, timeZone: string): string {
 	].join("\n");
 }
 
-/** One run of the link step: proposed links, deduplicated */
-async function proposeLinks(
+/** A link as proposed by one run, with the storyline it belongs to (normalized words) */
+export interface ProposedLink {
+	from: number;
+	to: number;
+	kind: StorylineKind;
+	storyline: string;
+}
+
+export async function proposeLinks(
 	episodes: StorylineEpisode[],
 	timeZone: string,
-): Promise<Array<Omit<StorylineLink, "agreement">> | null> {
+): Promise<ProposedLink[] | null> {
 	const [general, bits] = await Promise.all([
 		OmpRuntime.get().generateStructured<{
-			links: Array<{ from: number; to: number; kind: string; what: string }>;
+			links: Array<{
+				from: number;
+				to: number;
+				kind: string;
+				storyline: string;
+			}>;
 		}>({
 			systemPrompt: LINK_PROMPT,
 			prompt: `The day's conversations, in order:\n\n${episodes.map((e) => describeEpisode(e, timeZone)).join("\n\n")}`,
@@ -168,22 +183,31 @@ async function proposeLinks(
 	if (!general?.links) return null;
 	const known = new Set(episodes.map((e) => e.index));
 	const seen = new Set<string>();
-	const links: Array<Omit<StorylineLink, "agreement">> = [];
+	const links: ProposedLink[] = [];
 	const proposed = [
 		...general.links.map((l) => ({
 			...l,
 			kind: l.kind === "bit" ? "bit" : "thread",
 		})),
-		...(bits ?? []).map((l) => ({ ...l, kind: "bit" })),
+		...(bits ?? []).map((l) => ({
+			from: l.from,
+			to: l.to,
+			kind: "bit",
+			storyline: `bit ${l.what}`,
+		})),
 	];
 	for (const l of proposed) {
 		const [from, to] = [Math.max(l.from, l.to), Math.min(l.from, l.to)];
 		const kind: StorylineKind = l.kind === "bit" ? "bit" : "thread";
-		const key = `${from}:${to}:${kind}`;
+		const storyline = (l.storyline ?? "")
+			.toLowerCase()
+			.replace(/[^\p{L}\p{N}]+/gu, " ")
+			.trim();
+		const key = `${from}:${to}:${kind}:${storyline}`;
 		if (from === to || !known.has(from) || !known.has(to) || seen.has(key))
 			continue;
 		seen.add(key);
-		links.push({ from, to, kind });
+		links.push({ from, to, kind, storyline });
 	}
 	return links;
 }
@@ -194,7 +218,7 @@ async function proposeLinks(
  */
 async function proposeBitLinks(
 	episodes: StorylineEpisode[],
-): Promise<Array<{ from: number; to: number }> | null> {
+): Promise<Array<{ from: number; to: number; what: string }> | null> {
 	const withBits = episodes.filter((e) => e.bits.length);
 	if (withBits.length < 2) return [];
 	const written = await OmpRuntime.get().generateStructured<{
@@ -234,39 +258,80 @@ async function proposeBitLinks(
 }
 
 /** How often independent runs put each pair of conversations in the same chain (0-1) */
+export interface LinkVotes {
+	/** Pairs of conversations in the same storyline, with the share of runs that agreed */
+	storyline: StorylineLink[];
+	/**
+	 * Adjacent conversations of one session that a majority called a continuation: most likely
+	 * one conversation the segmenter cut in two (kept out of storylines)
+	 */
+	continuations: Array<{ from: number; to: number; agreement: number }>;
+}
+
 export async function voteLinks(
 	episodes: StorylineEpisode[],
 	timeZone: string,
 	runs = 5,
-): Promise<StorylineLink[] | null> {
+): Promise<LinkVotes | null> {
 	const proposals = (
 		await Promise.all(
 			Array.from({ length: runs }, () => proposeLinks(episodes, timeZone)),
 		)
-	).filter((p): p is Array<Omit<StorylineLink, "agreement">> => p !== null);
+	).filter((p): p is ProposedLink[] => p !== null);
 	if (!proposals.length) return null;
+	const sessionOf = new Map(episodes.map((e) => [e.index, e.session]));
+	const isContinuation = (l: ProposedLink) =>
+		l.from === l.to + 1 && sessionOf.get(l.from) === sessionOf.get(l.to);
+
 	const votes = new Map<string, number>();
-	// Each run's links → chains → "these two belong together" votes, per kind
+	const continuationVotes = new Map<string, number>();
 	for (const run of proposals) {
-		for (const chain of chainLinks(run.map((l) => ({ ...l, agreement: 1 })))) {
-			for (const [a, i] of chain.episodes.entries()) {
-				for (const j of chain.episodes.slice(a + 1)) {
-					const key = `${j}:${i}:${chain.kind}`;
-					votes.set(key, (votes.get(key) ?? 0) + 1);
+		for (const key of new Set(
+			run.filter(isContinuation).map((l) => `${l.from}:${l.to}`),
+		)) {
+			continuationVotes.set(key, (continuationVotes.get(key) ?? 0) + 1);
+		}
+		// Chain only links that name the same storyline, so a conversation in two storylines
+		// (lunchie's interview result and Joe joking about her) doesn't fuse them. Continuations
+		// count here too: a storyline can run through neighbouring episodes.
+		const byStoryline = new Map<string, ProposedLink[]>();
+		for (const l of run) {
+			const key = `${l.kind}:${l.storyline}`;
+			byStoryline.set(key, [...(byStoryline.get(key) ?? []), l]);
+		}
+		const counted = new Set<string>();
+		for (const links of byStoryline.values()) {
+			for (const chain of chainLinks(
+				links.map((l) => ({ ...l, agreement: 1 })),
+			)) {
+				for (const [a, i] of chain.episodes.entries()) {
+					for (const j of chain.episodes.slice(a + 1)) {
+						const key = `${j}:${i}:${chain.kind}`;
+						if (counted.has(key)) continue;
+						counted.add(key);
+						votes.set(key, (votes.get(key) ?? 0) + 1);
+					}
 				}
 			}
 		}
 	}
-	// Every pair any run put together, with the share of runs that did
-	return [...votes].map(([key, n]) => {
-		const [from, to, kind] = key.split(":") as [string, string, StorylineKind];
-		return {
-			from: Number(from),
-			to: Number(to),
-			kind,
-			agreement: n / proposals.length,
-		};
-	});
+	const share = (n: number) => n / proposals.length;
+	return {
+		storyline: [...votes].map(([key, n]) => {
+			const [from, to, kind] = key.split(":") as [
+				string,
+				string,
+				StorylineKind,
+			];
+			return { from: Number(from), to: Number(to), kind, agreement: share(n) };
+		}),
+		continuations: [...continuationVotes]
+			.filter(([, n]) => share(n) > 0.5)
+			.map(([key, n]) => {
+				const [from, to] = key.split(":").map(Number) as [number, number];
+				return { from, to, agreement: share(n) };
+			}),
+	};
 }
 
 /** Connected chains of links, per kind; each chain is a sorted list of episode numbers */
@@ -358,12 +423,26 @@ export async function buildStorylines(
 	episodes: StorylineEpisode[],
 	idByName: Map<string, string>,
 	timeZone: string,
-): Promise<{ storylines: Storyline[]; links: StorylineLink[] } | null> {
+): Promise<{
+	storylines: Storyline[];
+	links: StorylineLink[];
+	continuations: LinkVotes["continuations"];
+} | null> {
 	const votes = await voteLinks(episodes, timeZone);
 	if (!votes) return null;
-	const chains = groupByAgreement(votes);
-	const links = votes.filter((v) => v.agreement > 0.5);
-	if (!chains.length) return { storylines: [], links };
+	// A storyline that is only a contiguous stretch of one session adds nothing to the session
+	// itself (that is a hangout the segmenter over-cut: see continuations); keep the ones that
+	// cross sessions or skip conversations
+	const sessionOf = new Map(episodes.map((e) => [e.index, e.session]));
+	const chains = groupByAgreement(votes.storyline).filter((chain) => {
+		const sessions = new Set(chain.episodes.map((n) => sessionOf.get(n)));
+		const first = chain.episodes[0] ?? 0;
+		const last = chain.episodes[chain.episodes.length - 1] ?? 0;
+		return sessions.size > 1 || last - first + 1 > chain.episodes.length;
+	});
+	const links = votes.storyline.filter((v) => v.agreement > 0.5);
+	if (!chains.length)
+		return { storylines: [], links, continuations: votes.continuations };
 
 	// One call per chain, so a narration can't be matched to the wrong chain
 	const byIndex = new Map(episodes.map((e) => [e.index, e]));
@@ -407,5 +486,5 @@ export async function buildStorylines(
 			};
 		}),
 	);
-	return { storylines, links };
+	return { storylines, links, continuations: votes.continuations };
 }
