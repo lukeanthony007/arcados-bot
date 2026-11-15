@@ -14,7 +14,12 @@
  * - Repository-based audit logging
  */
 
-import type { Client, VoiceChannel } from "discord.js";
+import {
+	AuditLogEvent,
+	type Client,
+	type GuildMember,
+	type VoiceChannel,
+} from "discord.js";
 import type { VoiceDataRepository } from "../repositories/VoiceDataRepository";
 import type { ModerationEvent } from "../types/index";
 import { ModerationError } from "../types/index";
@@ -25,7 +30,7 @@ export class ModerationService {
 	constructor(
 		private client: Client,
 		private repository: VoiceDataRepository,
-	) { }
+	) {}
 
 	/**
 	 * Mute a user in a voice channel
@@ -74,10 +79,7 @@ export class ModerationService {
 	/**
 	 * Get audit log for a channel
 	 */
-	async getAuditLog(
-		channelId: string,
-		limit: number = 50,
-	): Promise<ModerationEvent[]> {
+	async getAuditLog(channelId: string, limit = 50): Promise<ModerationEvent[]> {
 		return this.repository.getModerationHistory(channelId, limit);
 	}
 
@@ -131,27 +133,27 @@ export class ModerationService {
 				return; // User not in channel
 			}
 
-			// Apply mute state
+			// Apply mute state; only lift mutes the bot applied (a moderator's mute persists)
 			if (shouldBeMuted && !member.voice.serverMute) {
 				await member.voice.setMute(true);
 			} else if (!shouldBeMuted && member.voice.serverMute) {
-				await member.voice.setMute(false);
+				await this.releaseIfOurs(member, "mute");
 			}
 
 			// Apply deafen state
 			if (shouldBeDeafened && !member.voice.serverDeaf) {
 				await member.voice.setDeaf(true);
 			} else if (!shouldBeDeafened && member.voice.serverDeaf) {
-				await member.voice.setDeaf(false);
+				await this.releaseIfOurs(member, "deaf");
 			}
-
 		} catch (error) {
 			console.error("🔸 [MODERATION] Failed to apply preferences:", error);
 		}
 	}
 
 	/**
-	 * Clear all moderation from a user (unmute/undeafen)
+	 * Lift mute/deafen the bot applied (an owner's channel moderation) when a user moves on.
+	 * Moderators' server mutes and deafens are left alone.
 	 */
 	private async clearModeration(
 		channelId: string,
@@ -163,15 +165,51 @@ export class ModerationService {
 
 			if (!member) return;
 
-			if (member.voice.serverMute) {
-				await member.voice.setMute(false);
-			}
-			if (member.voice.serverDeaf) {
-				await member.voice.setDeaf(false);
-			}
+			if (member.voice.serverMute) await this.releaseIfOurs(member, "mute");
+			if (member.voice.serverDeaf) await this.releaseIfOurs(member, "deaf");
 		} catch (error) {
 			console.error("🔸 [MODERATION] Failed to clear moderation:", error);
 		}
+	}
+
+	/**
+	 * Undo a server mute/deafen only when the bot applied it. Server mutes follow a user across
+	 * channels, so the bot lifts its own (channel-owner moderation) when they move on; but a
+	 * mute or deafen a moderator applied in Discord must persist. Who applied it comes from the
+	 * audit log, so it holds across restarts. If that can't be determined, leave it in place.
+	 */
+	private async releaseIfOurs(
+		member: GuildMember,
+		key: "mute" | "deaf",
+	): Promise<void> {
+		const botId = this.client.user?.id;
+		let executorId: string | null = null;
+		try {
+			const log = await member.guild.fetchAuditLogs({
+				type: AuditLogEvent.MemberUpdate,
+				limit: 100,
+			});
+			const entry = log.entries.find(
+				(e) =>
+					e.targetId === member.id &&
+					e.changes.some((c) => c.key === key && c.new === true),
+			);
+			executorId = entry?.executorId ?? null;
+		} catch (error) {
+			console.error(
+				"🔸 [MODERATION] Could not read the audit log; leaving moderation in place:",
+				error,
+			);
+			return;
+		}
+		if (!botId || executorId !== botId) {
+			VoiceLogger.moderation(
+				`Keeping ${key} on ${member.displayName}: applied by ${executorId ? `<@${executorId}>` : "someone other than the bot"}`,
+			);
+			return;
+		}
+		if (key === "mute") await member.voice.setMute(false);
+		else await member.voice.setDeaf(false);
 	}
 
 	/**
@@ -212,7 +250,11 @@ export class ModerationService {
 				"MODERATION",
 			);
 		} catch (error) {
-			VoiceLogger.error("MODERATION", "Failed to apply blacklist permissions", error);
+			VoiceLogger.error(
+				"MODERATION",
+				"Failed to apply blacklist permissions",
+				error,
+			);
 		}
 	}
 
@@ -251,7 +293,11 @@ export class ModerationService {
 				"MODERATION",
 			);
 		} catch (error) {
-			VoiceLogger.error("MODERATION", "Failed to remove blacklist permissions", error);
+			VoiceLogger.error(
+				"MODERATION",
+				"Failed to remove blacklist permissions",
+				error,
+			);
 		}
 	}
 
@@ -293,7 +339,11 @@ export class ModerationService {
 				"MODERATION",
 			);
 		} catch (error) {
-			VoiceLogger.error("MODERATION", "Failed to apply whitelist permissions", error);
+			VoiceLogger.error(
+				"MODERATION",
+				"Failed to apply whitelist permissions",
+				error,
+			);
 		}
 	}
 
@@ -332,7 +382,11 @@ export class ModerationService {
 				"MODERATION",
 			);
 		} catch (error) {
-			VoiceLogger.error("MODERATION", "Failed to remove whitelist permissions", error);
+			VoiceLogger.error(
+				"MODERATION",
+				"Failed to remove whitelist permissions",
+				error,
+			);
 		}
 	}
 
@@ -373,7 +427,11 @@ export class ModerationService {
 				);
 			}
 		} catch (error) {
-			VoiceLogger.error("MODERATION", "Failed to sync moderation permissions for new channel", error);
+			VoiceLogger.error(
+				"MODERATION",
+				"Failed to sync moderation permissions for new channel",
+				error,
+			);
 		}
 	}
 
@@ -428,7 +486,9 @@ export class ModerationService {
 
 			const userName = member.displayName || userId;
 			const channelName = channel.name || channelId;
-			VoiceLogger.moderation(`Applied ${action} to ${userName} in ${channelName}`);
+			VoiceLogger.moderation(
+				`Applied ${action} to ${userName} in ${channelName}`,
+			);
 		} catch (error) {
 			throw new ModerationError(`Failed to ${action} user`, error);
 		}
