@@ -1,0 +1,10 @@
+# Animus's own store: kept out of git. Captures (raw/) and wiki pages (wiki/) are yours and stay visible to git.
+/agent.json
+/core.sqlite*
+/recall.sqlite*
+/vectors.sqlite*
+/.credentials/
+/trust/
+/work/
+/migration-backups/
+/damaged/
